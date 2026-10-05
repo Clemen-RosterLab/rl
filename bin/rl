@@ -1,0 +1,22 @@
+#!/bin/zsh -f
+emulate -L zsh
+readonly rl_home="${${(%):-%x}:A:h:h}"
+if [[ "$1" == __hook ]]; then
+  # Hooks resolve the installed CLI on PATH, not a version-specific package path.
+  # Their explicit repository/state arguments must not be replaced by user config.
+  shift
+  exec node "$rl_home/dist/cli.js" state "$@"
+fi
+if [[ "$1" == --version || "$1" == -V ]]; then
+  exec node -p 'JSON.parse(require("node:fs").readFileSync(process.argv[1], "utf8")).version' "$rl_home/package.json"
+fi
+if [[ "$1" == init ]]; then
+  if [[ "$2" != zsh || $# != 2 ]]; then
+    print -u2 'Usage: rl init zsh'
+    exit 1
+  fi
+  print -r -- "source ${(q)rl_home}/shell/rl.zsh"
+  exit 0
+fi
+source "$rl_home/lib/rl.zsh" || exit 1
+_rl_main "$@"

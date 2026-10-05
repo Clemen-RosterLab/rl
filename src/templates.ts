@@ -1,0 +1,6 @@
+export const NOTE_TEMPLATES: Record<string, string> = {
+  "context.md":
+    "# Feature and domain documentation\n\n## Purpose and scope\nDescribe the user problem, intended behavior, and what is outside this feature.\n\n## Domain rules and acceptance criteria\nRecord terminology, constraints, examples, and observable completion criteria.\n\n## Design decisions\nRecord decisions and their rationale, including alternatives when relevant.\n\n## References\nLink specifications, issues, relevant code, and related documentation.\n",
+  "progress.md":
+    "# Implementation documentation\n\n## Completed\nRecord implemented behavior with concrete file or symbol references.\n\n## Remaining work\nKeep an actionable checklist; distinguish planned work from completed work.\n\n## Implementation details\nExplain the flow, important modules, APIs/data structures, and integration points.\n\n## Validation\nRecord checks actually run, their results, and gaps that remain unverified.\n\n## Blockers and open questions\nRecord unresolved decisions, known issues, and dependencies.\n\n## Next steps\nDescribe where the next agent or developer should continue.\n\n## Progress log\nAppend dated milestone updates here when several agents are working concurrently.\n",
+};

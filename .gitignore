@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+node_modules/
+*.tgz
+
+dist/
+.test-dist/
+
+.DS_Store
+.env
+.env.*
+!.env.example

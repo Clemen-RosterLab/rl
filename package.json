@@ -1,0 +1,59 @@
+{
+  "name": "rl-workspaces",
+  "version": "0.4.4",
+  "description": "Persistent Git workspaces with shared feature documentation and explicit agent sessions",
+  "license": "MIT",
+  "bin": {
+    "rl": "bin/rl"
+  },
+  "files": [
+    "bin/rl",
+    "dist/*.js",
+    "lib/*.zsh",
+    "shell/rl.zsh",
+    "config.example.zsh"
+  ],
+  "os": [
+    "darwin",
+    "linux"
+  ],
+  "keywords": [
+    "git",
+    "worktree",
+    "codex",
+    "claude",
+    "cli"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "prepack": "npm run build",
+    "test": "npm run build && tsc -p tsconfig.test.json && node --test .test-dist/*.test.js && zsh -f tests/smoke.zsh",
+    "test:package": "npm run build && tsc -p tsconfig.test.json && node --test .test-dist/package.test.js",
+    "format": "prettier --write \"src/**/*.ts\" \"tests/**/*.ts\" \"tsconfig*.json\" package.json",
+    "format:check": "prettier --check \"src/**/*.ts\" \"tests/**/*.ts\" \"tsconfig*.json\" package.json"
+  },
+  "dependencies": {
+    "proper-lockfile": "^4.1.2"
+  },
+  "devDependencies": {
+    "@types/node": "^22.20.4",
+    "@types/proper-lockfile": "^4.1.4",
+    "prettier": "^3.9.9",
+    "typescript": "^7.0.2"
+  },
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "bundleDependencies": [
+    "proper-lockfile"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Clemen-RosterLab/rl.git"
+  },
+  "homepage": "https://github.com/Clemen-RosterLab/rl#readme",
+  "bugs": {
+    "url": "https://github.com/Clemen-RosterLab/rl/issues"
+  }
+}
