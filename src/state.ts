@@ -1,3 +1,7 @@
+import { agentAdapter } from "./agent-registry.js";
+import { activityView } from "./activity.js";
+import { handleHook } from "./hooks.js";
+import { doctor } from "./doctor.js";
 import fs from "node:fs";
 import path from "node:path";
 import {
@@ -15,11 +19,9 @@ import {
   sessionId,
   timestamp,
 } from "./common.js";
-import { Agent, branchStatus, contextText, Store } from "./store.js";
+import { Agent, branchStatus, Store } from "./store.js";
 function agent(value: string): Agent {
-  if (value !== "codex" && value !== "claude")
-    throw new Error("Agent must be codex or claude");
-  return value;
+  return agentAdapter(value).name;
 }
 async function resume(store: Store, kind: Agent): Promise<number> {
   const [file, data, sid] = await store.locked(() => {
@@ -37,7 +39,7 @@ async function resume(store: Store, kind: Agent): Promise<number> {
   const stamp = now();
   console.error(`Resuming ${kind} session ${sid} for ${data.id}`);
   const result = await execute(
-    [kind, kind === "codex" ? "resume" : "--resume", sid],
+    agentAdapter(kind).resumeArgs(sid),
     data.worktree,
     { interactive: true },
   );
@@ -132,39 +134,13 @@ export async function main(argv: string[]): Promise<number> {
     arity(rest, 1);
     return resume(store, agent(rest[0]));
   }
+  if (command === "doctor") {
+    arity(rest, 0, 1);
+    return doctor(store, rest[0], !!values.json);
+  }
   if (command === "hook") {
     arity(rest, 2);
-    const kind = agent(rest[1]),
-      payload: unknown = JSON.parse(fs.readFileSync(0, "utf8"));
-    if (!object(payload)) throw new Error("Hook input must be a JSON object");
-    const event = payload.hook_event_name;
-    if (
-      !["SessionStart", "SubagentStart", "UserPromptSubmit"].includes(
-        String(event),
-      )
-    )
-      throw new Error("Unsupported session hook event");
-    if (typeof payload.cwd !== "string" || !path.isAbsolute(payload.cwd))
-      throw new Error("Hook requires an absolute cwd");
-    const cwd = payload.cwd,
-      sid = sessionId(payload.session_id);
-    return store.locked(() => {
-      const [file, data] = store.current(cwd);
-      if (data.key !== rest[0])
-        throw new Error(
-          "Hook belongs to a different RL instance; run 'rl adopt' to repair it",
-        );
-      if (event !== "SubagentStart" && !payload.agent_id)
-        store.recordSession(file, data, kind, sid);
-      if (event !== "UserPromptSubmit")
-        json({
-          hookSpecificOutput: {
-            hookEventName: event,
-            additionalContext: contextText(file, data),
-          },
-        });
-      return 0;
-    });
+    return handleHook(store, rest[0], rest[1]);
   }
   if (command === "pr" && rest[0] === "sync") {
     arity(rest, 1, 2);
@@ -207,6 +183,10 @@ export async function main(argv: string[]): Promise<number> {
       arity(rest, 0);
       json({
         ...data,
+        activity: {
+          codex: activityView(data.activity?.codex),
+          claude: activityView(data.activity?.claude),
+        },
         stateDirectory: path.dirname(file),
         gitStatus: branchStatus(store.repo, data),
       });

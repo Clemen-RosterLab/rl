@@ -1,3 +1,6 @@
+import { adapters } from "./agent-registry.js";
+import { Agent } from "./agents.js";
+import { Tracking, validateTracking } from "./activity.js";
 import { lastAccessed } from "./access.js";
 import fs from "node:fs";
 import path from "node:path";
@@ -20,13 +23,13 @@ import {
   writeJson,
 } from "./common.js";
 import { NOTE_TEMPLATES } from "./templates.js";
-export type Agent = "codex" | "claude";
+export type { Agent } from "./agents.js";
 export interface Session {
   id: string;
   createdAt: string;
   lastUsedAt: string;
 }
-export interface Instance {
+export interface Instance extends Tracking {
   schemaVersion: 1;
   key: string;
   id: string;
@@ -178,6 +181,7 @@ export class Store {
           !object(data.sessions)
         )
           throw new Error();
+        validateTracking(data);
         for (const agent of ["codex", "claude"]) {
           const sessions = data.sessions[agent];
           if (!Array.isArray(sessions)) throw new Error();
@@ -226,7 +230,10 @@ export class Store {
     return [root, branch];
   }
   current(cwd = process.cwd()): RecordEntry {
-    const [root, branch] = this.worktree(cwd);
+    return this.instanceForWorktree(...this.worktree(cwd));
+  }
+  // Call only with a worktree validated by worktree().
+  instanceForWorktree(root: string, branch: string): RecordEntry {
     for (const [file, data] of this.records())
       if (data.status === "active" && data.worktree === root) {
         if (data.branch !== branch)
@@ -303,6 +310,17 @@ export class Store {
       return [file, data];
     });
   }
+  assertSessionOwner(file: string, agent: Agent, id: string): void {
+    for (const [otherFile, other] of this.records())
+      if (
+        otherFile !== file &&
+        (other.sessions[agent].some((s) => s.id === id) ||
+          other.activity?.[agent]?.some((s) => s.sessionId === id))
+      )
+        throw new Error(
+          `Session ${id} already belongs to RL instance ${other.id}`,
+        );
+  }
   recordSession(
     file: string,
     data: Instance,
@@ -310,12 +328,19 @@ export class Store {
     id: string,
     stamp = now(),
   ): void {
+    this.associateSession(file, data, agent, id, stamp);
+    this.touch(file, data, stamp);
+  }
+  // Mutate the supplied record; callers persist session and activity together.
+  associateSession(
+    file: string,
+    data: Instance,
+    agent: Agent,
+    id: string,
+    stamp = now(),
+  ): void {
     const sid = sessionId(id);
-    for (const [otherFile, other] of this.records())
-      if (otherFile !== file && other.sessions[agent].some((s) => s.id === sid))
-        throw new Error(
-          `Session ${sid} already belongs to RL instance ${other.id}`,
-        );
+    this.assertSessionOwner(file, agent, sid);
     const item = data.sessions[agent].find((s) => s.id === sid);
     if (!item)
       data.sessions[agent].push({
@@ -325,28 +350,35 @@ export class Store {
       });
     else if (timestamp(stamp) > timestamp(item.lastUsedAt))
       item.lastUsedAt = stamp;
-    this.touch(file, data, stamp);
   }
 }
+export function hookCommand(
+  store: Store,
+  data: Instance,
+  agent: Agent,
+): string {
+  return (
+    [
+      "rl",
+      "__hook",
+      "--repo",
+      store.repo,
+      "--state-dir",
+      store.stateDir,
+      "hook",
+      data.key,
+      agent,
+    ]
+      .map(shellQuote)
+      .join(" ") + " # rl-session-hook"
+  );
+}
 function installHooks(store: Store, file: string, data: Instance): void {
-  const command = [
-    "rl",
-    "__hook",
-    "--repo",
-    store.repo,
-    "--state-dir",
-    store.stateDir,
-    "hook",
-    data.key,
-  ]
-    .map(shellQuote)
-    .join(" ");
   const updates: [string, Record<string, unknown>][] = [];
   const commands = {} as Record<Agent, string>;
-  for (const [agent, relative] of [
-    ["codex", ".codex/hooks.json"],
-    ["claude", ".claude/settings.local.json"],
-  ] as const) {
+  for (const adapter of Object.values(adapters)) {
+    const agent = adapter.name,
+      relative = adapter.configPath;
     const target = path.join(data.worktree, relative);
     if (isSymlink(target) || isSymlink(path.dirname(target)))
       throw new Error(
@@ -355,8 +387,8 @@ function installHooks(store: Store, file: string, data: Instance): void {
     const config = fs.existsSync(target) ? readJson(target) : {};
     const hooks = (config.hooks ??= {});
     if (!object(hooks)) throw new Error(`Invalid hooks object in ${target}`);
-    commands[agent] = `${command} ${agent} # rl-session-hook`;
-    for (const event of ["SessionStart", "SubagentStart", "UserPromptSubmit"]) {
+    commands[agent] = hookCommand(store, data, agent);
+    for (const event of Object.keys(adapter.events)) {
       const groups = hooks[event] ?? [];
       if (!Array.isArray(groups))
         throw new Error(`Invalid ${event} hooks in ${target}`);

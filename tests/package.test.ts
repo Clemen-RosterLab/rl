@@ -114,6 +114,12 @@ test("offline npm install, relocation and reinstall preserve hooks, sessions and
   const sid = randomUUID();
   assert.match(w.hook("codex", sid).stdout, /Package install complete/);
   w.env.RL_CONFIG = w.config;
+  const diagnosis = JSON.parse(
+    w.command([cli, "doctor", "codex", "--json"], { cwd: w.a }).stdout,
+  );
+  assert.equal(diagnosis.agents[0].installed, true);
+  assert.equal(diagnosis.agents[0].lastSuccess.event, "SessionStart");
+  assert.equal(diagnosis.agents[0].activity[0].sessionId, sid);
   assert.equal(
     JSON.parse(w.command([cli, "status"], { cwd: w.a }).stdout).sessions
       .codex[0].id,

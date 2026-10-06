@@ -1,80 +1,30 @@
 # rl
 
-A TypeScript CLI with zsh integration for persistent feature workspaces. Each instance owns its
-worktree, branch, feature notes, implementation handoff, explicit agent session
-IDs, and cached GitHub PR state. RL keeps that state independently of the agents.
+Manage Git worktrees, project notes, and Codex or Claude sessions from your terminal.
 
-Requires macOS or Linux, zsh, Git, and Node.js 22+. No Python installation is needed. Pickers require
-`fzf`; resuming an agent requires its CLI; automatic PR discovery and PR sync require authenticated `gh`.
-Worktree commands run from any directory. Instance commands resolve the current
-worktree, including when called from a subdirectory. Multiple repositories can
-be registered under short aliases, with isolated worktree directories and state.
+Create a workspace for each feature, switch between them, and pick up where you
+left off. RL keeps your notes and agent session links together and shows pull
+request status across your workspaces.
 
-## Install with npm
+Requires macOS or Linux, zsh, Git, and Node.js 22+. Install `fzf` for workspace
+pickers, `gh` (signed in) for pull request status, and Codex or Claude to resume
+their sessions.
+
+## Install
 
 ```sh
-git clone https://github.com/Clemen-RosterLab/rl.git
-cd rl
-npm ci
-npm pack
-npm install --global ./rl-workspaces-0.4.4.tgz
-rl --version
+npm install --global rl-workspaces
 ```
 
-The package is named **`rl-workspaces`**; the installed command is **`rl`**.
-Installing the tarball copies the runtime into npm's installation directory and
-does not depend on keeping this checkout. Ensure npm's global bin directory
-(`$(npm prefix -g)/bin` on macOS/Linux) is on `PATH`.
+The first npm release is pending; this command will work once it is published.
 
-This repository has not been published to the npm registry. After publication,
-installation will be `npm install --global rl-workspaces`. Until then, use the
-local tarball above. The tarball contains compiled JavaScript and its small runtime
-locking dependency, so installation requires neither Python nor a TypeScript
-compiler. It has no install scripts and does not edit global configuration.
-`npm pack` builds TypeScript automatically; run `npm ci` first in a fresh checkout.
-
-For directory switching, put this in your zsh startup file:
+Add this to `~/.zshrc` to switch directories when you open a workspace:
 
 ```zsh
 eval "$(command rl init zsh)"
 ```
 
-An existing `rl` shell function takes precedence over the executable. Remove
-the old function from your shell configuration before adding the integration.
-Restart the shell (`exec zsh`) after switching installations, or reload the
-integration after upgrading so its loaded functions match the installed version.
-
-### Switching from the original installer
-
-If you previously ran `./install.sh`, inspect `ls -l ~/.local/bin/rl`. If it is
-the old symlink pointing to this checkout's `bin/rl`, remove that symlink before
-installing through npm. Otherwise the old executable can shadow the npm command
-or conflict with installation. Keep unrelated files intact.
-
-Existing worktrees, configuration, and `~/.rl/instances` are unchanged by npm
-installation, upgrades, or uninstall. Run `rl adopt` in existing worktrees once
-to replace legacy hooks containing checkout paths. New hooks resolve `rl` on the
-agent's `PATH` and survive relocation or upgrades without changing their command
-definitions. Agent processes must inherit a `PATH` containing the installed CLI.
-
-To uninstall the npm package, run `npm uninstall --global rl-workspaces` and
-remove the optional integration line. Saved workspace state is retained.
-
-### Upgrading from the Python implementation
-
-Version 0.4.0 reads the existing JSON records, repository registry, documentation,
-and explicit session IDs in place. No state migration or worktree recreation is
-needed. Install the new tarball, then reload the shell integration or start a new
-shell. Finish any commands running the old version before upgrading: the Node
-implementation uses a different interprocess lock mechanism. Hook commands keep
-the same stable `rl __hook` format.
-
-### Checkout-based installation
-
-Run `npm ci && npm run build` before `./install.sh`. The installer links `bin/rl`
-into `~/.local/bin` (or `RL_INSTALL_DIR`); keep the checkout in place. It refuses
-to overwrite an unrelated file and does not edit shell configuration. Rebuild with `npm run build` after
-changing TypeScript sources. Use one installation method at a time.
+Restart your terminal, then register your project below.
 
 ## First workspace
 
@@ -86,8 +36,7 @@ rl --repo my-project new feature/example
 ```
 
 Use your repository's actual base branch in place of `origin/main`. Registration
-makes it the default if it is the first repository. The legacy fallback settings
-below are retained for existing users; new installations should register a repository.
+makes it the default if it is the first repository.
 
 ## Multiple repositories
 
@@ -106,7 +55,7 @@ rl --repo backend delete old-task another-task
 
 Repository selection follows this order: `--repo <alias>` before the command,
 `RL_REPO` from the environment/config, the registered repository owning the current
-Git worktree, the registry default, then the original `RL_REPO_ROOT` configuration.
+Git worktree, the registry default, then the `RL_REPO_ROOT` configuration.
 Inside a registered worktree or its subdirectories, commands such as `rl resume
 codex` select that repository automatically unless explicitly overridden.
 
@@ -116,13 +65,11 @@ the registration, retaining all worktrees, branches, documents, and sessions.
 Register the same path again to access its existing instance state.
 
 Each repository has its own default base and worktree directory under
-`RL_WORKTREE_DIR`. The directory defaults to its alias. Registering the original
-`RL_REPO_ROOT` preserves its existing `RL_REPO_NAME` directory, so no migration is
-needed. `repo add --worktree-name <directory>` can specify a different directory;
-directory names must be unique across registered repositories. Supply the original
+`RL_WORKTREE_DIR`. Use `repo add --worktree-name <directory>` to choose a directory;
+directory names must be unique across registered repositories. Supply the same
 directory name when re-registering a repository under a different alias.
 
-If `--base` is omitted, the original repository retains `RL_DEFAULT_BASE`; other
+If `--base` is omitted, a repository matching `RL_REPO_ROOT` uses `RL_DEFAULT_BASE`; other
 repositories use `origin/HEAD` if configured, otherwise their main checkout's
 current branch. No fetch occurs during registration. Registering a linked worktree
 normalizes to its main checkout, and duplicate registrations of one Git repository
@@ -156,8 +103,7 @@ parsing follows the [documented porcelain format](https://git-scm.com/docs/git-s
 Registered instance records are shown alongside existing managed Git worktrees
 that have not yet been adopted (`unregistered`); viewing status does not install
 hooks or create instances. Once repositories are registered, `--all` covers that
-registry only, so register your legacy configured repository as well. With no registry,
-it shows the original configured repository. `rl instances` retains its JSON list
+registry only. Register each repository you want to include. `rl instances` retains its JSON list
 for the selected repository and now includes each instance's `gitStatus`.
 
 ## Use
@@ -229,8 +175,7 @@ locally cached refs; `rl status --list --fetch` refreshes remote refs. They desc
 commit ancestry, so squash merges may still show commits ahead after a PR merges.
 
 **`delete` force-removes the worktree, including uncommitted changes, and deletes
-its local branch.** It never deletes the remote branch. This preserves the
-original implementation and corrects its misleading help text. Instance metadata,
+its local branch.** It never deletes the remote branch. Instance metadata,
 notes, and session history are retained with `status: "deleted"`. `rl instances`
 lists retained records; their notes remain in the state directory. Recreating a
 deleted worktree creates a new instance, without inheriting old sessions.
@@ -267,16 +212,15 @@ parent shell's directory.
 
 ## Existing worktrees
 
-Existing RL worktrees and branches remain in place. Opening one with `rl open`
+Opening an existing worktree with `rl open`
 or selecting it in the picker registers it automatically. Alternatively, run
 `rl adopt` inside the worktree; this needs no fetch and does not change its branch
 or application files. Repeating adoption preserves saved notes and session history.
 
 An existing worktree initially receives fresh documentation templates and empty
 session lists. Historical agent chats are not guessed or imported. Attach a known
-old session with `rl session add <agent> <UUID>`, or let enabled hooks record future
-starts/resumes. No bulk migration occurs when the CLI is installed. If the old
-`.zshrc` function is still defined, replace it as described under Install first.
+session with `rl session add <agent> <UUID>`, or let enabled hooks record future
+starts/resumes.
 
 ## Explicit agent sessions
 
@@ -294,10 +238,12 @@ codex
 claude
 ```
 
-The agent's `SessionStart` hook reports its actual session UUID to RL and supplies
+The agent's `SessionStart` hook reports its session identifier to RL and supplies
 the current feature documentation. `SubagentStart` supplies the same documentation
 to delegated agents without registering their IDs as resumable sessions.
-`UserPromptSubmit` refreshes the parent session's usage timestamp. A session is associated only
+`UserPromptSubmit` refreshes the parent session's usage timestamp and supplies
+updated notes when their contents have changed. Starts and resumes always receive
+context, including `SessionStart` after compaction. A session is associated only
 after an explicit hook event or manual registration. RL does not scan global
 session histories, infer ownership from file timestamps, or inspect transcripts.
 
@@ -329,6 +275,49 @@ most recent observed use or explicit registration. A session cannot be reassigne
 to another instance in the same repository. Usage outside RL hooks/commands is
 not observable.
 
+### Agent activity and diagnostics
+
+```sh
+rl doctor                       # check both agents in this workspace
+rl doctor codex                 # check one agent
+rl doctor claude --json          # machine-readable diagnostics
+rl status                       # includes per-session activity
+```
+
+RL installs `SessionStart`, `UserPromptSubmit`, `Stop`, `SessionEnd`,
+`SubagentStart`, and `SubagentStop` handlers. Run `rl adopt` in each existing
+workspace after updating RL to install the full set, then review hook trust in
+your agent and restart it.
+
+Activity records show the last observed state: `working`, `idle`, or `ended`.
+A start is idle until a prompt is submitted; a subagent start is working.
+Context restoration after compaction preserves the prior activity state.
+`Stop` and `SubagentStop` mean a response ended, not that the feature is complete.
+Child activity never replaces the parent's resumable session or activity.
+Non-ended activity becomes `stale` after 30 minutes without another event.
+These are event observations, not process monitoring: a crash, interruption,
+missing hook, or a long-running turn can leave activity stale. Events are applied
+in received order; the agents do not provide a shared ordering contract.
+
+`rl doctor` reports hook configuration, CLI version availability, the last
+successful event, the last recorded handler error, and activity. It is read-only
+apart from invoking each selected agent's `--version` command. Exit status is
+nonzero for incomplete hook configuration, a failed CLI version probe, or a state
+directory that this process cannot write. Hook trust and version compatibility
+are reported as unknown/unverified; neither installed files nor a version string
+prove that an agent will deliver events. Successful events establish delivery
+for that event only. Agent sandbox access can differ from your terminal's access.
+
+Errors are retained only after the handler validates the workspace and instance.
+Malformed input, ownership failures, and inaccessible state can only be reported
+on stderr; they cannot reliably update the diagnostics. A successful later event
+does not erase the last error's timestamp. Hooks never read agent transcripts or
+launch another agent, and they do not request continuation at the end of a turn.
+
+Codex thread identifiers such as `thr_…` are recorded for observation only.
+Automatic CLI resume remains limited to full session UUIDs; an observed thread
+identifier alone is not treated as proof that the CLI can resume it.
+
 ### Hook setup and trust
 
 If `/hooks` has no RL entries, run `rl adopt` from a normal terminal inside the
@@ -350,7 +339,7 @@ are excluded locally through Git's `info/exclude`; tracked files remain tracked,
 so review any existing tracked hook file before committing it. No global agent
 configuration, shell aliases, or agent permission settings are changed.
 
-Use agent versions supporting `SessionStart`, `SubagentStart`, and `UserPromptSubmit` hooks. Trust
+Use agent versions supporting the six lifecycle hooks listed above. Trust
 the workspace normally, then use Codex's `/hooks` to review and trust the RL
 handlers. Until trusted, Codex skips them. If startup already occurred, the next
 prompt can record the ID; restart/resume after trusting to load feature context.
@@ -362,7 +351,7 @@ worktree and branch. Copying a hook into another worktree cannot attach sessions
 to the original instance. Hooks call the stable `rl __hook` entry point through
 `PATH`, with explicit instance/repository/state arguments; they do not depend on
 user config loading or a particular Node/package installation path. Re-run
-`rl adopt` when migrating legacy absolute-path hooks or changing the state directory.
+`rl adopt` after changing the state directory.
 Changing `RL_STATE_DIR` selects
 a separate store; it does not migrate existing records. Avoid moving registered
 worktrees without also migrating their metadata.
@@ -497,37 +486,32 @@ to preserve notes and associations; the agents still own their actual transcript
 ## Directory switching
 
 An executable cannot change its parent shell's directory. Direct CLI calls
-print the selected path after their status messages. For the original directory
-switching behavior, run this in zsh (optionally save it in your shell startup):
+print the selected path after their status messages. To switch directories automatically,
+add this to `~/.zshrc`:
 
 ```zsh
 eval "$(command rl init zsh)"
 ```
 
-The integration loads the shared implementation from this repository. All
-worktree logic lives here; `.zshrc` is optional and contains no application logic.
+Restart your terminal after adding the integration or upgrading RL.
 
 ## Configuration
 
-Defaults match the original function, using the current user's home directory.
+Register repositories with `rl repo add` and choose their base with `--base`.
+For other settings, use environment variables or a configuration file.
 Copy `config.example.zsh` to `${XDG_CONFIG_HOME:-$HOME/.config}/rl/config.zsh`,
 or select a file with `RL_CONFIG`. Configuration is trusted zsh code.
 
 | Setting | Default |
 | --- | --- |
-| `RL_REPO_ROOT` | `$HOME/Documents/GitHub/rosterlab-frontend` |
 | `RL_WORKTREE_DIR` | `$HOME/.rl/worktrees` |
-| `RL_REPO_NAME` | Repository directory basename |
-| `RL_DEFAULT_BASE` | `origin/develop` |
 | `RL_STATE_DIR` | `$HOME/.rl/instances` |
 | `RL_REPO` | Optional registered repository alias; unset to select automatically |
 
 Nonempty environment settings override the file. Repository and worktree
 and state directories must be absolute. The state directory must be outside the
-worktree. Worktrees live under
-`$RL_WORKTREE_DIR/$RL_REPO_NAME` in legacy mode, or the selected registry entry's
-worktree directory. `RL_REPO_ROOT`, `RL_REPO_NAME`, and `RL_DEFAULT_BASE` provide
-the legacy fallback; registered entries have their own root, directory, and base.
+worktree. Each registered repository has its own directory under
+`RL_WORKTREE_DIR` and its own base branch.
 Git operations target the selected repository even when run outside its checkout.
 
 ## Development
@@ -537,9 +521,13 @@ records and hook installation; `state.ts` handles sessions, documentation, and
 PR snapshots; `repos.ts` handles routing and overview; `delete.ts` handles batch
 removal; `picker.ts` builds annotated selections; `summary.ts` exports Markdown.
 Shared process, filesystem, and locking helpers live in `common.ts`.
+`agent-codex.ts` and `agent-claude.ts` translate native hook contracts into RL
+lifecycle events; `hooks.ts` handles validated events, `activity.ts` tracks
+observations, and `doctor.ts` diagnoses configuration and delivery. Add agent
+contracts in adapters rather than agent-specific branches in the state handler.
 
 `npm run build` compiles strict TypeScript into `dist/`. `bin/rl` and
-`lib/rl.zsh` retain the original shell configuration/worktree commands, while
+`lib/rl.zsh` handle shell configuration and worktree commands, while
 `shell/rl.zsh` provides parent-shell directory switching. The executable skips
 user zsh startup files; configuration comes from the documented file and environment.
 

@@ -40,6 +40,7 @@ Usage:
   rl delete --jobs 2 <names>      Limit parallel removals (default: 4)
   rl delete --dry-run <names>     Preview without deleting
   rl adopt                       Register this worktree and install session hooks
+  rl doctor [codex|claude] [--json]  Check hook setup and observed agent activity
   rl status                      Show this instance's metadata
   rl status --all [--fetch]       Branch overview across all registered repositories
   rl status --list [--json]       Branch overview for the selected repository
@@ -141,7 +142,7 @@ _rl_main() {
       command node "${${functions_source[_rl_main]}:A:h:h}/dist/cli.js" summary \
         --repo "$repo_root" --state-dir "$state_dir" --default-base "$default_base" "$@"
       return ;;
-    adopt|status|instances|resume|session|context|progress|pr)
+    adopt|doctor|status|instances|resume|session|context|progress|pr)
       _rl_state "$@"
       return ;;
   esac

@@ -10,6 +10,7 @@ const help = {
     "rl adopt [--worktree <path>] [--base <ref>]",
     "rl status [--fetch] [--json] | rl instances",
     "rl resume codex|claude",
+    "rl doctor [codex|claude] [--json]",
     "rl session list [agent] | rl session add <agent> <UUID>",
     "rl context|progress show|path|set <file>|append <file>",
     "rl pr show | rl pr sync [number|URL]",

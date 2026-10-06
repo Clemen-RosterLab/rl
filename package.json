@@ -1,7 +1,7 @@
 {
   "name": "rl-workspaces",
   "version": "0.4.4",
-  "description": "Persistent Git workspaces with shared feature documentation and explicit agent sessions",
+  "description": "Manage Git worktrees, project notes, and Codex or Claude sessions from your terminal",
   "license": "MIT",
   "bin": {
     "rl": "bin/rl"
