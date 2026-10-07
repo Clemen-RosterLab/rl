@@ -11,11 +11,34 @@ if [[ "$1" == --version || "$1" == -V ]]; then
   exec node -p 'JSON.parse(require("node:fs").readFileSync(process.argv[1], "utf8")).version' "$rl_home/package.json"
 fi
 if [[ "$1" == init ]]; then
-  if [[ "$2" != zsh || $# != 2 ]]; then
-    print -u2 'Usage: rl init zsh'
+  if [[ "$2" != zsh && "$2" != bash || $# != 2 ]]; then
+    print -u2 'Usage: rl init zsh|bash'
     exit 1
   fi
-  print -r -- "source ${(q)rl_home}/shell/rl.zsh"
+  if [[ "$2" == zsh ]]; then
+    print -r -- "source ${(q)rl_home}/shell/rl.zsh"
+  else
+    print -r -- "_rl_executable=${(qq)rl_home}/bin/rl"
+    cat <<'BASH'
+rl() {
+  local destination_file destination result previous="$PWD"
+  local -a arguments=("$@")
+  if [[ "$1" == switch && "${2:-}" == - ]]; then
+    [[ -n "${RL_PREVIOUS_WORKSPACE:-}" ]] || { printf '%s\n' 'No previous workspace in this shell' >&2; return 1; }
+    arguments[1]="$RL_PREVIOUS_WORKSPACE"
+  fi
+  destination_file=$(mktemp "${TMPDIR:-/tmp}/rl-shell.XXXXXXXX") || return 1
+  if RL_SHELL_OUTPUT="$destination_file" command "$_rl_executable" "${arguments[@]}"; then result=0; else result=$?; fi
+  destination=$(cat -- "$destination_file")
+  rm -f -- "$destination_file"
+  if [[ -n "$destination" ]]; then
+    builtin cd -- "$destination" || return 1
+    RL_PREVIOUS_WORKSPACE="$previous"
+  fi
+  return "$result"
+}
+BASH
+  fi
   exit 0
 fi
 source "$rl_home/lib/rl.zsh" || exit 1

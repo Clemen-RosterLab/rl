@@ -15,11 +15,12 @@ export RL_STATE_DIR="$scratch/state"
 unset RL_DEFAULT_BASE RL_REPO GIT_DIR GIT_WORK_TREE GIT_COMMON_DIR GIT_INDEX_FILE
 print '# Empty test configuration' > "$RL_CONFIG"
 git init --bare -q "$scratch/origin.git"
-git init -q -b develop "$RL_REPO_ROOT"
+git init -q -b test "$RL_REPO_ROOT"
 git -C "$RL_REPO_ROOT" commit -q --allow-empty -m Initial
 git -C "$RL_REPO_ROOT" remote add origin "$scratch/origin.git"
-git -C "$RL_REPO_ROOT" push -q -u origin develop
-git -C "$RL_REPO_ROOT" push -q origin develop:feature/remote
+git -C "$RL_REPO_ROOT" push -q -u origin test
+git -C "$RL_REPO_ROOT" push -q origin test:feature/remote
+git -C "$RL_REPO_ROOT" branch develop test
 cd "$scratch"
 "$root/bin/rl" new task
 [[ -d "$RL_WORKTREE_DIR/example/task" ]]
@@ -38,7 +39,7 @@ if "$root/bin/rl" delete ../escape; then exit 1; fi
 if "$root/bin/rl" new missing -b nonexistent; then exit 1; fi
 if "$root/bin/rl" unknown; then exit 1; fi
 print dirty > "$RL_WORKTREE_DIR/example/feature-remote/untracked"
-"$root/bin/rl" delete feature-remote
+"$root/bin/rl" delete --force feature-remote
 [[ ! -d "$RL_WORKTREE_DIR/example/feature-remote" ]]
 if git -C "$RL_REPO_ROOT" show-ref --verify --quiet refs/heads/feature/remote; then exit 1; fi
 [[ -n $(git -C "$RL_REPO_ROOT" ls-remote origin refs/heads/feature/remote) ]]

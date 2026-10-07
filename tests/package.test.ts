@@ -44,6 +44,16 @@ test("npm tarball ships built JavaScript and bundled runtime dependencies, with 
       name,
     );
   assert.ok(names.includes("package/dist/cli.js"));
+  for (const name of [
+    "workflow",
+    "workflow-config",
+    "command-context",
+    "git-workflow",
+    "pr-workflow",
+    "agent-launch",
+    "mcp",
+  ])
+    assert.ok(names.includes(`package/dist/${name}.js`));
   assert.ok(names.includes("package/LICENSE"));
   assert.ok(
     !names.some((name) => name.endsWith(".py") || name.endsWith(".ts")),
@@ -92,6 +102,51 @@ test("offline npm install, relocation and reinstall preserve hooks, sessions and
   );
   assert.match(w.command([cli, "help"]).stdout, /rl resume codex\|claude/);
   w.command([cli, "adopt"], { cwd: w.a });
+  assert.equal(
+    w.command([cli, "path", "@"], { cwd: w.a }).stdout.trim(),
+    w.repo,
+  );
+  for (const command of [
+    ["switch"],
+    ["step"],
+    ["merge"],
+    ["agent"],
+    ["handoff"],
+    ["pr", "checks"],
+    ["mcp"],
+  ])
+    assert.match(
+      w.command([cli, ...command, "--help"], { cwd: w.a }).stdout,
+      /rl /,
+    );
+  w.command([cli, "agent", "run", "codex", "--prompt", "package launch"], {
+    cwd: w.a,
+  });
+  assert.deepEqual(w.calls().at(-1).argv.slice(1), [
+    "exec",
+    "--",
+    "package launch",
+  ]);
+  w.command([cli, "agent", "start", "claude", "--", "--help"], { cwd: w.a });
+  assert.deepEqual(w.calls().at(-1).argv.slice(1), ["--help"]);
+  const rpc = w.command([cli, "mcp"], {
+    cwd: w.a,
+    input:
+      JSON.stringify({
+        jsonrpc: "2.0",
+        id: 1,
+        method: "initialize",
+        params: {
+          protocolVersion: "2025-11-25",
+          capabilities: {},
+          clientInfo: { name: "package-test", version: "1" },
+        },
+      }) + "\n",
+  });
+  assert.equal(
+    JSON.parse(rpc.stdout).result.serverInfo.version,
+    readJson(path.join(ROOT, "package.json")).version,
+  );
   w.command([cli, "progress", "append", "-"], {
     cwd: w.a,
     input: "Package install complete",

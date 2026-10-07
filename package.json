@@ -1,6 +1,6 @@
 {
   "name": "rl-workspaces",
-  "version": "0.4.4",
+  "version": "0.5.0",
   "description": "Manage Git worktrees, project notes, and Codex or Claude sessions from your terminal",
   "license": "MIT",
   "bin": {
@@ -27,7 +27,7 @@
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "prepack": "npm run build",
-    "test": "npm run build && tsc -p tsconfig.test.json && node --test .test-dist/*.test.js && zsh -f tests/smoke.zsh",
+    "test": "npm run build && tsc -p tsconfig.test.json && node --test --test-concurrency=4 .test-dist/*.test.js && zsh -f tests/smoke.zsh",
     "test:package": "npm run build && tsc -p tsconfig.test.json && node --test .test-dist/package.test.js",
     "format": "prettier --write \"src/**/*.ts\" \"tests/**/*.ts\" \"tsconfig*.json\" package.json",
     "format:check": "prettier --check \"src/**/*.ts\" \"tests/**/*.ts\" \"tsconfig*.json\" package.json"

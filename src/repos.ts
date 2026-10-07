@@ -1,5 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
+import { syncCodexSessions } from "./codex-sessions.js";
 import {
   args,
   arity,
@@ -258,6 +259,8 @@ interface Row extends Checkout {
   key: string | null;
   repository: string;
   pr: Instance["pr"];
+  sessions?: Instance["sessions"];
+  task?: Instance["task"];
   stateDirectory?: string;
   repositoryName: string;
   gitStatus: BranchStatus;
@@ -283,6 +286,7 @@ async function repositoryRows(
     }
   }
   try {
+    await syncCodexSessions(store);
     const records = store.records(),
       activePaths = new Set(
         records
@@ -342,6 +346,9 @@ function display(rows: Row[]): void {
       "UPSTREAM",
       "SYNC",
       "PR (cached)",
+      "CODEX",
+      "CLAUDE",
+      "TASK",
     ],
   ];
   for (const row of rows) {
@@ -377,6 +384,9 @@ function display(rows: Row[]): void {
       s.upstream || "-",
       sync,
       row.pr ? `#${row.pr.number} ${row.pr.state}` : "-",
+      String(row.sessions?.codex.length ?? 0),
+      String(row.sessions?.claude.length ?? 0),
+      row.task?.state ?? "-",
     ]);
   }
   const widths = table[0].map((_, col) =>

@@ -2,15 +2,12 @@ import fs from "node:fs";
 import path from "node:path";
 import { adapters, agentAdapter } from "./agent-registry.js";
 import { activityView, STALE_AFTER_MS } from "./activity.js";
-import {
-  execute,
-  isSymlink,
-  json,
-  message,
-  object,
-  readJson,
-} from "./common.js";
+import { execute, isSymlink, json, message } from "./common.js";
 import { hookCommand, Store } from "./store.js";
+import { isJsonObject, readJsonObject } from "./json.js";
+
+const PROBE_TIMEOUT_MS = 2000;
+const MAX_VERSION_LENGTH = 200;
 
 export async function doctor(
   store: Store,
@@ -24,27 +21,47 @@ export async function doctor(
   const agents = await Promise.all(
     selectedAdapters.map(async (adapter) => {
       const configPath = path.join(data.worktree, adapter.configPath);
+      const expectedEvents = Object.keys({
+        ...adapter.events,
+        ...(data.extendedHooks ? adapter.extraEvents : {}),
+      });
+      const executablePath =
+        (process.env.PATH ?? "")
+          .split(path.delimiter)
+          .map((directory) =>
+            path.resolve(data.worktree, directory, adapter.name),
+          )
+          .find((candidate) => {
+            try {
+              fs.accessSync(candidate, fs.constants.X_OK);
+              return fs.statSync(candidate).isFile();
+            } catch {
+              return false;
+            }
+          }) ?? null;
       let configError: string | null = null;
       let installedEvents: string[] = [];
       try {
         if (isSymlink(configPath) || isSymlink(path.dirname(configPath)))
           throw new Error("Hook configuration is a symlink");
-        const config = readJson(configPath);
-        if (!object(config.hooks)) throw new Error("Missing hooks object");
+        const config = readJsonObject(configPath);
+        if (!isJsonObject(config.hooks))
+          throw new Error("Missing hooks object");
         const command = hookCommand(store, data, adapter.name);
-        installedEvents = Object.keys(adapter.events).filter((event) => {
-          const groups = (config.hooks as Record<string, unknown>)[event];
+        const hooks = config.hooks;
+        installedEvents = expectedEvents.filter((event) => {
+          const groups = hooks[event];
           if (!Array.isArray(groups)) return false;
           return groups.some(
             (group) =>
-              object(group) &&
+              isJsonObject(group) &&
               (group.matcher === undefined ||
                 group.matcher === "" ||
                 group.matcher === "*") &&
               Array.isArray(group.hooks) &&
               group.hooks.some(
-                (h: unknown) =>
-                  object(h) &&
+                (h) =>
+                  isJsonObject(h) &&
                   h.type === "command" &&
                   h.command === command &&
                   h.async !== true,
@@ -54,21 +71,36 @@ export async function doctor(
       } catch (error) {
         configError = message(error);
       }
-      const missingEvents = Object.keys(adapter.events).filter(
+      const missingEvents = expectedEvents.filter(
         (event) => !installedEvents.includes(event),
       );
       let cliAvailable = false,
         version: string | null = null,
-        cliError: string | null = null;
+        cliError: string | null = null,
+        launchVerified = false;
       try {
         const result = await execute(
           [adapter.name, "--version"],
           data.worktree,
-          { timeoutMs: 2000 },
+          { timeoutMs: PROBE_TIMEOUT_MS },
         );
         cliAvailable = result.code === 0;
-        version = result.stdout.trim().slice(0, 200) || null;
+        version = result.stdout.trim().slice(0, MAX_VERSION_LENGTH) || null;
         if (!cliAvailable) cliError = "Version probe failed or timed out";
+        if (cliAvailable) {
+          const help = await execute(
+            adapter.name === "codex"
+              ? [adapter.name, "exec", "--help"]
+              : [adapter.name, "--help"],
+            data.worktree,
+            { timeoutMs: PROBE_TIMEOUT_MS },
+          );
+          launchVerified =
+            help.code === 0 &&
+            (adapter.name === "codex"
+              ? /codex exec/.test(help.stdout) && /PROMPT/.test(help.stdout)
+              : /--print/.test(help.stdout) && /--resume/.test(help.stdout));
+        }
       } catch (error) {
         cliError = message(error);
       }
@@ -81,6 +113,10 @@ export async function doctor(
         missingEvents,
         configError,
         cliAvailable,
+        executablePath,
+        launchVerified,
+        extendedHooks: !!data.extendedHooks,
+        delivery: health?.lastSuccess ? "observed" : "not-observed",
         version,
         cliError,
         compatibility: "unverified",
@@ -114,7 +150,9 @@ export async function doctor(
       console.log(
         `\n${item.agent}: hooks ${item.installed ? "installed" : "incomplete"}; CLI ${item.cliAvailable ? (item.version ?? "available") : "unavailable"}`,
       );
-      console.log(`  Compatibility: unverified; hook trust: unknown`);
+      console.log(
+        `  CLI: ${item.executablePath ?? "not on PATH"}; launch flags: ${item.launchVerified ? "verified in installed help" : "unverified"}; hook trust: unknown`,
+      );
       console.log(
         `  Last received event: ${item.lastSuccess ? `${item.lastSuccess.event} at ${item.lastSuccess.at}` : "none"}`,
       );

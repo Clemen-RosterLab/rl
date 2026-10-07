@@ -12,34 +12,63 @@ _rl_repos() {
 
 _rl_enter() {
   _rl_state adopt --worktree "$1" --base "${base:-$default_base}" --quiet || return 1
+  _rl_change_directory "$1"
+}
+
+_rl_change_directory() {
+  local previous="$PWD"
   builtin cd -- "$1" || return 1
-  if [[ "${RL_INTERNAL_SHELL:-0}" != 1 ]]; then
+  if [[ "${RL_INTERNAL_SHELL:-0}" == 1 ]]; then
+    typeset -g RL_PREVIOUS_WORKSPACE="$previous"
+  elif [[ -n "${RL_SHELL_OUTPUT:-}" ]]; then
+    print -rn -- "$PWD" > "$RL_SHELL_OUTPUT"
+  else
     print -r -- "$PWD"
   fi
 }
 
-_rl_validate_name() {
-  case "$1" in
-    ''|/*|.|..|./*|../*|*/../*|*/./*|*/..|*/.)
-      print -u2 -r -- "Invalid workspace name: $1"
-      return 1 ;;
-  esac
-  git check-ref-format --branch "$1" >/dev/null 2>&1 || {
-    print -u2 -r -- "Invalid workspace name: $1"
-    return 1
-  }
+_rl_recover_directory() {
+  [[ -d "$PWD" ]] && return 0
+  builtin cd -- "$repo_root" || return 1
+  if [[ -n "${RL_SHELL_OUTPUT:-}" ]]; then
+    print -rn -- "$PWD" > "$RL_SHELL_OUTPUT"
+  fi
 }
 
 _rl_help() {
   cat <<'HELP'
 Usage:
   rl                             Pick a worktree with PR state and base commit counts
-  rl new <name> [--base|-b <ref>]  Create a worktree (default: origin/develop)
+  rl new <name> [--base|-b <ref>]  Create a worktree (default: origin/test)
   rl open --branch|-b <branch>    Open a local or origin branch
-  rl delete [<name> ...]          Multi-select or batch-remove worktrees AND local branches
+  rl switch <name> [-c] [--base ref] [--no-fetch] [--setup]
+  rl switch <name> --agent codex|claude [-- <agent args>]
+  rl switch @|-                  Main checkout or previous workspace
+  rl list [--json]               Show workspaces and branch status
+  rl path [name]                 Print a workspace path
+  rl exec [--workspace name] -- <command> [args...]
+  rl setup [--workspace name] [--dry-run]  Run explicit project setup
+  rl config init|show            Configure .rl/workflows.json
+  rl delete [<name> ...]          Remove clean merged worktrees and branches
+  rl delete --force <names>       Also remove dirty worktrees and unmerged branches
   rl delete --jobs 2 <names>      Limit parallel removals (default: 4)
   rl delete --dry-run <names>     Preview without deleting
-  rl adopt                       Register this worktree and install session hooks
+  rl adopt [--extended-hooks]     Register worktree and optional extended hooks
+  rl doctor [codex|claude] --repair  Repair project hooks
+  rl agent start codex|claude [-- <args>]  Start an interactive agent
+  rl agent run codex|claude --prompt <text>  Run an agent with a prompt
+  rl handoff [codex|claude]       Export task context for another agent
+  rl pause --file <handoff.json|->  Save session, changes, validation, and next steps
+  rl continue [workspace] [--no-agent]  Open a saved task and resume its conversation
+  rl mcp                         Serve task context and notes over stdio
+  rl step commit -m <message>     Commit staged changes
+  rl step rebase [--base ref]     Rebase this workspace onto its base
+  rl step squash -m <message>    Squash feature commits into one
+  rl merge [target] [--squash -m message] [--cleanup]  Integrate into a base checkout
+  rl diff [--base ref] [-- --stat]  Show workspace changes
+  rl log [--base ref] [-- --oneline]  Show feature commits
+  rl pr checks                  Show pull request checks
+  rl pr checkout <number>        Create a workspace for a pull request
   rl doctor [codex|claude] [--json]  Check hook setup and observed agent activity
   rl status                      Show this instance's metadata
   rl status --all [--fetch]       Branch overview across all registered repositories
@@ -52,6 +81,7 @@ Usage:
   rl instances                   List active and deleted instance records
   rl resume codex|claude          Resume this instance's last explicitly recorded session
   rl session list [agent]        Show recorded sessions
+  rl session save [agent] [UUID] Save the current Codex session or an explicit UUID
   rl session add <agent> <UUID>   Explicitly associate an existing session
   rl context show|path            Read feature/domain documentation
   rl context set|append <file>    Replace or append documentation (- reads stdin)
@@ -63,11 +93,11 @@ Usage:
   rl pr show                     Show cached GitHub PR state
   rl pr sync [number|URL]         Refresh and save PR state with gh
   rl help                       Show this help
-  rl init zsh                   Print optional shell integration
+  rl init zsh|bash              Print optional shell integration
   rl --version                  Print installed package version
 
 Pickers auto-detect PRs (60s cache) and commits +ahead/-behind the base (local refs).
-Deletion includes uncommitted changes; remote branches are never deleted.
+Deletion requires --force for uncommitted changes or unmerged branches.
 Use shell integration to change the calling shell's directory.
 HELP
 }
@@ -79,6 +109,7 @@ _rl_main() {
   local RL_REPO_ROOT="${RL_REPO_ROOT-}" RL_WORKTREE_DIR="${RL_WORKTREE_DIR-}"
   local RL_REPO_NAME="${RL_REPO_NAME-}" RL_DEFAULT_BASE="${RL_DEFAULT_BASE-}"
   local RL_STATE_DIR="${RL_STATE_DIR-}"
+  local env_selection_present=${+RL_REPO}
   local RL_REPO="${RL_REPO-}"
   local env_root="$RL_REPO_ROOT" env_dir="$RL_WORKTREE_DIR"
   local env_name="$RL_REPO_NAME" env_base="$RL_DEFAULT_BASE"
@@ -93,9 +124,10 @@ _rl_main() {
   local repo_root="${env_root:-${RL_REPO_ROOT:-$HOME/Documents/GitHub/rosterlab-frontend}}"
   local base_dir="${env_dir:-${RL_WORKTREE_DIR:-$HOME/.rl/worktrees}}"
   local repo_name="${env_name:-${RL_REPO_NAME:-${repo_root:t}}}"
-  local default_base="${env_base:-${RL_DEFAULT_BASE:-origin/develop}}"
+  local default_base="${env_base:-${RL_DEFAULT_BASE:-origin/test}}"
   local state_dir="${env_state:-${RL_STATE_DIR:-$HOME/.rl/instances}}"
-  local selected_repo="${env_selection:-$RL_REPO}"
+  local selected_repo="$RL_REPO"
+  (( env_selection_present )) && selected_repo="$env_selection"
   [[ "$repo_root" = /* && "$base_dir" = /* && "$state_dir" = /* ]] || {
     print -u2 'Repository, worktree, and state directories must be absolute paths.'
     return 1
@@ -121,6 +153,11 @@ _rl_main() {
     _rl_repos "$@"
     return
   fi
+  if [[ "$command" == list ]]; then
+    shift
+    _rl_repos status --list "$@"
+    return
+  fi
   if [[ "$command" == status ]] && (( ${argv[(Ie)--all]} || ${argv[(Ie)--list]} )); then
     _rl_repos "$@"
     return
@@ -136,7 +173,36 @@ _rl_main() {
     default_base="$repository_fields[3]"
   fi
 
+  if [[ "$command" == pr && ( "$2" == checks || "$2" == checkout ) ]]; then
+    command node "${${functions_source[_rl_main]}:A:h:h}/dist/cli.js" pr \
+      --repo "$repo_root" --state-dir "$state_dir" --base-dir "$base_dir/$repo_name" \
+      --default-base "$default_base" "$@"
+    return
+  fi
   case "$command" in
+    pause)
+      command node "${${functions_source[_rl_main]}:A:h:h}/dist/cli.js" task \
+        --repo "$repo_root" --state-dir "$state_dir" --base-dir "$base_dir/$repo_name" \
+        --default-base "$default_base" "$@"
+      return ;;
+    step|merge|diff|log)
+      command node "${${functions_source[_rl_main]}:A:h:h}/dist/cli.js" git \
+        --repo "$repo_root" --state-dir "$state_dir" --base-dir "$base_dir/$repo_name" \
+        --default-base "$default_base" "$@"
+      local git_result=$?
+      _rl_recover_directory || return 1
+      return $git_result ;;
+    agent|handoff)
+      [[ "$command" == agent ]] && shift
+      command node "${${functions_source[_rl_main]}:A:h:h}/dist/cli.js" agent \
+        --repo "$repo_root" --state-dir "$state_dir" --base-dir "$base_dir/$repo_name" \
+        --default-base "$default_base" "$@"
+      return ;;
+    mcp)
+      shift
+      command node "${${functions_source[_rl_main]}:A:h:h}/dist/cli.js" mcp \
+        --repo "$repo_root" --state-dir "$state_dir" "$@"
+      return ;;
     summary)
       shift
       command node "${${functions_source[_rl_main]}:A:h:h}/dist/cli.js" summary \
@@ -147,242 +213,36 @@ _rl_main() {
       return ;;
   esac
 
-  # ------------------------------------------------------------
-  # rl new <name> [--base <branch>]
-  # ------------------------------------------------------------
-  if [[ "$command" == "new" ]]; then
-    name="$2"
-
-    if [[ -z "$name" ]]; then
-      echo "Usage: rl new <name> [--base <branch>]"
-      return 1
-    fi
-
-    # Default base branch.
-    base="$default_base"
-
-    shift 2
-
-    while [[ $# -gt 0 ]]; do
-      case "$1" in
-        --base|-b)
-          if [[ -z "$2" ]]; then
-            echo "Missing branch after $1"
-            return 1
-          fi
-
-          base="$2"
-          shift 2
-          ;;
-
-        *)
-          echo "Unknown option: $1"
-          echo "Usage: rl new <name> [--base <branch>]"
-          return 1
-          ;;
-      esac
-    done
-
-    _rl_validate_name "$name" || return 1
-    branch="$name"
-    worktree="$base_dir/$repo_name/$name"
-
-    mkdir -p "$base_dir/$repo_name" || return 1
-
-    echo "Fetching origin..."
-    git -C "$repo_root" fetch origin || return 1
-
-    # Make origin/foo syntax optional.
-    # If "foo" doesn't exist locally but origin/foo does,
-    # use origin/foo as the base.
-    if ! git -C "$repo_root" rev-parse \
-      --verify "$base^{commit}" >/dev/null 2>&1; then
-
-      if git -C "$repo_root" rev-parse \
-        --verify "origin/$base^{commit}" >/dev/null 2>&1; then
-
-        base="origin/$base"
-      else
-        echo "Base branch does not exist:"
-        echo "  $base"
-        return 1
+  case "$command" in
+    switch|new|open|continue)
+      if [[ "$command" == switch && "$2" == - ]]; then
+        [[ -n "${RL_PREVIOUS_WORKSPACE:-}" ]] || { print -u2 'No previous workspace in this shell'; return 1; }
+        argv[2]="$RL_PREVIOUS_WORKSPACE"
       fi
-    fi
-
-    if [[ -e "$worktree" ]]; then
-      echo "Worktree already exists:"
-      echo "  $worktree"
-      return 1
-    fi
-
-    # If <name> already exists, reuse it.
-    if git -C "$repo_root" show-ref \
-      --verify --quiet "refs/heads/$branch"; then
-
-      echo "Branch already exists: $branch"
-
-      existing_worktree=$(
-        git -C "$repo_root" worktree list --porcelain |
-        awk -v target="refs/heads/$branch" '
-          /^worktree / {
-            path = substr($0, 10)
-          }
-
-          /^branch / {
-            if (substr($0, 8) == target) {
-              print path
-              exit
-            }
-          }
-        '
-      )
-
-      if [[ -n "$existing_worktree" ]]; then
-        echo "Branch already has a worktree:"
-        echo "  $existing_worktree"
-        _rl_enter "$existing_worktree"
-        return
-      fi
-
-      git -C "$repo_root" worktree add \
-        "$worktree" \
-        "$branch" || return 1
-
-    else
-
-      echo "Creating:"
-      echo "  branch: $branch"
-      echo "  base:   $base"
-
-      git -C "$repo_root" worktree add \
-        -b "$branch" \
-        "$worktree" \
-        "$base" || return 1
-    fi
-
-    echo ""
-    echo "Created workspace: $name"
-    echo "Branch:   $branch"
-    echo "Base:     $base"
-    echo "Worktree: $worktree"
-
-    _rl_enter "$worktree"
-    return
-  fi
-
-  # ------------------------------------------------------------
-  # rl open --branch <branch>
-  # rl open -b <branch>
-  # ------------------------------------------------------------
-  if [[ "$command" == "open" ]]; then
-
-    if [[ "$2" != "--branch" && "$2" != "-b" ]]; then
-      echo "Usage:"
-      echo "  rl open --branch <branch>"
-      echo "  rl open -b <branch>"
-      return 1
-    fi
-
-    branch="$3"
-
-    if [[ -z "$branch" ]]; then
-      echo "Usage: rl open --branch <branch>"
-      return 1
-    fi
-
-    echo "Fetching origin..."
-    git -C "$repo_root" fetch origin || return 1
-
-    # Allow:
-    #
-    #   rl open --branch foo
-    #   rl open --branch origin/foo
-    #
-    if [[ "$branch" == origin/* ]]; then
-      branch="${branch#origin/}"
-    fi
-
-    git -C "$repo_root" check-ref-format --branch "$branch" >/dev/null 2>&1 || {
-      print -u2 -r -- "Invalid branch: $branch"
-      return 1
-    }
-
-    # Does local branch exist?
-    if ! git -C "$repo_root" show-ref \
-      --verify --quiet "refs/heads/$branch"; then
-
-      # If not, check origin.
-      if git -C "$repo_root" show-ref \
-        --verify --quiet "refs/remotes/origin/$branch"; then
-
-        echo "Creating local tracking branch:"
-        echo "  $branch -> origin/$branch"
-
-        git -C "$repo_root" branch \
-          --track "$branch" "origin/$branch" || return 1
-
-      else
-        echo "Branch does not exist locally or on origin:"
-        echo "  $branch"
-        return 1
-      fi
-    fi
-
-    # Check whether branch already has a worktree.
-    existing_worktree=$(
-      git -C "$repo_root" worktree list --porcelain |
-      awk -v target="refs/heads/$branch" '
-        /^worktree / {
-          path = substr($0, 10)
-        }
-
-        /^branch / {
-          if (substr($0, 8) == target) {
-            print path
-            exit
-          }
-        }
-      '
-    )
-
-    if [[ -n "$existing_worktree" ]]; then
-      echo "Opening existing worktree:"
-      echo "  $existing_worktree"
-
-      _rl_enter "$existing_worktree"
-      return
-    fi
-
-    # Turn things like:
-    #
-    # feature/cliniko
-    #
-    # into:
-    #
-    # feature-cliniko
-    #
-    name="${branch//\//-}"
-    worktree="$base_dir/$repo_name/$name"
-
-    if [[ -e "$worktree" ]]; then
-      echo "Worktree path already exists:"
-      echo "  $worktree"
-      return 1
-    fi
-
-    mkdir -p "$base_dir/$repo_name" || return 1
-
-    echo "Creating worktree:"
-    echo "  branch:   $branch"
-    echo "  worktree: $worktree"
-
-    git -C "$repo_root" worktree add \
-      "$worktree" \
-      "$branch" || return 1
-
-    _rl_enter "$worktree"
-    return
-  fi
+      local destination_file destination workflow_result
+      local workflow_command=workflow
+      [[ "$command" == continue ]] && workflow_command=task
+      destination_file=$(mktemp "${TMPDIR:-/tmp}/rl-switch.XXXXXXXX") || return 1
+      {
+        command node "${${functions_source[_rl_main]}:A:h:h}/dist/cli.js" "$workflow_command" \
+          --repo "$repo_root" --state-dir "$state_dir" --base-dir "$base_dir/$repo_name" \
+          --default-base "$default_base" --output-path "$destination_file" "$@"
+        workflow_result=$?
+        destination=$(<"$destination_file")
+        if [[ -n "$destination" ]]; then
+          _rl_change_directory "$destination" || return 1
+        fi
+        return $workflow_result
+      } always {
+        command rm -f -- "$destination_file"
+      }
+      ;;
+    path|exec|setup|config)
+      command node "${${functions_source[_rl_main]}:A:h:h}/dist/cli.js" workflow \
+        --repo "$repo_root" --state-dir "$state_dir" --base-dir "$base_dir/$repo_name" \
+        --default-base "$default_base" "$@"
+      return ;;
+  esac
 
   if [[ "$command" == "delete" ]]; then
     shift
@@ -391,7 +251,7 @@ _rl_main() {
       --base-dir "$base_dir/$repo_name" --default-base "$default_base" "$@"
     local delete_result=$?
     # With shell integration, leave a deleted current directory gracefully.
-    [[ -d "$PWD" ]] || builtin cd -- "$repo_root"
+    _rl_recover_directory || return 1
     return $delete_result
   fi
 

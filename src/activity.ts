@@ -55,7 +55,7 @@ export function recordActivity(
   // Arrival order is the only portable ordering available. Do not invent a
   // source timestamp or claim this is a process-liveness signal.
   item.state =
-    event.type === "context.restored"
+    event.type === "context.restored" || event.type === "notification"
       ? item.state
       : event.type === "session.ended"
         ? "ended"

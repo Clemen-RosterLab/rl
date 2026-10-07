@@ -5,6 +5,7 @@ import { randomUUID } from "node:crypto";
 import { spawnSync, spawn } from "node:child_process";
 import { parseArgs } from "node:util";
 import lockfile from "proper-lockfile";
+import { readJsonObject } from "./json.js";
 
 export const now = (): string => new Date().toISOString();
 export const message = (error: unknown): string =>
@@ -133,13 +134,7 @@ export function object(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 export function readJson(file: string): Record<string, unknown> {
-  try {
-    const data: unknown = JSON.parse(fs.readFileSync(file, "utf8"));
-    if (!object(data)) throw new Error("Expected a JSON object");
-    return data;
-  } catch (error) {
-    throw new Error(`Cannot read ${file}: ${message(error)}`);
-  }
+  return readJsonObject(file);
 }
 export function atomicWrite(file: string, text: string): void {
   fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });

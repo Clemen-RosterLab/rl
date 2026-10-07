@@ -23,6 +23,10 @@ import {
   writeJson,
 } from "./common.js";
 import { NOTE_TEMPLATES } from "./templates.js";
+import { handoffText, validateTask, type TaskState } from "./task-state.js";
+const HOOK_TIMEOUT_SECONDS = 10;
+const CODEX_END_TIMEOUT_SECONDS = 3;
+
 export type { Agent } from "./agents.js";
 export interface Session {
   id: string;
@@ -44,6 +48,8 @@ export interface Instance extends Tracking {
   sessions: Record<Agent, Session[]>;
   pr: (Record<string, unknown> & { url: string }) | null;
   hookCommands?: Record<Agent, string>;
+  extendedHooks?: boolean;
+  task?: TaskState;
   [key: string]: unknown;
 }
 export interface Checkout {
@@ -152,6 +158,34 @@ export class Store {
       createHash("sha256").update(this.repo).digest("hex").slice(0, 24),
     );
   }
+  archiveWorktrees(paths: readonly string[]): void {
+    for (const [file, data] of this.records()) {
+      if (data.status !== "active" || !paths.includes(data.worktree)) continue;
+      data.status = "deleted";
+      data.deletedAt = now();
+      this.save(file, data);
+    }
+  }
+  readDocument(file: string, kind: "context" | "progress"): string {
+    return fs.readFileSync(path.join(path.dirname(file), kind + ".md"), "utf8");
+  }
+  updateDocument(
+    file: string,
+    data: Instance,
+    kind: "context" | "progress",
+    action: "set" | "append",
+    text: string,
+  ): void {
+    const content =
+      action === "append"
+        ? this.readDocument(file, kind).trimEnd() +
+          `\n\n### Update ${now()}\n\n` +
+          text.trimEnd() +
+          "\n"
+        : text;
+    atomicWrite(path.join(path.dirname(file), kind + ".md"), content);
+    this.save(file, data);
+  }
   locked<T>(action: () => T | Promise<T>): Promise<T> {
     return locked(this.root, ".typescript.lock", action);
   }
@@ -178,10 +212,13 @@ export class Store {
             data.pr === null ||
             (object(data.pr) && typeof data.pr.url === "string")
           ) ||
-          !object(data.sessions)
+          !object(data.sessions) ||
+          (data.extendedHooks !== undefined &&
+            typeof data.extendedHooks !== "boolean")
         )
           throw new Error();
         validateTracking(data);
+        if (data.task !== undefined) validateTask(data.task);
         for (const agent of ["codex", "claude"]) {
           const sessions = data.sessions[agent];
           if (!Array.isArray(sessions)) throw new Error();
@@ -254,7 +291,11 @@ export class Store {
       previous && timestamp(previous) > timestamp(stamp) ? previous : stamp;
     this.save(file, data);
   }
-  async adopt(cwd: string, baseBranch?: string): Promise<RecordEntry> {
+  async adopt(
+    cwd: string,
+    baseBranch?: string,
+    extendedHooks?: boolean,
+  ): Promise<RecordEntry> {
     const [root, branch] = this.worktree(cwd);
     if (this.stateDir === root || inside(this.stateDir, root))
       throw new Error(
@@ -265,6 +306,7 @@ export class Store {
         if (data.status === "active" && data.worktree === root) {
           if (data.branch !== branch)
             throw new Error(`This instance already owns branch ${data.branch}`);
+          if (extendedHooks !== undefined) data.extendedHooks = extendedHooks;
           installHooks(this, file, data);
           this.touch(file, data);
           return [file, data];
@@ -286,6 +328,7 @@ export class Store {
         sessions: { codex: [], claude: [] },
         pr: null,
       };
+      if (extendedHooks !== undefined) data.extendedHooks = extendedHooks;
       if (baseBranch) data.baseBranch = baseBranch;
       // Discovery also covers worktrees without instance records. Carry their
       // snapshot into the newly adopted instance without another network lookup.
@@ -388,7 +431,10 @@ function installHooks(store: Store, file: string, data: Instance): void {
     const hooks = (config.hooks ??= {});
     if (!object(hooks)) throw new Error(`Invalid hooks object in ${target}`);
     commands[agent] = hookCommand(store, data, agent);
-    for (const event of Object.keys(adapter.events)) {
+    for (const event of Object.keys({
+      ...adapter.events,
+      ...(data.extendedHooks ? adapter.extraEvents : {}),
+    })) {
       const groups = hooks[event] ?? [];
       if (!Array.isArray(groups))
         throw new Error(`Invalid ${event} hooks in ${target}`);
@@ -408,7 +454,17 @@ function installHooks(store: Store, file: string, data: Instance): void {
         if (handlers.length) kept.push({ ...group, hooks: handlers });
       }
       kept.push({
-        hooks: [{ type: "command", command: commands[agent], timeout: 10 }],
+        hooks: [
+          {
+            type: "command",
+            command: commands[agent],
+            timeout:
+              event === "Interrupt" ||
+              (agent === "codex" && event === "SessionEnd")
+                ? CODEX_END_TIMEOUT_SECONDS
+                : HOOK_TIMEOUT_SECONDS,
+          },
+        ],
       });
       hooks[event] = kept;
     }
@@ -446,6 +502,14 @@ export function contextText(file: string, data: Instance): string {
     `RL feature workspace: ${data.id}\nBranch: ${data.branch}`,
     "The following RL-owned documents are shared living feature documentation, not just conversation memory. Read them before starting work, and read the full files when excerpts are truncated. At meaningful milestones and before finishing your task, document what changed, what remains, implementation details (file/symbol references, flows, APIs, data structures), decisions and rationale, checks actually run, and blockers. Keep completed and planned work distinct; do not mark unverified work as tested or done. Respect your assigned scope and permissions; read-only agents should return proposed documentation updates to their parent. Use 'rl context append <file>' for durable domain or design notes and 'rl progress append <file>' for milestone/handoff updates ('-' reads stdin). Append is locked so concurrent agents do not overwrite one another. Use 'rl context set <file>' or 'rl progress set <file>' only for a deliberate replacement after reading the latest document and coordinating with other writers. Re-read the documents before planning subsequent work.",
   ];
+  sections.push(
+    "When the user asks to pause or save this task for later, save a task handoff with rl_task_pause through MCP, or 'rl pause --summary <text> --changes <text> --validation <text> --next <text> [--blockers <text>]'. Include the current session UUID (Codex shell commands can infer it), concrete changes, checks actually run and their results, remaining work, and blockers. Use 'Not run' for unperformed checks. A pause saves task state; it does not terminate the agent. The user can return with 'rl continue'.",
+  );
+  const latest = data.task?.handoffs.at(-1);
+  if (latest)
+    sections.push(
+      `RL task state: ${data.task!.state}\n\n${handoffText(latest)}`,
+    );
   for (const name of ["context.md", "progress.md"]) {
     const source = path.join(path.dirname(file), name),
       text = fs.readFileSync(source, "utf8");

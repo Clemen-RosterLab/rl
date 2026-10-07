@@ -203,3 +203,38 @@ test("manual session registration respects ownership established by stop-only ob
   w.rl(["session", "add", "claude", sid], { cwd: w.b, ok: false });
   assert.deepEqual(w.status(w.b).sessions.claude, []);
 });
+
+test("extended hooks are opt-in and preserve notification activity and session ownership", (t) => {
+  const w = new Workspace(t);
+  const sid = randomUUID();
+  assert.equal(
+    readJson(path.join(w.a, ".codex/hooks.json")).hooks.Interrupt,
+    undefined,
+  );
+  w.rl(["adopt", "--extended-hooks"], { cwd: w.a });
+  assert.equal(
+    readJson(path.join(w.a, ".codex/hooks.json")).hooks.Interrupt[0].hooks[0]
+      .timeout,
+    3,
+  );
+  for (const agent of ["codex", "claude"]) {
+    w.hook(agent, sid);
+    w.hook(agent, sid, { event: "UserPromptSubmit" });
+    if (agent === "claude") {
+      assert.equal(w.hook(agent, sid, { event: "Notification" }).stdout, "");
+      assert.equal(w.status().activity.claude[0].state, "working");
+    }
+    assert.equal(
+      w.hook(agent, sid, {
+        event: agent === "codex" ? "Interrupt" : "StopFailure",
+      }).stdout,
+      "",
+    );
+    assert.equal(w.status().activity[agent][0].state, "idle");
+    assert.equal(w.status().sessions[agent].length, 1);
+  }
+  w.rl(["doctor", "--repair", "--json"], { cwd: w.a });
+  assert.ok(
+    readJson(path.join(w.a, ".claude/settings.local.json")).hooks.StopFailure,
+  );
+});

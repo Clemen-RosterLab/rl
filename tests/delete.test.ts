@@ -10,7 +10,7 @@ test("batch deletion deduplicates names and retains archived records", (t) => {
   for (const root of roots)
     write(path.join(root, "uncommitted.txt"), "unfinished");
   assert.match(
-    w.rl(["delete", "one", "feature/two", "three", "one"]).stdout,
+    w.rl(["delete", "--force", "one", "feature/two", "three", "one"]).stdout,
     /Removed 3 worktree\(s\); failed 0/,
   );
   for (const [index, root] of roots.entries()) {
@@ -55,6 +55,45 @@ test("preflight and dry-run preserve worktrees", (t) => {
   assert.ok(fs.existsSync(one));
   assert.equal(w.status(one).status, "active");
 });
+test("default deletion preserves dirty workspaces and unmerged commits", (t) => {
+  const w = new Workspace(t),
+    dirty = w.managed("dirty"),
+    unmerged = w.managed("unmerged");
+  write(path.join(dirty, "unfinished.txt"), "keep this");
+  write(path.join(unmerged, "feature.txt"), "keep this commit");
+  w.git(unmerged, "add", "feature.txt");
+  w.git(unmerged, "commit", "-m", "Unmerged feature");
+  const before = w.git(unmerged, "rev-parse", "HEAD");
+  w.rl(["delete", "dirty", "unmerged"], { ok: false });
+  assert.equal(read(path.join(dirty, "unfinished.txt")), "keep this");
+  assert.equal(w.git(unmerged, "rev-parse", "HEAD"), before);
+  for (const root of [dirty, unmerged])
+    assert.equal(w.status(root).status, "active");
+  w.rl(["delete", "--force", "dirty", "unmerged"]);
+  assert.ok(!fs.existsSync(dirty) && !fs.existsSync(unmerged));
+});
+test("default deletion preserves detached commits and interrupted operations", (t) => {
+  const w = new Workspace(t),
+    detached = w.managed("detached"),
+    interrupted = w.managed("interrupted");
+  w.git(detached, "checkout", "--detach");
+  w.git(detached, "commit", "--allow-empty", "-m", "Detached work");
+  const head = w.git(detached, "rev-parse", "HEAD");
+  const rebase = w.git(
+    interrupted,
+    "rev-parse",
+    "--path-format=absolute",
+    "--git-path",
+    "rebase-merge",
+  );
+  fs.mkdirSync(rebase);
+  w.rl(["delete", "detached", "interrupted"], { ok: false });
+  assert.ok(fs.existsSync(detached) && fs.existsSync(interrupted));
+  assert.equal(w.git(detached, "rev-parse", "HEAD"), head);
+  fs.rmdirSync(rebase);
+  w.rl(["delete", "--force", "detached", "interrupted"]);
+  assert.ok(!fs.existsSync(detached) && !fs.existsSync(interrupted));
+});
 test("locked worktree failure retains state and other targets still complete", (t) => {
   const w = new Workspace(t),
     one = w.managed("one"),
@@ -81,7 +120,7 @@ test("parallel removal overlaps but branch cleanup and prune each run once", (t)
     "git",
     `const fs=require('node:fs'),path=require('node:path'),cp=require('node:child_process'); const args=process.argv.slice(2); fs.appendFileSync(process.env.GIT_CALLS,JSON.stringify(args)+'\\n'); if(args.includes('remove') && args.includes('--force')) { fs.writeFileSync(path.join(process.env.BARRIER,String(process.pid)),''); const end=Date.now()+10000; while(fs.readdirSync(process.env.BARRIER).length<2) { if(Date.now()>end) process.exit(88); Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,20); } } const r=cp.spawnSync(process.env.REAL_GIT,args,{stdio:'inherit'}); process.exit(r.status??1);`,
   );
-  w.rl(["delete", "--jobs", "2", "one", "two"]);
+  w.rl(["delete", "--force", "--jobs", "2", "one", "two"]);
   const calls: string[][] = read(w.env.GIT_CALLS)
     .trim()
     .split("\n")

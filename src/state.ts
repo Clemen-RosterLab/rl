@@ -2,55 +2,25 @@ import { agentAdapter } from "./agent-registry.js";
 import { activityView } from "./activity.js";
 import { handleHook } from "./hooks.js";
 import { doctor } from "./doctor.js";
+import { currentSessionId } from "./session.js";
+import { syncCodexSessions } from "./codex-sessions.js";
+import { resumeAgent } from "./agent-resume.js";
 import fs from "node:fs";
 import path from "node:path";
 import {
   args,
   arity,
-  atomicWrite,
   canonical,
-  execute,
   git,
   json,
   now,
   object,
   required,
   run,
-  sessionId,
-  timestamp,
 } from "./common.js";
 import { Agent, branchStatus, Store } from "./store.js";
 function agent(value: string): Agent {
   return agentAdapter(value).name;
-}
-async function resume(store: Store, kind: Agent): Promise<number> {
-  const [file, data, sid] = await store.locked(() => {
-    const [file, data] = store.current(),
-      sessions = data.sessions[kind];
-    if (!sessions.length)
-      throw new Error(
-        `No ${kind} session recorded for ${data.id}. Start ${kind} here with RL hooks enabled, or use 'rl session add <agent> <UUID>'`,
-      );
-    const item = sessions.reduce((a, b) =>
-      timestamp(a.lastUsedAt) >= timestamp(b.lastUsedAt) ? a : b,
-    );
-    return [file, data, sessionId(item.id)] as const;
-  });
-  const stamp = now();
-  console.error(`Resuming ${kind} session ${sid} for ${data.id}`);
-  const result = await execute(
-    agentAdapter(kind).resumeArgs(sid),
-    data.worktree,
-    { interactive: true },
-  );
-  if (result.code === 0)
-    await store.locked(() => {
-      const [currentFile, current] = store.current(data.worktree);
-      if (currentFile !== file)
-        throw new Error("Instance changed while the agent was running");
-      store.recordSession(file, current, kind, sid, stamp);
-    });
-  return result.code;
 }
 async function syncPr(store: Store, requested?: string): Promise<number> {
   const [file, data] = await store.locked(() => store.current());
@@ -111,7 +81,7 @@ export async function main(argv: string[]): Promise<number> {
   const { values, positionals } = args(
     argv,
     ["repo", "state-dir", "worktree", "base"],
-    ["quiet", "fetch", "json"],
+    ["quiet", "fetch", "json", "repair", "extended-hooks"],
   );
   const store = new Store(
     required(values, "repo"),
@@ -123,6 +93,7 @@ export async function main(argv: string[]): Promise<number> {
     const [file, data] = await store.adopt(
       String(values.worktree ?? "."),
       typeof values.base === "string" ? values.base : undefined,
+      values["extended-hooks"] ? true : undefined,
     );
     if (!values.quiet)
       console.log(
@@ -132,10 +103,14 @@ export async function main(argv: string[]): Promise<number> {
   }
   if (command === "resume") {
     arity(rest, 1);
-    return resume(store, agent(rest[0]));
+    return resumeAgent(store, agent(rest[0]));
   }
   if (command === "doctor") {
     arity(rest, 0, 1);
+    if (values.repair) {
+      const [, data] = store.current();
+      await store.adopt(data.worktree);
+    }
     return doctor(store, rest[0], !!values.json);
   }
   if (command === "hook") {
@@ -146,8 +121,22 @@ export async function main(argv: string[]): Promise<number> {
     arity(rest, 1, 2);
     return syncPr(store, rest[1]);
   }
+  if (command === "status" || command === "instances") arity(rest, 0);
+  if (command === "session" && rest[0] === "list") {
+    arity(rest, 1, 2);
+    if (rest[1]) agent(rest[1]);
+  }
   if (command === "status" && values.fetch)
     git(store.repo, "fetch", "--all", "--prune");
+  if (
+    command === "status" ||
+    command === "instances" ||
+    (command === "session" && rest[0] === "list")
+  )
+    await syncCodexSessions(
+      store,
+      command === "instances" ? undefined : process.cwd(),
+    );
   let replacement = "";
   if (
     ["context", "progress"].includes(command) &&
@@ -170,12 +159,7 @@ export async function main(argv: string[]): Promise<number> {
     if (command === "archive") {
       arity(rest, 0);
       const root = canonical(required(values, "worktree"));
-      for (const [file, data] of store.records())
-        if (data.status === "active" && data.worktree === root) {
-          data.status = "deleted";
-          data.deletedAt = now();
-          store.save(file, data);
-        }
+      store.archiveWorktrees([root]);
       return 0;
     }
     const [file, data] = store.current();
@@ -191,7 +175,15 @@ export async function main(argv: string[]): Promise<number> {
         gitStatus: branchStatus(store.repo, data),
       });
     } else if (command === "session") {
-      if (rest[0] === "add") {
+      if (rest[0] === "save") {
+        arity(rest, 1, 3);
+        const kind = agent(rest[1] ?? "codex");
+        const sid = currentSessionId(kind, rest[2]);
+        store.recordSession(file, data, kind, sid);
+        if (values.json)
+          json({ agent: kind, sessionId: sid, instance: data.id });
+        else console.log(`Saved ${kind} session ${sid} for ${data.id}`);
+      } else if (rest[0] === "add") {
         arity(rest, 3);
         const kind = agent(rest[1]);
         store.recordSession(file, data, kind, rest[2]);
@@ -200,23 +192,18 @@ export async function main(argv: string[]): Promise<number> {
         arity(rest, 1, 2);
         json(rest[1] ? data.sessions[agent(rest[1])] : data.sessions);
       } else
-        throw new Error("Usage: rl session list [agent] | add <agent> <UUID>");
+        throw new Error(
+          "Usage: rl session list [agent] | save [agent] [UUID] | add <agent> <UUID>",
+        );
     } else if (command === "context" || command === "progress") {
       const target = path.join(path.dirname(file), command + ".md"),
         action = rest[0];
       if (action === "path" || action === "show") {
         arity(rest, 1);
         if (action === "path") console.log(target);
-        else process.stdout.write(fs.readFileSync(target, "utf8"));
+        else process.stdout.write(store.readDocument(file, command));
       } else if (action === "set" || action === "append") {
-        if (action === "append")
-          replacement =
-            fs.readFileSync(target, "utf8").trimEnd() +
-            `\n\n### Update ${now()}\n\n` +
-            replacement.trimEnd() +
-            "\n";
-        atomicWrite(target, replacement);
-        store.save(file, data);
+        store.updateDocument(file, data, command, action, replacement);
       } else
         throw new Error(
           `Usage: rl ${command} show|path|set <file>|append <file>`,

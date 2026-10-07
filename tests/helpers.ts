@@ -56,6 +56,8 @@ export class Workspace {
       "GIT_WORK_TREE",
       "GIT_COMMON_DIR",
       "GIT_INDEX_FILE",
+      "CODEX_THREAD_ID",
+      "CODEX_SESSION_ID",
     ])
       delete this.env[key];
     write(this.config, "# test\n");
@@ -74,7 +76,7 @@ export class Workspace {
     for (const agent of ["codex", "claude"])
       this.stub(
         agent,
-        `const fs = require('node:fs'); fs.appendFileSync(process.env.AGENT_LOG, JSON.stringify({ argv: process.argv.slice(1), cwd: process.cwd() }) + '\\n'); process.exit(Number(process.env.AGENT_EXIT || 0));`,
+        `if (process.argv[2] === 'app-server') process.exit(0); const fs = require('node:fs'); fs.appendFileSync(process.env.AGENT_LOG, JSON.stringify({ argv: process.argv.slice(1), cwd: process.cwd() }) + '\\n'); process.exit(Number(process.env.AGENT_EXIT || 0));`,
       );
   }
   stub(name: string, code: string): void {

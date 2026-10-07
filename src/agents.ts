@@ -9,7 +9,10 @@ export type EventType =
   | "turn.stopped"
   | "session.ended"
   | "child.started"
-  | "child.stopped";
+  | "child.stopped"
+  | "turn.interrupted"
+  | "turn.failed"
+  | "notification";
 export interface AgentEvent {
   type: EventType;
   nativeEvent: string;
@@ -22,8 +25,11 @@ export interface AgentAdapter {
   name: Agent;
   configPath: string;
   events: Readonly<Record<string, EventType>>;
+  extraEvents: Readonly<Record<string, EventType>>;
   observedId(value: unknown): string;
   resumeArgs(id: string): string[];
+  startArgs(argv: string[]): string[];
+  runArgs(prompt: string, argv: string[]): string[];
   parse(payload: unknown): AgentEvent;
   response(event: AgentEvent, context?: string): unknown | undefined;
 }
@@ -41,7 +47,8 @@ export function parseEvent(
 ): AgentEvent {
   if (!object(payload)) throw new Error("Hook input must be a JSON object");
   const nativeEvent = String(payload.hook_event_name);
-  if (!Object.hasOwn(adapter.events, nativeEvent))
+  const events = { ...adapter.events, ...adapter.extraEvents };
+  if (!Object.hasOwn(events, nativeEvent))
     throw new Error("Unsupported session hook event");
   if (typeof payload.cwd !== "string" || !path.isAbsolute(payload.cwd))
     throw new Error("Hook requires an absolute cwd");
@@ -56,10 +63,9 @@ export function parseEvent(
     childId = payload.agent_id;
   }
   const type =
-    adapter.events[nativeEvent] === "session.started" &&
-    payload.source === "compact"
+    events[nativeEvent] === "session.started" && payload.source === "compact"
       ? "context.restored"
-      : adapter.events[nativeEvent];
+      : events[nativeEvent];
   if (type.startsWith("child.") && !childId)
     throw new Error("Subagent hook requires agent_id");
   let resumable = false;

@@ -3,20 +3,26 @@ import {
   args,
   canonical,
   execute,
+  git,
   inside,
+  locked,
   message,
-  now,
   pooled,
   required,
 } from "./common.js";
 import { Store } from "./store.js";
 import { worktrees } from "./repos.js";
 import { candidates, select, Candidate } from "./picker.js";
+import {
+  assertReady,
+  GIT_WORKFLOW_DIRECTORY,
+  GIT_WORKFLOW_LOCK,
+} from "./git-safety.js";
 export async function main(argv: string[]): Promise<number> {
   const { values, positionals } = args(
     argv,
     ["repo", "state-dir", "base-dir", "jobs", "default-base"],
-    ["dry-run"],
+    ["dry-run", "force"],
   );
   const jobs = Number(values.jobs ?? 4);
   if (!Number.isInteger(jobs) || jobs < 1 || jobs > 32)
@@ -32,7 +38,7 @@ export async function main(argv: string[]): Promise<number> {
       await select(
         new Store(repo, required(values, "state-dir")),
         [...items.values()],
-        String(values["default-base"] ?? "origin/develop"),
+        String(values["default-base"] ?? "origin/test"),
         true,
       )
     ).map((item) => item.name);
@@ -55,66 +61,119 @@ export async function main(argv: string[]): Promise<number> {
     );
   if (values["dry-run"]) return 0;
   const store = new Store(repo, required(values, "state-dir"));
-  await store.locked(() => store.records());
-  process.chdir(repo);
-  console.log(
-    `Removing ${selected.length} workspace(s), up to ${jobs} at a time...`,
-  );
-  const removed: Candidate[] = [],
-    failed: Candidate[] = [];
-  await pooled(selected, jobs, async (item) => {
-    try {
-      const result = await execute(
-        ["git", "-C", repo, "worktree", "remove", "--force", item.path],
-        repo,
+  return locked(
+    path.join(store.root, GIT_WORKFLOW_DIRECTORY),
+    GIT_WORKFLOW_LOCK,
+    async () => {
+      await store.locked(() => store.records());
+      process.chdir(repo);
+      console.log(
+        `Removing ${selected.length} workspace(s), up to ${jobs} at a time...`,
       );
-      if (result.code) throw new Error(result.stderr.trim());
-      removed.push(item);
-      console.log(`Removed worktree: ${item.name}`);
-    } catch (error) {
-      failed.push(item);
-      console.error(`Failed: ${item.name}: ${message(error)}`);
-    }
-  });
-  const removedPaths = new Set(removed.map((item) => item.path));
-  await store.locked(() => {
-    for (const [file, data] of store.records())
-      if (data.status === "active" && removedPaths.has(data.worktree)) {
-        data.status = "deleted";
-        data.deletedAt = now();
-        store.save(file, data);
+      const removed: Candidate[] = [],
+        failed: Candidate[] = [];
+      await pooled(selected, jobs, async (item) => {
+        try {
+          const current = worktrees(repo).find(
+            (entry) => canonical(entry.worktree) === item.path,
+          );
+          if (
+            !current ||
+            (current.branch ?? "").replace(/^refs\/heads\//, "") !== item.branch
+          )
+            throw new Error("Workspace branch changed; inspect it and retry");
+          if (!values.force && !item.branch)
+            throw new Error(
+              "Detached workspace may contain unmerged commits; inspect it or use --force",
+            );
+          if (!values.force) assertReady(item.path, true, item.branch);
+          if (!values.force && item.branch) {
+            const upstream = git(
+              repo,
+              "for-each-ref",
+              "--format=%(upstream)",
+              `refs/heads/${item.branch}`,
+            );
+            const merged = await execute(
+              [
+                "git",
+                "-C",
+                repo,
+                "merge-base",
+                "--is-ancestor",
+                `refs/heads/${item.branch}`,
+                upstream || "HEAD",
+              ],
+              repo,
+            );
+            if (merged.code)
+              throw new Error(
+                "Branch has unmerged commits; merge it first or use --force",
+              );
+          }
+          const result = await execute(
+            [
+              "git",
+              "-C",
+              repo,
+              "worktree",
+              "remove",
+              ...(values.force ? ["--force"] : []),
+              item.path,
+            ],
+            repo,
+          );
+          if (result.code) throw new Error(result.stderr.trim());
+          removed.push(item);
+          console.log(`Removed worktree: ${item.name}`);
+        } catch (error) {
+          failed.push(item);
+          console.error(`Failed: ${item.name}: ${message(error)}`);
+        }
+      });
+      await store.locked(() =>
+        store.archiveWorktrees(removed.map((item) => item.path)),
+      );
+      let cleanupFailed = false;
+      const branches = [
+        ...new Set(removed.map((item) => item.branch).filter(Boolean)),
+      ];
+      if (branches.length) {
+        const result = await execute(
+          [
+            "git",
+            "-C",
+            repo,
+            "branch",
+            values.force ? "-D" : "-d",
+            "--",
+            ...branches,
+          ],
+          repo,
+        );
+        process.stdout.write(result.stdout);
+        if (result.code) {
+          cleanupFailed = true;
+          console.error(
+            "Some worktrees were removed but local branch cleanup failed:\n" +
+              result.stderr.trim(),
+          );
+        }
       }
-  });
-  let cleanupFailed = false;
-  const branches = [
-    ...new Set(removed.map((item) => item.branch).filter(Boolean)),
-  ];
-  if (branches.length) {
-    const result = await execute(
-      ["git", "-C", repo, "branch", "-D", "--", ...branches],
-      repo,
-    );
-    process.stdout.write(result.stdout);
-    if (result.code) {
-      cleanupFailed = true;
-      console.error(
-        "Some worktrees were removed but local branch cleanup failed:\n" +
-          result.stderr.trim(),
+      if (removed.length) {
+        const result = await execute(
+          ["git", "-C", repo, "worktree", "prune"],
+          repo,
+        );
+        if (result.code) {
+          cleanupFailed = true;
+          console.error("Worktree pruning failed: " + result.stderr.trim());
+        }
+      }
+      console.log(
+        `Removed ${removed.length} worktree(s); failed ${failed.length}. Saved documentation and session history retained.`,
       );
-    }
-  }
-  if (removed.length) {
-    const result = await execute(
-      ["git", "-C", repo, "worktree", "prune"],
-      repo,
-    );
-    if (result.code) {
-      cleanupFailed = true;
-      console.error("Worktree pruning failed: " + result.stderr.trim());
-    }
-  }
-  console.log(
-    `Removed ${removed.length} worktree(s); failed ${failed.length}. Saved documentation and session history retained.`,
+      return failed.length || cleanupFailed ? 1 : 0;
+    },
   );
-  return failed.length || cleanupFailed ? 1 : 0;
 }
