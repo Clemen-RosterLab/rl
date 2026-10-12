@@ -344,7 +344,7 @@ function display(rows: Row[]): void {
       "WORKTREE",
       "CHANGES",
       "UPSTREAM",
-      "SYNC",
+      "COMMITS + / −",
       "PR (cached)",
       "CODEX",
       "CLAUDE",

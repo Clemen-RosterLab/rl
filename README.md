@@ -48,8 +48,11 @@ rl resume codex
 ```
 
 The default base is `origin/test`. Use `--base`, `RL_DEFAULT_BASE`, or a registered
-repository's base setting to choose another branch. Creation fetches origin when present;
-add `--no-fetch` to work offline. Notes and session links survive workspace deletion.
+repository's base setting to choose another branch. Creation fetches origin first,
+then branches from the refreshed remote base (including an explicit `--base origin/<branch>`).
+A failed fetch stops creation. This refreshes remote refs without merging into a local
+branch; add `--no-fetch` to work offline using cached refs. Notes and session links
+survive workspace deletion.
 
 ## Workspace commands
 
@@ -73,6 +76,9 @@ new checkout; `new` and `open` can reopen an existing checkout. `open` flattens
 slashes in directory names; `new` and `switch -c` retain nested names.
 
 Pickers show cached PR state, commits ahead/behind the base, and recent use.
+The `COMMITS + / −` column counts commits ahead/behind, rather than changed lines.
+The picker compares with its displayed base; the status overview compares with the
+displayed upstream. `CHANGES` reports changed files separately.
 PR discovery uses `gh`; `RL_PR_OFFLINE=1` disables it. Status is offline by default.
 `--fetch` explicitly refreshes tracking refs.
 
@@ -91,6 +97,7 @@ Example configuration:
 ```json
 {
   "copy": [".env", ".cache"],
+  "clean": ["node_modules", ".next", ".turbo"],
   "env": { "APP_MODE": "development" },
   "onCreate": [["npm", "ci"]],
   "onOpen": []
@@ -115,6 +122,40 @@ reservation; another process can occupy it. Project environment keys are limited
 to `APP_*`, `PUBLIC_*`, `VITE_*`, `NEXT_PUBLIC_*`, `REACT_APP_*`, `PORT`,
 `NODE_ENV`, `DATABASE_URL`, and `REDIS_URL`. Runtime loader, executable search,
 agent configuration, and permission variables cannot be overridden by the project.
+
+## Storage and cleanup
+
+These commands operate only on the current adopted RL workspace, including when
+run from a directory inside it. They reject workspace selectors and cross-repository
+routing. They do not scan or clean sibling worktrees.
+
+```sh
+rl storage                 # disk usage, largest paths, and cleanup suggestions
+rl storage --json          # structured usage report
+rl clean --dry-run         # preview configured generated directories and savings
+rl clean                  # remove those generated directories
+```
+
+Add a `clean` array to `.rl/workflows.json` in the current workspace:
+
+```json
+{ "clean": ["node_modules", ".next", ".turbo"] }
+```
+
+The default list is empty. Entries must be literal, ignored directory paths.
+Cleanup validates the complete plan before deleting anything and refuses tracked
+files, credentials such as `.env`, Git/agent/task metadata, and symlink targets.
+Links inside generated directories are unlinked without traversing their targets.
+Code changes, branches, notes, sessions, and task handoffs stay in place. Close
+development servers before cleaning their dependencies; use your project's install
+and build commands to regenerate them later.
+
+Storage reports approximate allocated sizes, deduplicating hard links within the
+workspace. Cleanup estimates exclude hard-linked file data retained outside the
+selected directories; filesystem clones and snapshots can also reduce actual
+savings. Suggestions use the current workspace's last-access time (14 days by
+default, configurable with `--older-than 30d`) and its cached PR state. Nothing is
+deleted automatically.
 
 ## Finish a feature
 
@@ -158,17 +199,50 @@ picker and `--jobs 1..32` (default 4), retaining notes and session history.
 ## Pull requests
 
 ```sh
+rl pr                     # open this branch's PR in your browser
 rl pr sync                # save this branch's PR state
-rl pr show                # show the saved snapshot
+rl pr show                # readable saved snapshot with the full PR link
+rl pr show --json         # saved metadata for scripts
 rl pr checks [--json]     # query checks and preserve gh's exit status
 rl pr checkout 123        # new managed pr-123 workspace
 rl pr checkout 123 --name review/login
+rl pr update --base test   # multi-select PRs behind test, then merge test into them
+rl pr update 123 456 --base test --dry-run  # preview an explicit selection
 ```
 
-PR commands require authenticated `gh`. Checkout verifies the origin repository,
+`rl status` also prints a readable workspace, Git, session, task, and PR summary;
+use `rl status --json` for scripts. `rl pr sync --json` keeps machine-readable
+refresh output. `rl pr show` works offline. `rl pr` uses the saved URL when
+available; if the browser cannot open, that link remains in its output. With no
+saved PR, it looks up the current branch through `gh pr view --web`.
+
+Opening, refreshing, checks, and checkout require authenticated `gh`. Checkout verifies the origin repository,
 PR identity, and fetched commit before creating a workspace. Fork PR checkout
 is currently rejected. It does not change your current branch, publish, or merge
 a PR. Failed refreshes retain the previous snapshot.
+
+`rl pr update` brings selected PR branches up to date by merging the latest base
+branch into them on GitHub. Run it from your current adopted RL workspace; it
+uses that repository's configured base by default, or `--base test` / `origin/test`.
+PRs remain open. This command updates remote branches and requires authenticated
+`gh` with permission to update those PRs. Local branches, edits, sessions, and
+sibling worktrees are left in place; it creates no additional worktrees.
+
+Without PR numbers, `fzf` lets you select multiple open PRs targeting the chosen
+base and missing some of its commits. Tab selects, Ctrl-A selects all displayed
+rows, and Enter updates the selection. The picker checks up to 100 PRs by default;
+`--limit` accepts 1–200, and a single batch accepts at most 50 selections. Explicit
+numbers avoid the picker. `--dry-run` performs read-only checks and reports what
+would be updated. If GitHub hasn't calculated mergeability yet, the preview says so.
+
+Each result includes the PR link, branch, behind count in commits, and an outcome:
+updated, already up to date, conflict, changed since selection, failed, pending,
+or skipped. RL continues after individual failures and prints a final summary;
+`--json` provides structured results. GitHub's update request checks the expected
+PR head commit so concurrent changes are rejected. RL verifies that the base is
+included before reporting an update as complete; accepted updates that cannot
+yet be verified stay pending. Conflicts and other incomplete outcomes return a
+nonzero exit status. Closed, retargeted, and fork PRs are skipped.
 
 ## Codex and Claude
 

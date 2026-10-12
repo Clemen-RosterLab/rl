@@ -176,8 +176,8 @@ test("offline npm install, relocation and reinstall preserve hooks, sessions and
   assert.equal(diagnosis.agents[0].lastSuccess.event, "SessionStart");
   assert.equal(diagnosis.agents[0].activity[0].sessionId, sid);
   assert.equal(
-    JSON.parse(w.command([cli, "status"], { cwd: w.a }).stdout).sessions
-      .codex[0].id,
+    JSON.parse(w.command([cli, "status", "--json"], { cwd: w.a }).stdout)
+      .sessions.codex[0].id,
     sid,
   );
   w.command([cli, "adopt"], { cwd: w.a });

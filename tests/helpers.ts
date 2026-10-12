@@ -128,7 +128,7 @@ export class Workspace {
     return this.command([CLI, ...args], options);
   }
   status(cwd = this.a) {
-    return JSON.parse(this.rl(["status"], { cwd }).stdout);
+    return JSON.parse(this.rl(["status", "--json"], { cwd }).stdout);
   }
   hookCommand(agent: string, event = "SessionStart", root = this.a): string {
     const file = path.join(

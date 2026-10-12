@@ -10,6 +10,8 @@ import { main as pr } from "./pr-workflow.js";
 import { main as agent } from "./agent-launch.js";
 import { main as mcp } from "./mcp.js";
 import { main as task } from "./task.js";
+import { main as storage } from "./storage.js";
+import { main as prUpdate } from "./pr-update.js";
 const commands = {
   state,
   repos,
@@ -22,6 +24,8 @@ const commands = {
   agent,
   mcp,
   task,
+  storage,
+  "pr-update": prUpdate,
 };
 const help = {
   state: [
@@ -32,7 +36,8 @@ const help = {
     "rl session list [agent] | rl session add <agent> <UUID>",
     "rl session save [agent] [UUID] [--json] (defaults to the current Codex session)",
     "rl context|progress show|path|set <file>|append <file>",
-    "rl pr show | rl pr sync [number|URL]",
+    "rl pr [open] | rl pr show [--json] | rl pr sync [number|URL] [--json]",
+    "rl pr update [PR numbers...] [--base test] [--dry-run] [--json]",
   ],
   repos: [
     "rl repo add <alias> <path> [--base <ref>] [--worktree-name <name>]",
@@ -74,6 +79,17 @@ const help = {
     "rl pause --summary <text> --changes <text> --validation <text> --next <text> [--blockers <text>] [--session <UUID>] [--agent codex|claude]",
     "rl pause --file <handoff.json|-> [--workspace <name>] [--json]",
     "rl continue [workspace] [--no-agent] (most recently paused task in this repository)",
+  ],
+  storage: [
+    "rl storage [--json] [--older-than 14d]: measure only the current RL workspace",
+    "rl clean [--dry-run] [--json]: remove configured ignored directories in the current RL workspace",
+    "Configure the clean array in this workspace's .rl/workflows.json. Workspace selectors are not supported.",
+  ],
+  "pr-update": [
+    "rl pr update [PR numbers...] [--base test] [--dry-run] [--json] [--limit 100]",
+    "Omit PR numbers to multi-select open PRs behind their base using fzf.",
+    "Merges the latest base into selected remote PR branches. Reports updates, conflicts, failures, and pending requests.",
+    "Runs only from the current adopted RL workspace; local worktrees are not modified.",
   ],
 };
 try {

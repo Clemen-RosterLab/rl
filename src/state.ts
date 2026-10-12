@@ -5,6 +5,8 @@ import { doctor } from "./doctor.js";
 import { currentSessionId } from "./session.js";
 import { syncCodexSessions } from "./codex-sessions.js";
 import { resumeAgent } from "./agent-resume.js";
+import { github } from "./pr-workflow.js";
+import { prText, statusText } from "./display.js";
 import fs from "node:fs";
 import path from "node:path";
 import {
@@ -13,16 +15,21 @@ import {
   canonical,
   git,
   json,
+  message,
   now,
   object,
   required,
   run,
 } from "./common.js";
-import { Agent, branchStatus, Store } from "./store.js";
+import { Agent, branchStatus, Store, type Instance } from "./store.js";
 function agent(value: string): Agent {
   return agentAdapter(value).name;
 }
-async function syncPr(store: Store, requested?: string): Promise<number> {
+async function syncPr(
+  store: Store,
+  requested?: string,
+  asJson = false,
+): Promise<number> {
   const [file, data] = await store.locked(() => store.current());
   const selector = requested || data.pr?.url || data.branch;
   if (selector.startsWith("-"))
@@ -74,8 +81,48 @@ async function syncPr(store: Store, requested?: string): Promise<number> {
     current.pr = pr as typeof current.pr;
     store.save(file, current);
   });
-  json(pr);
+  if (asJson) json(pr);
+  else console.log(prText(pr as Instance["pr"]));
   return 0;
+}
+
+async function openPr(store: Store, asJson: boolean): Promise<number> {
+  const [, data] = await store.locked(() => store.current());
+  if (asJson) {
+    json(data.pr);
+    return 0;
+  }
+  if (data.pr) {
+    const url = new URL(data.pr.url);
+    if (
+      url.protocol !== "https:" ||
+      url.username ||
+      url.password ||
+      !/\/pull\/[1-9]\d*$/.test(url.pathname)
+    )
+      throw new Error("Invalid saved PR URL; run rl pr sync to refresh");
+    console.log(prText(data.pr));
+  } else console.log(`Opening PR for ${data.branch}…`);
+  try {
+    const result = await github(data.worktree, [
+      "pr",
+      "view",
+      data.pr?.url ?? data.branch,
+      "--web",
+    ]);
+    if (result.code)
+      throw new Error(
+        result.stderr.trim() || "Could not open PR in the browser",
+      );
+    if (result.stdout) process.stdout.write(result.stdout);
+    return 0;
+  } catch (error) {
+    if (!data.pr) throw error;
+    console.error(
+      `Could not open the browser: ${message(error)}. Use the PR link above.`,
+    );
+    return 0;
+  }
 }
 export async function main(argv: string[]): Promise<number> {
   const { values, positionals } = args(
@@ -119,7 +166,11 @@ export async function main(argv: string[]): Promise<number> {
   }
   if (command === "pr" && rest[0] === "sync") {
     arity(rest, 1, 2);
-    return syncPr(store, rest[1]);
+    return syncPr(store, rest[1], !!values.json);
+  }
+  if (command === "pr" && (!rest.length || rest[0] === "open")) {
+    arity(rest, 0, rest[0] === "open" ? 1 : 0);
+    return openPr(store, !!values.json);
   }
   if (command === "status" || command === "instances") arity(rest, 0);
   if (command === "session" && rest[0] === "list") {
@@ -165,7 +216,7 @@ export async function main(argv: string[]): Promise<number> {
     const [file, data] = store.current();
     if (command === "status") {
       arity(rest, 0);
-      json({
+      const status = {
         ...data,
         activity: {
           codex: activityView(data.activity?.codex),
@@ -173,7 +224,9 @@ export async function main(argv: string[]): Promise<number> {
         },
         stateDirectory: path.dirname(file),
         gitStatus: branchStatus(store.repo, data),
-      });
+      };
+      if (values.json) json(status);
+      else console.log(statusText(data, status.gitStatus));
     } else if (command === "session") {
       if (rest[0] === "save") {
         arity(rest, 1, 3);
@@ -210,7 +263,8 @@ export async function main(argv: string[]): Promise<number> {
         );
     } else if (command === "pr" && rest[0] === "show") {
       arity(rest, 1);
-      json(data.pr);
+      if (values.json) json(data.pr);
+      else console.log(prText(data.pr));
     } else throw new Error("Unknown state command");
     return 0;
   });

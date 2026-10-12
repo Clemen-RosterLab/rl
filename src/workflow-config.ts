@@ -3,6 +3,7 @@ import path from "node:path";
 import { createHash } from "node:crypto";
 import { execute, git, gitEnv, inside } from "./common.js";
 import { isJsonObject, readJsonObject } from "./json.js";
+import { validateCleanupPath } from "./cleanup-path.js";
 
 export const WORKFLOW_FILE = ".rl/workflows.json";
 const RESERVED_DIRECTORIES = new Set([".git", ".rl", ".codex", ".claude"]);
@@ -11,15 +12,17 @@ const ENV_PREFIX = /^(APP_|PUBLIC_|VITE_|NEXT_PUBLIC_|REACT_APP_)/;
 const ENV_NAMES = new Set(["PORT", "NODE_ENV", "DATABASE_URL", "REDIS_URL"]);
 const PORT_START = 10000;
 const PORT_COUNT = 40000;
-const CONFIG_KEYS = new Set(["copy", "env", "onCreate", "onOpen"]);
+const CONFIG_KEYS = new Set(["copy", "clean", "env", "onCreate", "onOpen"]);
 export interface WorkflowConfig {
   copy: string[];
+  clean: string[];
   env: Record<string, string>;
   onCreate: string[][];
   onOpen: string[][];
 }
 export const EMPTY_WORKFLOW: WorkflowConfig = {
   copy: [],
+  clean: [],
   env: {},
   onCreate: [],
   onOpen: [],
@@ -64,7 +67,16 @@ export function readWorkflowConfig(repo: string): WorkflowConfig {
       env[key] = value;
     }
   }
-  const result: WorkflowConfig = { copy, env, onCreate: [], onOpen: [] };
+  const cleanup = data.clean ?? [];
+  if (!Array.isArray(cleanup))
+    throw new Error(
+      "Workflow clean must be an array of relative directory paths",
+    );
+  const clean = cleanup.map((item) => {
+    validateCleanupPath(item);
+    return item;
+  });
+  const result: WorkflowConfig = { copy, clean, env, onCreate: [], onOpen: [] };
   for (const event of ["onCreate", "onOpen"] as const) {
     const commands = data[event] ?? [];
     if (!Array.isArray(commands))
@@ -111,7 +123,7 @@ export function workflowEnvironment(
   };
 }
 
-function containedPath(root: string, relative: string): string {
+export function containedPath(root: string, relative: string): string {
   const components = relative.split(/[\\/]/);
   if (
     path.isAbsolute(relative) ||

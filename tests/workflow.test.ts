@@ -65,6 +65,64 @@ test("unconfigured creation and registration default to origin/test even when ma
   assert.equal(w.status(explicit).baseBranch, "develop");
 });
 
+test("creation fetches the latest default and explicit remote bases before branching and stops on fetch failure", (t) => {
+  const w = new Workspace(t);
+  delete w.env.RL_DEFAULT_BASE;
+  w.git(w.repo, "branch", "-m", "develop", "test");
+  const remote = path.join(w.root, "origin.git");
+  const writer = path.join(w.root, "remote-writer");
+  w.command(["git", "init", "--bare", "-q", remote]);
+  w.git(w.repo, "remote", "add", "origin", remote);
+  w.git(w.repo, "push", "-q", "-u", "origin", "test");
+  const initial = w.git(w.repo, "rev-parse", "origin/test");
+  w.command(["git", "clone", "-q", "-b", "test", remote, writer]);
+  w.git(writer, "commit", "-q", "--allow-empty", "-m", "Remote test update");
+  w.git(writer, "push", "-q", "origin", "test");
+  const latest = w.git(writer, "rev-parse", "HEAD");
+  assert.notEqual(latest, initial);
+  assert.equal(w.git(w.repo, "rev-parse", "origin/test"), initial);
+
+  const offline = w.rl(["new", "offline-base", "--no-fetch"]).stdout.trim();
+  assert.equal(w.git(offline, "rev-parse", "HEAD"), initial);
+  const fresh = w.rl(["new", "fresh-base"]).stdout.trim();
+  assert.equal(w.git(fresh, "rev-parse", "HEAD"), latest);
+  assert.equal(w.status(fresh).baseBranch, "origin/test");
+  assert.equal(w.git(w.repo, "rev-parse", "test"), initial);
+
+  w.git(writer, "checkout", "-qb", "release/next");
+  w.git(writer, "commit", "-q", "--allow-empty", "-m", "Remote custom base");
+  w.git(writer, "push", "-q", "origin", "release/next");
+  const custom = w
+    .rl(["new", "custom-fresh-base", "--base", "origin/release/next"])
+    .stdout.trim();
+  assert.equal(
+    w.git(custom, "rev-parse", "HEAD"),
+    w.git(writer, "rev-parse", "HEAD"),
+  );
+
+  w.git(
+    w.repo,
+    "remote",
+    "set-url",
+    "origin",
+    path.join(w.root, "missing-origin.git"),
+  );
+  const failed = w.rl(["new", "failed-fetch"], { ok: false });
+  assert.match(failed.stderr, /Fetch failed/);
+  assert.ok(
+    !fs.existsSync(path.join(w.root, "worktrees/example/failed-fetch")),
+  );
+  assert.equal(
+    w.git(
+      w.repo,
+      "for-each-ref",
+      "--format=%(refname)",
+      "refs/heads/failed-fetch",
+    ),
+    "",
+  );
+});
+
 test("switch creates, resolves nested names, opens branches, and preserves argv and exit status", (t) => {
   const w = new Workspace(t);
   const created = w
@@ -231,6 +289,7 @@ test("config validation and hook failures are reported without silently continui
   w.rl(["config", "init"]);
   assert.deepEqual(JSON.parse(w.rl(["config", "show"]).stdout), {
     copy: [],
+    clean: [],
     env: {},
     onCreate: [],
     onOpen: [],

@@ -25,7 +25,7 @@ const CHECK_FIELDS = "name,state,bucket,link,workflow";
 const FETCH_PREFIX = "refs/rl/pr-fetch/";
 
 /** Bound requests and ignore a caller's unrelated GH_REPO override. */
-async function github(repo: string, argv: string[]) {
+export async function github(repo: string, argv: string[]) {
   if (process.env.RL_PR_OFFLINE === "1")
     throw new Error("GitHub is offline (RL_PR_OFFLINE=1)");
   const env: NodeJS.ProcessEnv = { ...process.env, GH_PROMPT_DISABLED: "1" };
@@ -34,7 +34,7 @@ async function github(repo: string, argv: string[]) {
 }
 
 /** Bind GitHub reads and Git fetches to the same origin before changing local refs. */
-async function repositoryIdentity(
+export async function repositoryIdentity(
   repo: string,
 ): Promise<{ name: string; url: string }> {
   const result = await github(repo, [

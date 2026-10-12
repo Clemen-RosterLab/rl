@@ -49,6 +49,8 @@ Usage:
   rl exec [--workspace name] -- <command> [args...]
   rl setup [--workspace name] [--dry-run]  Run explicit project setup
   rl config init|show            Configure .rl/workflows.json
+  rl storage [--json]            Measure disk usage in the current RL workspace
+  rl clean [--dry-run] [--json]   Clean configured generated directories in the current workspace
   rl delete [<name> ...]          Remove clean merged worktrees and branches
   rl delete --force <names>       Also remove dirty worktrees and unmerged branches
   rl delete --jobs 2 <names>      Limit parallel removals (default: 4)
@@ -68,9 +70,10 @@ Usage:
   rl diff [--base ref] [-- --stat]  Show workspace changes
   rl log [--base ref] [-- --oneline]  Show feature commits
   rl pr checks                  Show pull request checks
+  rl pr update [numbers...] [--base test] [--dry-run]  Bring selected PR branches up to date
   rl pr checkout <number>        Create a workspace for a pull request
   rl doctor [codex|claude] [--json]  Check hook setup and observed agent activity
-  rl status                      Show this instance's metadata
+  rl status [--json]              Show workspace, Git, sessions, task, and PR summary
   rl status --all [--fetch]       Branch overview across all registered repositories
   rl status --list [--json]       Branch overview for the selected repository
   rl repo add <alias> <path> [--base <ref>]  Register a repository
@@ -90,8 +93,9 @@ Usage:
   rl summary                     Save this instance's Markdown summary and print its path
   rl summary -o <file.md>         Export a summary to a chosen file
   rl summary --stdout [--base <ref>]  Print Markdown; optionally choose comparison base
-  rl pr show                     Show cached GitHub PR state
-  rl pr sync [number|URL]         Refresh and save PR state with gh
+  rl pr [open]                   Open this branch's pull request in the browser
+  rl pr show [--json]             Show cached PR summary and link
+  rl pr sync [number|URL] [--json] Refresh and save PR state with gh
   rl help                       Show this help
   rl init zsh|bash              Print optional shell integration
   rl --version                  Print installed package version
@@ -173,6 +177,12 @@ _rl_main() {
     default_base="$repository_fields[3]"
   fi
 
+  if [[ "$command" == pr && "$2" == update ]]; then
+    command node "${${functions_source[_rl_main]}:A:h:h}/dist/cli.js" pr-update \
+      --repo "$repo_root" --state-dir "$state_dir" --base-dir "$base_dir/$repo_name" \
+      --default-base "$default_base" "$@"
+    return
+  fi
   if [[ "$command" == pr && ( "$2" == checks || "$2" == checkout ) ]]; then
     command node "${${functions_source[_rl_main]}:A:h:h}/dist/cli.js" pr \
       --repo "$repo_root" --state-dir "$state_dir" --base-dir "$base_dir/$repo_name" \
@@ -180,6 +190,11 @@ _rl_main() {
     return
   fi
   case "$command" in
+    storage|clean)
+      command node "${${functions_source[_rl_main]}:A:h:h}/dist/cli.js" storage \
+        --repo "$repo_root" --state-dir "$state_dir" --base-dir "$base_dir/$repo_name" \
+        --default-base "$default_base" "$@"
+      return ;;
     pause)
       command node "${${functions_source[_rl_main]}:A:h:h}/dist/cli.js" task \
         --repo "$repo_root" --state-dir "$state_dir" --base-dir "$base_dir/$repo_name" \

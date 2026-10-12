@@ -135,7 +135,7 @@ export function pickerRows(
     Math.max(12, ...items.map((item) => visible(item.name).length)),
     Math.max(16, Math.min(48, columns - baseWidth - 47)),
   );
-  const diffWidth = Math.max(11, ...details.map((row) => row.diff.length));
+  const diffWidth = Math.max(13, ...details.map((row) => row.diff.length));
   const cell = (value: string, width: number) => {
     const text = visible(value);
     return (text.length > width ? text.slice(0, width - 1) + "…" : text).padEnd(
@@ -144,7 +144,7 @@ export function pickerRows(
   };
   const format = (name: string, state: string, diff: string, base: string) =>
     `${cell(name, nameWidth)}  ${cell(state, 7)}  ${cell(diff, diffWidth)}  ${cell(base, baseWidth)}  LAST ACCESSED`;
-  const header = format("WORKSPACE", "PR", "+ / −", "BASE");
+  const header = format("WORKSPACE", "PR", "COMMITS + / −", "BASE");
   return details.map(({ item, state, diff, base, accessed }) => ({
     item,
     header,
