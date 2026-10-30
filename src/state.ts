@@ -4,7 +4,8 @@ import { handleHook } from "./hooks.js";
 import { doctor } from "./doctor.js";
 import { currentSessionId } from "./session.js";
 import { syncCodexSessions } from "./codex-sessions.js";
-import { resumeAgent } from "./agent-resume.js";
+import { resumeSessions } from "./agent-resume.js";
+import { workflowSummary } from "./agent-runner.js";
 import { github } from "./pr-workflow.js";
 import { prText, statusText } from "./display.js";
 import fs from "node:fs";
@@ -128,13 +129,25 @@ export async function main(argv: string[]): Promise<number> {
   const { values, positionals } = args(
     argv,
     ["repo", "state-dir", "worktree", "base"],
-    ["quiet", "fetch", "json", "repair", "extended-hooks"],
+    [
+      "quiet",
+      "fetch",
+      "json",
+      "repair",
+      "extended-hooks",
+      "latest",
+      "l",
+      "workspace",
+    ],
+    { latest: "l" },
   );
   const store = new Store(
     required(values, "repo"),
     required(values, "state-dir"),
   );
   const [command, ...rest] = positionals;
+  if ((values.latest || values.l) && command !== "resume")
+    throw new Error("--latest is only supported by rl resume");
   if (command === "adopt") {
     arity(rest, 0);
     const [file, data] = await store.adopt(
@@ -149,8 +162,12 @@ export async function main(argv: string[]): Promise<number> {
     return 0;
   }
   if (command === "resume") {
-    arity(rest, 1);
-    return resumeAgent(store, agent(rest[0]));
+    arity(rest, 0, 1);
+    return resumeSessions(
+      store,
+      rest[0] === undefined ? undefined : agent(rest[0]),
+      { latest: !!(values.latest || values.l) },
+    );
   }
   if (command === "doctor") {
     arity(rest, 0, 1);
@@ -224,9 +241,10 @@ export async function main(argv: string[]): Promise<number> {
         },
         stateDirectory: path.dirname(file),
         gitStatus: branchStatus(store.repo, data),
+        workflow: workflowSummary(store),
       };
       if (values.json) json(status);
-      else console.log(statusText(data, status.gitStatus));
+      else console.log(statusText(data, status.gitStatus, status.workflow));
     } else if (command === "session") {
       if (rest[0] === "save") {
         arity(rest, 1, 3);

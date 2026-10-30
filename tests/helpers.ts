@@ -20,6 +20,27 @@ export interface Options {
   input?: string;
   ok?: boolean;
 }
+export function sessionPicker(w: Workspace): string {
+  const capture = path.join(w.root, "session-picker.json");
+  w.env.RESUME_PICKER_CAPTURE = capture;
+  w.stub(
+    "fzf",
+    `
+const fs = require('node:fs');
+const input = fs.readFileSync(0, 'utf8');
+fs.writeFileSync(process.env.RESUME_PICKER_CAPTURE, JSON.stringify({input, args:process.argv.slice(2), cwd:process.cwd()}));
+if(process.env.RESUME_PICKER_EXIT) process.exit(Number(process.env.RESUME_PICKER_EXIT));
+if(process.env.RESUME_PICKER_OUTPUT !== undefined) { console.log(process.env.RESUME_PICKER_OUTPUT); process.exit(0); }
+const line = input.trimEnd().split('\\n').find(line => {
+ const fields = line.split('\\t');
+ return (!process.env.RESUME_PICKER_AGENT || fields[1] === process.env.RESUME_PICKER_AGENT) && (!process.env.RESUME_PICKER_ID || fields[2] === process.env.RESUME_PICKER_ID);
+});
+if(!line) process.exit(1);
+console.log(line);
+`,
+  );
+  return capture;
+}
 export class Workspace {
   root = fs.realpathSync(
     fs.mkdtempSync(path.join(os.tmpdir(), "rl state ' test ")),
@@ -128,7 +149,9 @@ export class Workspace {
     return this.command([CLI, ...args], options);
   }
   status(cwd = this.a) {
-    return JSON.parse(this.rl(["status", "--json"], { cwd }).stdout);
+    return JSON.parse(
+      this.rl(["status", "--workspace", "--json"], { cwd }).stdout,
+    );
   }
   hookCommand(agent: string, event = "SessionStart", root = this.a): string {
     const file = path.join(

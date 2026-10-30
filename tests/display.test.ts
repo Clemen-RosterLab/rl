@@ -26,6 +26,7 @@ function cachePr(w: Workspace, pr = PR): string {
 
 test("status prints Git changes, saved sessions, PR link and paused task while JSON stays available", (t) => {
   const w = new Workspace(t);
+  w.env.NO_COLOR = "1";
   const sid = randomUUID();
   w.hook("codex", sid);
   w.hook("codex", sid, { event: "UserPromptSubmit" });
@@ -52,18 +53,22 @@ test("status prints Git changes, saved sessions, PR link and paused task while J
   w.git(w.a, "add", "staged.txt");
   write(path.join(w.a, "untracked.txt"), "unfinished");
   const before = read(file);
-  const output = w.rl(["status"], { cwd: w.a }).stdout;
-  assert.match(output, /Workspace: /);
-  assert.match(output, /Branch: feature\/a/);
-  assert.ok(output.includes(`Path: ${w.a}`));
-  assert.match(output, /Git: 1 staged, 1 untracked/);
-  assert.match(output, /PR #42: Feature A \[draft · open\]/);
+  const output = w.rl(["status", "--workspace"], { cwd: w.a }).stdout;
+  assert.match(output, /\n  feature\/a\n/);
+  assert.doesNotMatch(output, /Branch\s+feature\/a/);
+  assert.match(output, /Path\s+/);
+  assert.ok(output.includes(w.a));
+  assert.match(output, /Git\s+1 staged file · 1 untracked file/);
+  assert.match(output, /PR #42 · draft · open · → test/);
+  assert.match(output, /Feature A/);
   assert.ok(output.includes(PR.url));
-  assert.match(output, /Codex: 1 saved sessions · 1 working/);
-  assert.match(output, /Claude: 0 saved sessions/);
-  assert.match(output, /Task: paused · Finish login states/);
-  assert.match(output, /Next: Check browser behavior/);
-  assert.match(output, /Blockers: Waiting for copy/);
+  assert.match(output, /Codex\s+1 saved · 1 working/);
+  assert.match(output, /Claude\s+0 saved/);
+  assert.match(output, /Task · paused\n  Finish login states/);
+  assert.match(output, /Next\s+Check browser behavior/);
+  assert.match(output, /Blockers\s+Waiting for copy/);
+  assert.match(output, /Resume with rl resume/);
+  assert.ok(!output.includes("\x1b"));
   assert.throws(() => JSON.parse(output));
   const data = w.status();
   assert.equal(data.gitStatus.staged, 1);
@@ -71,6 +76,44 @@ test("status prints Git changes, saved sessions, PR link and paused task while J
   assert.deepEqual(data.pr, PR);
   assert.equal(data.task.state, "paused");
   assert.equal(read(file), before);
+});
+
+test("status distinguishes upstream commits from changed files and respects terminal color settings", (t) => {
+  const w = new Workspace(t);
+  delete w.env.FORCE_COLOR;
+  delete w.env.NO_COLOR;
+  w.env.TERM = "xterm-256color";
+  w.git(w.a, "branch", "--set-upstream-to", "develop");
+  cachePr(w, {
+    ...PR,
+    title: "Feature\nA\x1b[31m",
+    syncedAt: new Date(Date.now() - 2 * 86400000).toISOString(),
+  });
+  const clean = w.rl(["status", "--workspace"], { cwd: w.a }).stdout;
+  assert.match(clean, /Git\s+clean/);
+  assert.match(clean, /Upstream\s+up to date · develop/);
+  assert.doesNotMatch(clean, /0 ahead|0 behind|\x1b/);
+  assert.match(clean, /Cached \d+d ago/);
+  assert.doesNotMatch(clean, /Cached 2026-/);
+  assert.match(clean, /Feature A/);
+  w.git(w.repo, "commit", "-q", "--allow-empty", "-m", "Advance upstream");
+  w.git(w.a, "commit", "-q", "--allow-empty", "-m", "Feature commit");
+  write(path.join(w.a, "unfinished.txt"), "unfinished");
+  const plain = w.rl(["status", "--workspace"], { cwd: w.a }).stdout;
+  assert.match(plain, /Git\s+1 untracked file/);
+  assert.match(plain, /Upstream\s+1 ahead · 1 behind \(commits\) · develop/);
+  w.env.FORCE_COLOR = "1";
+  const colored = w.rl(["status", "--workspace"], { cwd: w.a }).stdout;
+  assert.match(colored, /\x1b\[/);
+  w.env.NO_COLOR = "1";
+  const disabled = w.rl(["status", "--workspace"], { cwd: w.a }).stdout;
+  assert.doesNotMatch(disabled, /\x1b/);
+  delete w.env.NO_COLOR;
+  w.env.TERM = "dumb";
+  assert.doesNotMatch(
+    w.rl(["status", "--workspace"], { cwd: w.a }).stdout,
+    /\x1b/,
+  );
 });
 
 test("pr show works offline and prints a readable cached summary or a clear empty state", (t) => {

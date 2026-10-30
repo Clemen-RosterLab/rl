@@ -35,6 +35,22 @@ export async function handleHook(
       );
     try {
       const event = adapter.parse(payload);
+      // Workflow workers are ephemeral. Supply task context without turning a
+      // review pass into a saved conversation or changing the user's last-used
+      // session. Other native/managed hooks remain under the CLI's own policy.
+      if (process.env.RL_WORKFLOW_RUN && process.env.RL_WORKFLOW_STEP) {
+        const context = [
+          "session.started",
+          "context.restored",
+          "child.started",
+          "turn.started",
+        ].includes(event.type)
+          ? contextText(file, data)
+          : undefined;
+        const response = adapter.response(event, context);
+        if (response !== undefined) json(response);
+        return 0;
+      }
       const stamp = now();
       let context: string | undefined, hash: string | undefined;
       if (

@@ -36,85 +36,79 @@ _rl_recover_directory() {
 }
 
 _rl_help() {
-  cat <<'HELP'
-Usage:
-  rl                             Pick a worktree with PR state and base commit counts
-  rl new <name> [--base|-b <ref>]  Create a worktree (default: origin/test)
-  rl open --branch|-b <branch>    Open a local or origin branch
-  rl switch <name> [-c] [--base ref] [--no-fetch] [--setup]
-  rl switch <name> --agent codex|claude [-- <agent args>]
-  rl switch @|-                  Main checkout or previous workspace
-  rl list [--json]               Show workspaces and branch status
-  rl path [name]                 Print a workspace path
-  rl exec [--workspace name] -- <command> [args...]
-  rl setup [--workspace name] [--dry-run]  Run explicit project setup
-  rl config init|show            Configure .rl/workflows.json
-  rl storage [--json]            Measure disk usage in the current RL workspace
-  rl clean [--dry-run] [--json]   Clean configured generated directories in the current workspace
-  rl delete [<name> ...]          Remove clean merged worktrees and branches
-  rl delete --force <names>       Also remove dirty worktrees and unmerged branches
-  rl delete --jobs 2 <names>      Limit parallel removals (default: 4)
-  rl delete --dry-run <names>     Preview without deleting
-  rl adopt [--extended-hooks]     Register worktree and optional extended hooks
-  rl doctor [codex|claude] --repair  Repair project hooks
-  rl agent start codex|claude [-- <args>]  Start an interactive agent
-  rl agent run codex|claude --prompt <text>  Run an agent with a prompt
-  rl handoff [codex|claude]       Export task context for another agent
-  rl pause --file <handoff.json|->  Save session, changes, validation, and next steps
-  rl continue [workspace] [--no-agent]  Open a saved task and resume its conversation
-  rl mcp                         Serve task context and notes over stdio
-  rl step commit -m <message>     Commit staged changes
-  rl step rebase [--base ref]     Rebase this workspace onto its base
-  rl step squash -m <message>    Squash feature commits into one
-  rl merge [target] [--squash -m message] [--cleanup]  Integrate into a base checkout
-  rl diff [--base ref] [-- --stat]  Show workspace changes
-  rl log [--base ref] [-- --oneline]  Show feature commits
-  rl pr checks                  Show pull request checks
-  rl pr update [numbers...] [--base test] [--dry-run]  Bring selected PR branches up to date
-  rl pr checkout <number>        Create a workspace for a pull request
-  rl doctor [codex|claude] [--json]  Check hook setup and observed agent activity
-  rl status [--json]              Show workspace, Git, sessions, task, and PR summary
-  rl status --all [--fetch]       Branch overview across all registered repositories
-  rl status --list [--json]       Branch overview for the selected repository
-  rl repo add <alias> <path> [--base <ref>]  Register a repository
-  rl repo list                   List registered repositories
-  rl repo use <alias>             Set the default repository outside registered worktrees
-  rl repo remove <alias>          Unregister only; retain worktrees and saved state
-  rl --repo <alias> <command>     Select a repository explicitly
-  rl instances                   List active and deleted instance records
-  rl resume codex|claude          Resume this instance's last explicitly recorded session
-  rl session list [agent]        Show recorded sessions
-  rl session save [agent] [UUID] Save the current Codex session or an explicit UUID
-  rl session add <agent> <UUID>   Explicitly associate an existing session
-  rl context show|path            Read feature/domain documentation
-  rl context set|append <file>    Replace or append documentation (- reads stdin)
-  rl progress show|path           Read implementation documentation
-  rl progress set|append <file>   Record completed work, remaining work, and details
-  rl summary                     Save this instance's Markdown summary and print its path
-  rl summary -o <file.md>         Export a summary to a chosen file
-  rl summary --stdout [--base <ref>]  Print Markdown; optionally choose comparison base
-  rl pr [open]                   Open this branch's pull request in the browser
-  rl pr show [--json]             Show cached PR summary and link
-  rl pr sync [number|URL] [--json] Refresh and save PR state with gh
-  rl help                       Show this help
-  rl init zsh|bash              Print optional shell integration
-  rl --version                  Print installed package version
-
-Pickers auto-detect PRs (60s cache) and commits +ahead/-behind the base (local refs).
-Deletion requires --force for uncommitted changes or unmerged branches.
-Use shell integration to change the calling shell's directory.
-HELP
+  command node "${${functions_source[_rl_help]}:A:h:h}/dist/help.js" "$@"
 }
 
 _rl_main() {
   emulate -L zsh
+  # Help is independent of repository routing, config files, and agent tools.
+  local -a help_args=("$@")
+  [[ "$help_args[1]" == --repo ]] && help_args=("${help_args[@]:2}")
+  [[ "$help_args[1]" == --repo=* ]] && help_args=("${help_args[@]:1}")
+  local help_arg
+  if [[ "$help_args[1]" == help ]]; then
+    _rl_help "${help_args[@]}"
+    return
+  fi
+  for help_arg in "${help_args[@]}"; do
+    [[ "$help_arg" == -- ]] && break
+    if [[ "$help_arg" == --help || "$help_arg" == -h ]]; then
+      _rl_help "${help_args[@]}"
+      return
+    fi
+  done
+  if (( ${#help_args} == 1 )) && [[ "$help_args[1]" == (agent|workflow|policy|repo|git|notes|session|config|step) ]]; then
+    _rl_help "${help_args[@]}"
+    return
+  fi
+
+  # Canonical command families; older spellings remain compatibility aliases.
+  # Preserve a leading repository selector while normalizing the public command.
+  local -a routing_prefix=()
+  if [[ "$1" == --repo ]]; then
+    routing_prefix=("$1" "$2")
+    shift 2
+  elif [[ "$1" == --repo=* ]]; then
+    routing_prefix=("$1")
+    shift
+  fi
+  case "$1:$2" in
+    git:commit|git:rebase|git:squash) argv=(step "$2" "${@:3}") ;;
+    git:diff|git:log|git:merge) argv=("$2" "${@:3}") ;;
+    agent:sessions) argv=(session list "${@:3}") ;;
+    agent:save) argv=(session save "${@:3}") ;;
+    agent:handoff) argv=(handoff "${@:3}") ;;
+    agent:mcp) argv=(mcp "${@:3}") ;;
+    storage:clean) argv=(clean "${@:3}") ;;
+    setup:init|setup:show) argv=(config "$2" "${@:3}") ;;
+    setup:adopt) argv=(adopt "${@:3}") ;;
+    setup:run) argv=(setup "${@:3}") ;;
+    setup:shell)
+      command "${${functions_source[_rl_main]}:A:h:h}/bin/rl" init "${@:3}"
+      return ;;
+    notes:summary) argv=(summary "${@:3}") ;;
+    notes:show|notes:path|notes:set|notes:append)
+      local note_kind="${3:-context}"
+      if [[ "$note_kind" != context && "$note_kind" != progress ]]; then
+        print -u2 -r -- "Unknown document: $note_kind. Use context or progress."
+        _rl_help notes "$2" >&2
+        return 1
+      fi
+      argv=("$note_kind" "$2" "${@:4}") ;;
+  esac
+  if [[ "$1" == git || "$1" == notes ]]; then
+    print -u2 -r -- "Unknown $1 command: $2"
+    print -u2 -r -- "Run rl help $1 for available commands."
+    return 1
+  fi
+  argv=("${routing_prefix[@]}" "$@")
   local config_file="${RL_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/rl/config.zsh}"
   # Configuration is trusted zsh code, scoped to this invocation.
-  local RL_REPO_ROOT="${RL_REPO_ROOT-}" RL_WORKTREE_DIR="${RL_WORKTREE_DIR-}"
-  local RL_REPO_NAME="${RL_REPO_NAME-}" RL_DEFAULT_BASE="${RL_DEFAULT_BASE-}"
-  local RL_STATE_DIR="${RL_STATE_DIR-}"
+  local -x RL_REPO_ROOT="${RL_REPO_ROOT-}" RL_WORKTREE_DIR="${RL_WORKTREE_DIR-}"
+  local -x RL_REPO_NAME="${RL_REPO_NAME-}" RL_DEFAULT_BASE="${RL_DEFAULT_BASE-}"
+  local -x RL_STATE_DIR="${RL_STATE_DIR-}"
   local env_selection_present=${+RL_REPO}
-  local RL_REPO="${RL_REPO-}"
+  local -x RL_REPO="${RL_REPO-}"
   local env_root="$RL_REPO_ROOT" env_dir="$RL_WORKTREE_DIR"
   local env_name="$RL_REPO_NAME" env_base="$RL_DEFAULT_BASE"
   local env_state="$RL_STATE_DIR"
@@ -157,12 +151,31 @@ _rl_main() {
     _rl_repos "$@"
     return
   fi
+  if [[ "$command" == checkout ]]; then
+    local destination_file destination checkout_result
+    destination_file=$(mktemp "${TMPDIR:-/tmp}/rl-checkout.XXXXXXXX") || return 1
+    {
+      _rl_repos "$@" --output-path "$destination_file"
+      checkout_result=$?
+      destination=$(<"$destination_file")
+      if (( checkout_result == 0 )) && [[ -n "$destination" ]]; then
+        _rl_change_directory "$destination" || return 1
+      fi
+      return $checkout_result
+    } always {
+      command rm -f -- "$destination_file"
+    }
+  fi
   if [[ "$command" == list ]]; then
     shift
-    _rl_repos status --list "$@"
+    if (( ${argv[(Ie)--all]} )); then
+      _rl_repos status "$@"
+    else
+      _rl_repos status --list "$@"
+    fi
     return
   fi
-  if [[ "$command" == status ]] && (( ${argv[(Ie)--all]} || ${argv[(Ie)--list]} )); then
+  if [[ "$command" == status ]] && (( ! ${argv[(Ie)--workspace]} )); then
     _rl_repos "$@"
     return
   fi
@@ -207,7 +220,18 @@ _rl_main() {
       local git_result=$?
       _rl_recover_directory || return 1
       return $git_result ;;
+    workflow|policy)
+      command node "${${functions_source[_rl_main]}:A:h:h}/dist/cli.js" automation \
+        --repo "$repo_root" --state-dir "$state_dir" --base-dir "$base_dir/$repo_name" \
+        --default-base "$default_base" "$@"
+      return ;;
     agent|handoff)
+      if [[ "$command" == agent && ( "$2" == list || "$2" == show ) ]]; then
+        command node "${${functions_source[_rl_main]}:A:h:h}/dist/cli.js" automation \
+          --repo "$repo_root" --state-dir "$state_dir" --base-dir "$base_dir/$repo_name" \
+          --default-base "$default_base" "$@"
+        return
+      fi
       [[ "$command" == agent ]] && shift
       command node "${${functions_source[_rl_main]}:A:h:h}/dist/cli.js" agent \
         --repo "$repo_root" --state-dir "$state_dir" --base-dir "$base_dir/$repo_name" \
@@ -286,8 +310,7 @@ _rl_main() {
     return
   fi
 
-  _rl_help
-  [[ "$command" == help || "$command" == --help || "$command" == -h ]] && return 0
   print -u2 -r -- "Unknown command: $command"
+  print -u2 'Run rl help for available commands.'
   return 1
 }

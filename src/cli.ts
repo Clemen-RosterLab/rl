@@ -1,4 +1,5 @@
 import { message } from "./common.js";
+import { invocation, topicHelp, usageHint } from "./help.js";
 import { main as state } from "./state.js";
 import { main as repos } from "./repos.js";
 import { main as remove } from "./delete.js";
@@ -12,6 +13,7 @@ import { main as mcp } from "./mcp.js";
 import { main as task } from "./task.js";
 import { main as storage } from "./storage.js";
 import { main as prUpdate } from "./pr-update.js";
+import { main as agentWorkflows } from "./agent-workflows.js";
 const commands = {
   state,
   repos,
@@ -26,72 +28,9 @@ const commands = {
   task,
   storage,
   "pr-update": prUpdate,
+  automation: agentWorkflows,
 };
-const help = {
-  state: [
-    "rl adopt [--worktree <path>] [--base <ref>] [--extended-hooks]",
-    "rl status [--fetch] [--json] | rl instances",
-    "rl resume codex|claude",
-    "rl doctor [codex|claude] [--json] [--repair]",
-    "rl session list [agent] | rl session add <agent> <UUID>",
-    "rl session save [agent] [UUID] [--json] (defaults to the current Codex session)",
-    "rl context|progress show|path|set <file>|append <file>",
-    "rl pr [open] | rl pr show [--json] | rl pr sync [number|URL] [--json]",
-    "rl pr update [PR numbers...] [--base test] [--dry-run] [--json]",
-  ],
-  repos: [
-    "rl repo add <alias> <path> [--base <ref>] [--worktree-name <name>]",
-    "rl repo list [--json] | rl repo use <alias> | rl repo remove <alias>",
-    "rl status --all|--list [--json] [--fetch] [--include-deleted]",
-  ],
-  delete: [
-    "rl delete [--jobs <1..32>] [--dry-run] [--force] [names...]",
-    "Omit names to multi-select worktrees with cached PR state and base commit counts.",
-    "Refuses dirty or unmerged workspaces unless --force; retains RL state.",
-  ],
-  summary: [
-    "rl summary [--base <ref>] [--stdout | --output|-o <file.md> [--force]]",
-    "Defaults to summary.md in this instance's state directory.",
-  ],
-  picker: ["rl: pick a worktree with cached PR state and base commit counts."],
-  workflow: [
-    "rl switch <name|branch|@|-> [-c|--create] [--base <ref>] [--setup] [--agent codex|claude]",
-    "rl new <branch> [--base <ref>] | rl open -b <branch> [--setup] [--no-fetch]",
-    "rl path [name|branch|@] | rl exec [--workspace <name>] -- <command> [args...]",
-    "rl config init|show | rl setup [--workspace <name>] [--dry-run]",
-  ],
-  git: [
-    "rl step commit -m <message> [--all] [--dry-run]",
-    "rl step rebase|squash [--base <ref>] [-m <message>] [--dry-run]",
-    "rl merge [target-branch] [--squash -m <message>] [--cleanup] [--dry-run]",
-    "rl diff|log [--base <ref>] [-- <git-options> [-- paths...]]",
-  ],
-  pr: ["rl pr checks [--json] | rl pr checkout <number> [--name <branch>]"],
-  agent: [
-    "rl agent start codex|claude [--workspace <name>] [-- <agent-options>]",
-    "rl agent run codex|claude --prompt <text> [--workspace <name>] [-- <agent-options>]",
-    "rl handoff [codex|claude] [--workspace <name>] [--stdout | --output <file>]",
-  ],
-  mcp: [
-    "rl mcp: serve workspace status and notes over stdio for agent MCP clients.",
-  ],
-  task: [
-    "rl pause --summary <text> --changes <text> --validation <text> --next <text> [--blockers <text>] [--session <UUID>] [--agent codex|claude]",
-    "rl pause --file <handoff.json|-> [--workspace <name>] [--json]",
-    "rl continue [workspace] [--no-agent] (most recently paused task in this repository)",
-  ],
-  storage: [
-    "rl storage [--json] [--older-than 14d]: measure only the current RL workspace",
-    "rl clean [--dry-run] [--json]: remove configured ignored directories in the current RL workspace",
-    "Configure the clean array in this workspace's .rl/workflows.json. Workspace selectors are not supported.",
-  ],
-  "pr-update": [
-    "rl pr update [PR numbers...] [--base test] [--dry-run] [--json] [--limit 100]",
-    "Omit PR numbers to multi-select open PRs behind their base using fzf.",
-    "Merges the latest base into selected remote PR branches. Reports updates, conflicts, failures, and pending requests.",
-    "Runs only from the current adopted RL workspace; local worktrees are not modified.",
-  ],
-};
+
 try {
   const [command, ...argv] = process.argv.slice(2);
   if (!Object.hasOwn(commands, command))
@@ -99,11 +38,34 @@ try {
   const separator = argv.indexOf("--");
   const options = separator < 0 ? argv : argv.slice(0, separator);
   if (options.includes("--help") || options.includes("-h")) {
-    console.log(help[command as keyof typeof help].join("\n"));
+    console.log(
+      topicHelp(
+        invocation(
+          command,
+          options.filter((arg) => arg !== "--help" && arg !== "-h"),
+        ),
+      ),
+    );
   } else {
     process.exitCode = await commands[command as keyof typeof commands](argv);
   }
 } catch (error) {
-  console.error(`rl: ${message(error)}`);
+  const detail = message(error).replace("; run rl --help", "");
+  console.error(
+    `rl: ${detail.startsWith("Usage:") ? "Invalid command arguments" : detail}`,
+  );
+  const parseError =
+    typeof error === "object" &&
+    error !== null &&
+    "code" in error &&
+    String(error.code).startsWith("ERR_PARSE_ARGS_");
+  const argumentsError =
+    parseError ||
+    /^(?:Usage:|Invalid command arguments|Unknown option|Missing --|Expected|Unsupported .*option|--.*(?:require|supported|accept))/.test(
+      detail,
+    );
+  console.error(
+    usageHint(process.argv[2] ?? "", process.argv.slice(3), argumentsError),
+  );
   process.exitCode = 1;
 }

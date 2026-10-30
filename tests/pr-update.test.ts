@@ -2,6 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
+import { createHash } from "node:crypto";
 import { Workspace, read, readJson, write } from "./helpers.js";
 
 const BASE = "a".repeat(40);
@@ -25,6 +26,14 @@ function pr(number: number, extra: object = {}) {
   };
 }
 function fixture(w: Workspace, entries: Record<string, object>) {
+  const adopted = new Set(["feature/a", "feature/b"]);
+  for (const entry of Object.values(entries) as any[]) {
+    const branch = entry.raw.headRefName;
+    if (entry.rlManaged !== false && !adopted.has(branch)) {
+      w.managed(branch);
+      adopted.add(branch);
+    }
+  }
   delete w.env.RL_PR_OFFLINE;
   w.env.RL_DEFAULT_BASE = "origin/test";
   w.env.GH_REPO = "wrong/repository";
@@ -52,12 +61,19 @@ const save = () => fs.writeFileSync(process.env.PR_UPDATE_STATE,JSON.stringify(d
 const output = value => console.log(JSON.stringify(value));
 const fail = msg => { output({message:msg}); console.error(msg); process.exit(1); };
 if(args[0]==='repo') { output({nameWithOwner:'example/repo',url:process.env.PR_IDENTITY_URL||'https://github.com/example/repo'}); process.exit(0); }
-if(args[0]==='pr' && args[1]==='list') { output(Object.keys(data).map(number=>({number:Number(number)})));process.exit(0); }
+if(args[0]==='pr' && args[1]==='list') {
+ const branch=args[args.indexOf('--head')+1];
+ output(Object.entries(data).filter(([,item])=>process.env.BAD_PR_LIST || item.raw.headRefName===branch).map(([number,item])=>({number:Number(number),headRefName:item.raw.headRefName})));process.exit(0);
+}
+
 if(args[0]==='pr' && args[1]==='view') {
  const item=data[args[2]]; if(!item) fail('PR not found');
  item.views=(item.views||0)+1;
  if(item.headChangeAt && item.views>=item.headChangeAt) item.raw.headRefOid='b'.repeat(40);
  if(item.retargetAt && item.views>=item.retargetAt) item.raw.baseRefName='main';
+ if(item.deleteSessionAt && item.views>=item.deleteSessionAt) {
+  const record=JSON.parse(fs.readFileSync(item.instanceFile,'utf8'));record.status='deleted';fs.writeFileSync(item.instanceFile,JSON.stringify(record));
+ }
  if(item.put && item.verificationFails) fail('Verification temporarily unavailable');
  if(process.env.SWITCH_ON_VIEW && item.views===1) cp.spawnSync('git',['checkout','-qb','switched-during-query'],{cwd:process.cwd()});
  save(); output(item.raw);process.exit(0);
@@ -66,6 +82,11 @@ const endpoint=args.find(a=>a.startsWith('repos/'))||'';
 if(endpoint.includes('/compare/')) {
  const oid=endpoint.split('...')[1].split('?')[0];
  const item=Object.values(data).find(item=>item.raw.headRefOid===oid);if(!item) fail('Unknown comparison');
+ item.comparisons=(item.comparisons||0)+1;
+ if(item.deleteSessionOnCompareAt && item.comparisons>=item.deleteSessionOnCompareAt) {
+  const record=JSON.parse(fs.readFileSync(item.instanceFile,'utf8'));record.status='deleted';fs.writeFileSync(item.instanceFile,JSON.stringify(record));
+ }
+ save();
  output({behind_by:item.badComparison?'invalid':item.behind,base_commit:{sha:item.raw.baseRefOid}});process.exit(0);
 }
 const match=endpoint.match(/\\/pulls\\/(\\d+)\\/update-branch$/);
@@ -314,5 +335,140 @@ test("PR batch refuses updates after its current workspace branch changes", (t) 
   );
   assert.equal(report.results[0].status, "failed");
   assert.match(report.results[0].detail, /Instance owns branch/);
+  assert.equal(mock.puts().length, 0);
+});
+
+function instanceFile(w: Workspace, branch: string): string {
+  const root = path.dirname(w.status().stateDirectory);
+  for (const key of fs.readdirSync(root)) {
+    const file = path.join(root, key, "instance.json");
+    if (fs.existsSync(file) && readJson(file).branch === branch) return file;
+  }
+  throw new Error(`Missing test RL session for ${branch}`);
+}
+
+test("PR updates offer only active RL session branches and reject unrelated explicit numbers", (t) => {
+  const w = new Workspace(t);
+  const mock = fixture(w, {
+    11: { raw: pr(11), behind: 2 },
+    12: { raw: pr(12), behind: 2, rlManaged: false },
+    13: { raw: pr(13), behind: 2 },
+  });
+  // A real local worktree and a stale cached PR do not grant RL ownership.
+  w.git(
+    w.repo,
+    "worktree",
+    "add",
+    "-q",
+    "-b",
+    "feature/12",
+    path.join(w.root, "unadopted"),
+  );
+  const current = instanceFile(w, "feature/a");
+  write(current, JSON.stringify({ ...readJson(current), pr: pr(12) }));
+  const deleted = instanceFile(w, "feature/13");
+  write(deleted, JSON.stringify({ ...readJson(deleted), status: "deleted" }));
+  // Records from another repository in the same state directory are excluded.
+  const foreignRepository = path.join(w.root, "other-repository");
+  const foreign = path.join(
+    w.state,
+    createHash("sha256").update(foreignRepository).digest("hex").slice(0, 24),
+    readJson(deleted).key,
+  );
+  fs.mkdirSync(foreign, { recursive: true });
+  write(
+    path.join(foreign, "instance.json"),
+    JSON.stringify({
+      ...readJson(deleted),
+      status: "active",
+      repository: foreignRepository,
+    }),
+  );
+  const capture = path.join(w.root, "scoped-picker.txt");
+  w.env.PR_PICKER_CAPTURE = capture;
+  w.stub(
+    "fzf",
+    "const fs=require('node:fs');const input=fs.readFileSync(0,'utf8');fs.writeFileSync(process.env.PR_PICKER_CAPTURE,input);console.log('11');",
+  );
+  const report = JSON.parse(
+    w.rl(["pr", "update", "--limit", "1", "--dry-run", "--json"], { cwd: w.a })
+      .stdout,
+  );
+  assert.deepEqual(
+    report.results.map((row: { number: number }) => row.number),
+    [11],
+  );
+  assert.match(read(capture), /#11/);
+  assert.doesNotMatch(read(capture), /#12|#13/);
+  const lists = mock
+    .calls()
+    .filter((call) => call.args[0] === "pr" && call.args[1] === "list");
+  assert.deepEqual(
+    lists.map((call) => call.args[call.args.indexOf("--head") + 1]).sort(),
+    ["feature/11", "feature/a", "feature/b"],
+  );
+  assert.ok(
+    !mock
+      .calls()
+      .some(
+        (call) =>
+          call.args[0] === "pr" &&
+          call.args[1] === "view" &&
+          ["12", "13"].includes(call.args[2]),
+      ),
+  );
+  const explicit = JSON.parse(
+    w.rl(["pr", "update", "11", "12", "13", "--json"], { cwd: w.a, ok: false })
+      .stdout,
+  );
+  assert.deepEqual(
+    explicit.results.map((row: { status: string }) => row.status),
+    ["updated", "skipped", "skipped"],
+  );
+  assert.match(explicit.results[1].detail, /active RL session/);
+  assert.equal(mock.puts().length, 1);
+  assert.ok(
+    mock.puts()[0].args.includes("repos/example/repo/pulls/11/update-branch"),
+  );
+  assert.ok(
+    !mock
+      .calls()
+      .some((call) =>
+        call.args.some(
+          (arg: string) =>
+            arg.includes(`/compare/${BASE}...${head(12)}`) ||
+            arg.includes(`/compare/${BASE}...${head(13)}`),
+        ),
+      ),
+  );
+});
+
+test("PR updates recheck session ownership after selection and before writing", (t) => {
+  const w = new Workspace(t);
+  const mock = fixture(w, {
+    11: { raw: pr(11), behind: 2, deleteSessionOnCompareAt: 2 },
+  });
+  const entries = readJson(mock.state);
+  entries[11].instanceFile = instanceFile(w, "feature/11");
+  write(mock.state, JSON.stringify(entries));
+  const report = JSON.parse(
+    w.rl(["pr", "update", "11", "--json"], { cwd: w.a, ok: false }).stdout,
+  );
+  assert.equal(report.results[0].status, "skipped");
+  assert.match(report.results[0].detail, /active RL session/);
+  assert.equal(mock.puts().length, 0);
+});
+
+test("PR updates reject a branch-filtered list containing another session's PRs", (t) => {
+  const w = new Workspace(t);
+  const mock = fixture(w, {
+    11: { raw: pr(11), behind: 2 },
+    12: { raw: pr(12), behind: 2, rlManaged: false },
+  });
+  w.env.BAD_PR_LIST = "1";
+  assert.match(
+    w.rl(["pr", "update"], { cwd: w.a, ok: false }).stderr,
+    /Invalid RL session PR list/,
+  );
   assert.equal(mock.puts().length, 0);
 });

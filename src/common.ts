@@ -87,6 +87,9 @@ export async function execute(
     terminalError?: boolean;
     timeoutMs?: number;
     env?: NodeJS.ProcessEnv;
+    signal?: AbortSignal;
+    maxOutputBytes?: number;
+    processGroup?: boolean;
   } = {},
 ): Promise<CommandResult> {
   return new Promise((resolve, reject) => {
@@ -94,17 +97,45 @@ export async function execute(
       cwd,
       timeout: options.timeoutMs,
       env: options.env ?? (argv[0] === "git" ? gitEnv() : process.env),
+      detached: options.processGroup,
       stdio: options.interactive
         ? "inherit"
         : ["pipe", "pipe", options.terminalError ? "inherit" : "pipe"],
     });
     let stdout = "",
       stderr = "";
+    let outputBytes = 0;
+    let overflow = false;
+    let forceKill: ReturnType<typeof setTimeout> | undefined;
+    const kill = (signal: NodeJS.Signals) => {
+      if (child.exitCode !== null || child.signalCode !== null) return;
+      try {
+        if (options.processGroup && child.pid) process.kill(-child.pid, signal);
+        else child.kill(signal);
+      } catch (error) {
+        const code = (error as NodeJS.ErrnoException).code;
+        if (code === "EPERM" && options.processGroup) child.kill(signal);
+        else if (code !== "ESRCH") throw error;
+      }
+    };
+    const abort = () => {
+      kill("SIGTERM");
+      forceKill ??= setTimeout(() => kill("SIGKILL"), 1000);
+      forceKill.unref();
+    };
+    const append = (chunk: Buffer, target: "stdout" | "stderr") => {
+      outputBytes += chunk.length;
+      if (options.maxOutputBytes && outputBytes > options.maxOutputBytes) {
+        overflow = true;
+        abort();
+      } else if (target === "stdout") stdout += chunk;
+      else stderr += chunk;
+    };
     child.stdout?.on("data", (chunk) => {
-      stdout += chunk;
+      append(chunk, "stdout");
     });
     child.stderr?.on("data", (chunk) => {
-      stderr += chunk;
+      append(chunk, "stderr");
     });
     child.stdin?.on("error", () => {});
     child.stdin?.end(options.input);
@@ -113,6 +144,8 @@ export async function execute(
     process.on("SIGINT", interrupt);
     process.on("SIGTERM", terminate);
     const cleanup = () => {
+      if (forceKill) clearTimeout(forceKill);
+      options.signal?.removeEventListener("abort", abort);
       process.off("SIGINT", interrupt);
       process.off("SIGTERM", terminate);
     };
@@ -122,12 +155,18 @@ export async function execute(
     });
     child.on("close", (code, signal) => {
       cleanup();
+      if (overflow) {
+        reject(new Error("Command output exceeded the configured size limit"));
+        return;
+      }
       resolve({
         code: code ?? 128 + (os.constants.signals[signal!] ?? 1),
         stdout,
         stderr,
       });
     });
+    options.signal?.addEventListener("abort", abort, { once: true });
+    if (options.signal?.aborted) abort();
   });
 }
 export function object(value: unknown): value is Record<string, unknown> {

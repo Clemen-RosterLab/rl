@@ -3,9 +3,16 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
-import { CLI, Workspace, read, write, readJson } from "./helpers.js";
+import {
+  CLI,
+  Workspace,
+  read,
+  write,
+  readJson,
+  sessionPicker,
+} from "./helpers.js";
 
-test("explicit resumes select last used UUID independently for each agent and instance", (t) => {
+test("resume filters sessions by agent and instance and orders the latest used first", (t) => {
   const w = new Workspace(t),
     [a1, a2, b1, claude] = Array.from({ length: 4 }, () => randomUUID());
   w.hook("codex", a1);
@@ -15,6 +22,7 @@ test("explicit resumes select last used UUID independently for each agent and in
   w.hook("codex", a1, { event: "UserPromptSubmit" });
   const sub = path.join(w.a, "nested");
   fs.mkdirSync(sub);
+  sessionPicker(w);
   w.rl(["resume", "codex"], { cwd: sub });
   w.rl(["resume", "claude"], { cwd: w.a });
   w.rl(["resume", "codex"], { cwd: w.b });
@@ -198,7 +206,11 @@ test("adoption preserves preexisting work, saved notes and session ownership", (
 test("branch changes cannot silently retarget an instance", (t) => {
   const w = new Workspace(t);
   w.git(w.a, "checkout", "-q", "-b", "different");
-  for (const command of [["status"], ["resume", "codex"], ["adopt"]])
+  for (const command of [
+    ["status", "--workspace"],
+    ["resume", "codex"],
+    ["adopt"],
+  ])
     w.rl(command, { cwd: w.a, ok: false });
   assert.ok(!fs.existsSync(w.log));
 });
@@ -303,6 +315,7 @@ test("legacy Python timestamps retain microsecond ordering and unknown fields su
   ];
   data.futureField = { retained: true };
   write(file, JSON.stringify(data));
+  sessionPicker(w);
   w.rl(["resume", "codex"], { cwd: w.a });
   assert.deepEqual(w.calls()[0].argv.slice(1), ["resume", newer]);
   assert.deepEqual(readJson(file).futureField, { retained: true });

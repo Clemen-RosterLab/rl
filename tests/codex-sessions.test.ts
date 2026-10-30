@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
-import { Workspace, readJson } from "./helpers.js";
+import { Workspace, readJson, sessionPicker } from "./helpers.js";
 
 function server(w: Workspace) {
   w.env.CODEX_RPC_LOG = path.join(w.root, "codex-rpc.jsonl");
@@ -87,6 +87,7 @@ test("ordinary Codex sessions are discovered, persisted, shown in overview and r
     table.split("\n").find((line) => line.includes("feature/a")) ?? "",
     /2\s+0\s+-$/,
   );
+  sessionPicker(w);
   w.rl(["resume", "codex"], { cwd: w.a });
   assert.deepEqual(w.calls()[0].argv.slice(1), ["resume", newer.id]);
   const requests = fs
@@ -113,7 +114,7 @@ test("resume discovers a session before status has ever imported it", (t) => {
   server(w);
   const item = thread(w);
   w.env.CODEX_THREADS = JSON.stringify([item]);
-  w.rl(["resume", "codex"], { cwd: w.a });
+  w.rl(["resume"], { cwd: w.a });
   assert.deepEqual(w.calls()[0].argv.slice(1), ["resume", item.id]);
 });
 
@@ -123,7 +124,7 @@ test("a branch change during discovery cannot save to the previous instance", (t
   server(w);
   w.env.CODEX_THREADS = JSON.stringify([thread(w)]);
   w.env.CODEX_SWITCH_BRANCH = "1";
-  w.rl(["status"], { cwd: w.a, ok: false });
+  w.rl(["status", "--workspace"], { cwd: w.a, ok: false });
   assert.deepEqual(readJson(file).sessions.codex, []);
 });
 

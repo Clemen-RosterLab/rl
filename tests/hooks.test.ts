@@ -3,7 +3,22 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
-import { Workspace, readJson, read, write } from "./helpers.js";
+import { Workspace, readJson, read, write, sessionPicker } from "./helpers.js";
+
+test("ephemeral workflow hooks provide context without recording sessions or changing activity", (t) => {
+  const w = new Workspace(t);
+  const before = w.status();
+  const file = path.join(before.stateDirectory, "instance.json"),
+    original = read(file);
+  w.env.RL_WORKFLOW_RUN = randomUUID();
+  w.env.RL_WORKFLOW_STEP = "behavior";
+  for (const agent of ["codex", "claude"]) {
+    assert.match(w.hook(agent, randomUUID()).stdout, /RL feature workspace/);
+    w.hook(agent, randomUUID(), { event: "Stop" });
+  }
+  assert.equal(read(file), original);
+  assert.deepEqual(w.status().sessions, before.sessions);
+});
 
 for (const agent of ["codex", "claude"]) {
   test(`${agent} lifecycle separates activity, child sessions, and resumable history`, (t) => {
@@ -169,6 +184,7 @@ test("late Stop events do not change which session resumes, and missing CLIs are
   w.hook("claude", first);
   w.hook("claude", latest);
   w.hook("claude", first, { event: "Stop" });
+  sessionPicker(w);
   w.rl(["resume", "claude"], { cwd: w.a });
   assert.deepEqual(w.calls().at(-1).argv.slice(1), ["--resume", latest]);
   w.stub("claude", "process.exit(42);");

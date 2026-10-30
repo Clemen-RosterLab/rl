@@ -47,7 +47,7 @@ test("unconfigured creation and registration default to origin/test even when ma
   w.rl(["repo", "add", "example", w.repo]);
   const registry = JSON.parse(w.rl(["repo", "list", "--json"]).stdout);
   assert.equal(registry.repositories.example.base, "origin/test");
-  const help = w.rl(["help"]).stdout;
+  const help = w.rl(["switch", "--help"]).stdout;
   assert.match(help, /default: origin\/test/);
   assert.doesNotMatch(help, /default: origin\/main/);
   assert.doesNotMatch(help, /default: origin\/develop/);

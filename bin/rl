@@ -11,8 +11,17 @@ if [[ "$1" == --version || "$1" == -V ]]; then
   exec node -p 'JSON.parse(require("node:fs").readFileSync(process.argv[1], "utf8")).version' "$rl_home/package.json"
 fi
 if [[ "$1" == init ]]; then
+  if (( $# == 1 )); then
+    exec node "$rl_home/dist/help.js" init
+  fi
+  for argument in "$@"; do
+    [[ "$argument" == -- ]] && break
+    if [[ "$argument" == --help || "$argument" == -h ]]; then
+      exec node "$rl_home/dist/help.js" "$@"
+    fi
+  done
   if [[ "$2" != zsh && "$2" != bash || $# != 2 ]]; then
-    print -u2 'Usage: rl init zsh|bash'
+    print -u2 'Usage: rl setup shell <zsh|bash>'
     exit 1
   fi
   if [[ "$2" == zsh ]]; then

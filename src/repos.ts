@@ -1,5 +1,8 @@
 import fs from "node:fs";
 import path from "node:path";
+import os from "node:os";
+import { stripVTControlCharacters } from "node:util";
+import { writeWorkspaceOutput } from "./command-context.js";
 import { syncCodexSessions } from "./codex-sessions.js";
 import {
   args,
@@ -151,6 +154,105 @@ class Registry {
     }
     return this.legacy();
   }
+  async checkout(name?: string, output?: string): Promise<void> {
+    const data = this.read();
+    const repos = Object.entries(data.repositories)
+      .sort(([a], [b]) => a.localeCompare(b))
+      .map(([name, repo]) => ({ name, ...repo }));
+    if (!repos.length)
+      throw new Error(
+        "No registered repositories. Run 'rl repo add .' inside a repository first.",
+      );
+    let selected = name ? repos.find((repo) => repo.name === name) : undefined;
+    if (name && !selected)
+      throw new Error(`Unknown repository: ${name}. Use 'rl repo list'`);
+    if (!name && repos.length === 1) selected = repos[0];
+    if (!selected) {
+      const visible = (value: string) =>
+        stripVTControlCharacters(value).replace(/[\x00-\x1f\x7f-\x9f]/g, " ");
+      const cell = (value: string, width: number) => {
+        const text = visible(value);
+        return (
+          text.length > width ? text.slice(0, width - 1) + "…" : text
+        ).padEnd(width);
+      };
+      const nameWidth = Math.min(
+        32,
+        Math.max(12, ...repos.map((repo) => repo.name.length)),
+      );
+      const baseWidth = Math.min(
+        24,
+        Math.max(4, ...repos.map((repo) => visible(repo.base).length)),
+      );
+      const pathWidth = Math.max(
+        12,
+        (process.stderr.columns || 110) - nameWidth - baseWidth - 10,
+      );
+      const dim = (value: string) =>
+        process.env.NO_COLOR !== undefined ? value : `\x1b[90m${value}\x1b[0m`;
+      const home = os.homedir();
+      const rows = repos.map((repo) => ({
+        repo,
+        line: `${repo.name}\t${cell(repo.name, nameWidth)}  ${dim(cell(repo.base, baseWidth))}  ${dim(cell(repo.root.startsWith(home + path.sep) ? "~" + repo.root.slice(home.length) : repo.root, pathWidth))}`,
+      }));
+      const result = await execute(
+        [
+          "fzf",
+          "--ansi",
+          "--prompt=Repository › ",
+          "--delimiter=\t",
+          "--with-nth=2..",
+          "--height=~50%",
+          "--min-height=8",
+          "--border=rounded",
+          "--info=inline",
+          "--reverse",
+          "--no-multi",
+          "--no-sort",
+          `--header=Enter open · Esc cancel\n\n${cell("REPOSITORY", nameWidth)}  ${cell("BASE", baseWidth)}  PATH`,
+        ],
+        process.cwd(),
+        {
+          input: rows.map((row) => row.line).join("\n") + "\n",
+          terminalError: true,
+        },
+      );
+      if ([1, 130].includes(result.code)) return;
+      if (result.code) throw new Error(`fzf failed (exit ${result.code})`);
+      const line = result.stdout.replace(/\r?\n$/, "");
+      selected = rows.find(
+        (row) =>
+          stripVTControlCharacters(row.line) ===
+            stripVTControlCharacters(line) || row.repo.name === line,
+      )?.repo;
+      if (!selected) throw new Error("Picker returned an unknown repository");
+    }
+    const current = this.read().repositories[selected.name];
+    if (
+      !current ||
+      JSON.stringify(current) !==
+        JSON.stringify(data.repositories[selected.name])
+    )
+      throw new Error(
+        "Repository registration changed during selection; retry the command",
+      );
+    if (
+      canonical(git(selected.root, "rev-parse", "--show-toplevel")) !==
+        selected.root ||
+      canonical(
+        git(
+          selected.root,
+          "rev-parse",
+          "--path-format=absolute",
+          "--git-common-dir",
+        ),
+      ) !== selected.commonDir
+    )
+      throw new Error(
+        "Repository checkout no longer matches its registration; register it again",
+      );
+    writeWorkspaceOutput(selected.root, output);
+  }
   async manage(rest: string[], values: Record<string, unknown>): Promise<void> {
     await locked(
       path.dirname(this.file),
@@ -158,7 +260,8 @@ class Registry {
       () => {
         const data = this.read(),
           repos = data.repositories,
-          [action, name, target] = rest;
+          [action] = rest;
+        let name = rest[1];
         if (action === "list") {
           arity(rest, 1);
           if (values.json) json(data);
@@ -176,22 +279,32 @@ class Registry {
           return;
         }
         if (action === "add") {
-          arity(rest, 3);
+          arity(rest, 1, 3);
+          if (rest.length === 3 && values.alias !== undefined)
+            throw new Error(
+              "Choose either --alias <name> or the legacy <alias> <path> form",
+            );
+          const target = rest.length === 3 ? rest[2] : (rest[1] ?? ".");
+          const root = canonical(worktrees(expandHome(target))[0].worktree);
+          name = String(
+            values.alias ?? (rest.length === 3 ? name : repositoryName(root)),
+          );
           if (!validName(name))
             throw new Error(
-              "Repository names must contain letters, numbers, dots, underscores, or hyphens",
+              "Repository names must contain letters, numbers, dots, underscores, or hyphens; supply --alias <name>",
             );
           if (Object.hasOwn(repos, name))
-            throw new Error(`Repository name already registered: ${name}`);
-          const root = canonical(worktrees(expandHome(target))[0].worktree),
-            common = canonical(
-              git(
-                root,
-                "rev-parse",
-                "--path-format=absolute",
-                "--git-common-dir",
-              ),
+            throw new Error(
+              `Repository name already registered: ${name}; choose --alias <name>`,
             );
+          const common = canonical(
+            git(
+              root,
+              "rev-parse",
+              "--path-format=absolute",
+              "--git-common-dir",
+            ),
+          );
           if (Object.values(repos).some((repo) => repo.commonDir === common))
             throw new Error(
               "This Git repository is already registered under another name",
@@ -243,6 +356,26 @@ class Registry {
       },
     );
   }
+}
+function repositoryName(root: string): string {
+  let source: string;
+  try {
+    source = git(root, "remote", "get-url", "origin");
+  } catch {
+    return path.basename(root);
+  }
+  if (source.includes("://")) {
+    try {
+      source = new URL(source).pathname;
+    } catch {
+      /* Git also accepts local paths. */
+    }
+  }
+  return source
+    .replace(/\/+$/, "")
+    .split(/[/:]/)
+    .at(-1)!
+    .replace(/\.git$/, "");
 }
 function defaultBase(root: string): string {
   try {
@@ -401,6 +534,127 @@ function display(rows: Row[]): void {
     );
   if (!rows.length) console.log("No RL instances found.");
 }
+async function repositoryStatus(
+  registry: Registry,
+  data: RegistryData,
+  fetch: boolean,
+  asJson: boolean,
+): Promise<number> {
+  const repo = registry.resolve(data);
+  const result = await repositoryRows(repo, registry.settings, fetch, false);
+  let currentWorkspace: { path: string; branch: string; main: boolean } | null =
+    null;
+  try {
+    if (
+      canonical(
+        git(
+          process.cwd(),
+          "rev-parse",
+          "--path-format=absolute",
+          "--git-common-dir",
+        ),
+      ) ===
+      canonical(
+        git(
+          repo.root,
+          "rev-parse",
+          "--path-format=absolute",
+          "--git-common-dir",
+        ),
+      )
+    ) {
+      const root = canonical(
+        git(process.cwd(), "rev-parse", "--show-toplevel"),
+      );
+      currentWorkspace = {
+        path: root,
+        branch: git(root, "branch", "--show-current") || "(detached)",
+        main: root === repo.root,
+      };
+    }
+  } catch {
+    /* Outside the selected repository. */
+  }
+  const rows = result.rows.filter((row) => row.worktree !== repo.root);
+  const status = {
+    repository: {
+      name: repo.name,
+      root: repo.root,
+      base: repo.base,
+      worktreeDirectory: path.join(
+        registry.settings.baseDir,
+        repo.worktreeName,
+      ),
+      registered: Object.hasOwn(data.repositories, repo.name),
+    },
+    selection: registry.settings.selection
+      ? "explicit"
+      : currentWorkspace
+        ? "current checkout"
+        : "default",
+    defaultRepository: data.default,
+    registeredRepositories: Object.keys(data.repositories).length,
+    currentWorkspace,
+    workspaces: {
+      total: rows.length,
+      dirty: rows.filter((row) => row.gitStatus.dirty).length,
+      unavailable: rows.filter((row) => row.gitStatus.availability !== "ok")
+        .length,
+    },
+    sessions: {
+      codex: result.rows.reduce(
+        (n, row) => n + (row.sessions?.codex.length ?? 0),
+        0,
+      ),
+      claude: result.rows.reduce(
+        (n, row) => n + (row.sessions?.claude.length ?? 0),
+        0,
+      ),
+    },
+    fetched: fetch,
+    errors: result.errors,
+  };
+  if (asJson) json(status);
+  else {
+    const safe = (value: string) =>
+      stripVTControlCharacters(value).replace(/[\x00-\x1f\x7f-\x9f]/g, " ");
+    const row = (label: string, value: string) =>
+      `  ${label.padEnd(13)}${safe(value)}`;
+    console.log(
+      [
+        "",
+        `  ${safe(repo.name)}`,
+        "",
+        row("Repository", repo.root),
+        row("Selected via", status.selection),
+        row("Base", repo.base),
+        row("Worktrees", status.repository.worktreeDirectory),
+        row(
+          "Current",
+          currentWorkspace
+            ? `${currentWorkspace.main ? "main checkout" : currentWorkspace.branch} · ${currentWorkspace.path}`
+            : "outside this repository",
+        ),
+        row(
+          "Workspaces",
+          `${status.workspaces.total} total · ${status.workspaces.dirty} dirty · ${status.workspaces.unavailable} unavailable`,
+        ),
+        row(
+          "Sessions",
+          `${status.sessions.codex} Codex · ${status.sessions.claude} Claude saved`,
+        ),
+        row("Default", data.default ?? "legacy configuration"),
+        "",
+        "  rl checkout  switch repository · rl list  workspaces",
+        "  rl status --workspace  current workspace, Git, PR and sessions",
+        "",
+      ].join("\n"),
+    );
+    for (const error of result.errors)
+      console.error(`${safe(error.repository)}: ${safe(error.message)}`);
+  }
+  return result.errors.length ? 1 : 0;
+}
 export async function main(argv: string[]): Promise<number> {
   const { values, positionals } = args(
     argv,
@@ -413,6 +667,8 @@ export async function main(argv: string[]): Promise<number> {
       "selection",
       "base",
       "worktree-name",
+      "alias",
+      "output-path",
     ],
     ["all", "list", "json", "fetch", "include-deleted"],
   );
@@ -430,8 +686,18 @@ export async function main(argv: string[]): Promise<number> {
     await registry.manage(rest, values);
     return 0;
   }
+  if (command === "checkout") {
+    arity(rest, 0, 1);
+    await registry.checkout(
+      rest[0],
+      values["output-path"] as string | undefined,
+    );
+    return 0;
+  }
   const data = registry.read();
   arity(rest, 0);
+  if (command === "status" && !values.all && !values.list)
+    return repositoryStatus(registry, data, !!values.fetch, !!values.json);
   if (command === "resolve") {
     const repo = registry.resolve(data);
     console.log(

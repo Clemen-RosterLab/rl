@@ -100,7 +100,14 @@ test("offline npm install, relocation and reinstall preserve hooks, sessions and
     w.command([cli, "--version"]).stdout.trim(),
     readJson(path.join(ROOT, "package.json")).version,
   );
-  assert.match(w.command([cli, "help"]).stdout, /rl resume codex\|claude/);
+  assert.match(
+    w.command([cli, "help"]).stdout,
+    /resume\s+Resume a saved conversation/,
+  );
+  assert.match(
+    w.command([cli, "resume", "--help"]).stdout,
+    /rl resume \[codex\|claude\]/,
+  );
   w.command([cli, "adopt"], { cwd: w.a });
   assert.equal(
     w.command([cli, "path", "@"], { cwd: w.a }).stdout.trim(),
@@ -176,8 +183,9 @@ test("offline npm install, relocation and reinstall preserve hooks, sessions and
   assert.equal(diagnosis.agents[0].lastSuccess.event, "SessionStart");
   assert.equal(diagnosis.agents[0].activity[0].sessionId, sid);
   assert.equal(
-    JSON.parse(w.command([cli, "status", "--json"], { cwd: w.a }).stdout)
-      .sessions.codex[0].id,
+    JSON.parse(
+      w.command([cli, "status", "--workspace", "--json"], { cwd: w.a }).stdout,
+    ).sessions.codex[0].id,
     sid,
   );
   w.command([cli, "adopt"], { cwd: w.a });

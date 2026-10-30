@@ -135,7 +135,7 @@ async function choose(
         "--reverse",
         "--prompt=Update PRs › ",
         "--bind=ctrl-a:select-all,ctrl-d:deselect-all",
-        `--header=Tab select · Enter ${dryRun ? "preview" : "merge base into selected PR branches"} · Esc cancel\nBase: ${visible(base)} · behind counts are commits`,
+        `--header=Your active RL session PRs · Tab select · Enter ${dryRun ? "preview" : "merge base into selected PR branches"} · Esc cancel\nBase: ${visible(base)} · behind counts are commits`,
       ],
       cwd,
       { input: lines.join("\n") + "\n", terminalError: true },
@@ -182,6 +182,30 @@ export async function main(argv: string[]): Promise<number> {
     throw new Error("Expected positive PR numbers");
   const context = commandContext(values);
   const [file, data] = context.store.current();
+  // Session ownership comes from repository-scoped RL records, never PR authors
+  // or a cached PR number. Keep the original owners so replacement sessions do
+  // not silently authorize an already selected update.
+  const owners = new Map<string, Set<string>>();
+  for (const [, instance] of context.store.records()) {
+    if (instance.status !== "active") continue;
+    const keys = owners.get(instance.branch) ?? new Set<string>();
+    keys.add(instance.key);
+    owners.set(instance.branch, keys);
+  }
+  const ownsBranch = (branch: string) => {
+    const keys = owners.get(branch);
+    return (
+      !!keys &&
+      context.store
+        .records()
+        .some(
+          ([, instance]) =>
+            instance.status === "active" &&
+            instance.branch === branch &&
+            keys.has(instance.key),
+        )
+    );
+  };
   const base = String(values.base ?? context.defaultBase).replace(
     /^origin\//,
     "",
@@ -237,6 +261,13 @@ export async function main(argv: string[]): Promise<number> {
         mergeability: pr.mergeable,
         detail: "",
       };
+      if (!ownsBranch(pr.headRefName))
+        return {
+          ...row,
+          status: "skipped",
+          detail:
+            "PR branch does not belong to an active RL session in this repository",
+        };
       if (
         pr.state !== "OPEN" ||
         pr.baseRefName !== base ||
@@ -288,39 +319,50 @@ export async function main(argv: string[]): Promise<number> {
   let selected = [...new Set(requested.map(Number))];
   const initial = new Map<number, Result>();
   if (!selected.length) {
-    const listed = await github(data.worktree, [
-      "pr",
-      "list",
-      "--repo",
-      repository.url,
-      "--base",
-      base,
-      "--state",
-      "open",
-      "--limit",
-      String(limit),
-      "--json",
-      "number",
-    ]);
-    if (listed.code) throw new Error(apiError(listed.stdout, listed.stderr));
-    const list = parseJson(listed.stdout);
-    if (
-      !Array.isArray(list) ||
-      list.some(
-        (item) =>
-          !object(item) ||
-          !Number.isSafeInteger(item.number) ||
-          Number(item.number) < 1,
-      )
-    )
-      throw new Error("Invalid PR list from GitHub");
-    const ids = [
-      ...new Set(
-        list.map((item) => Number((item as { number: number }).number)),
-      ),
-    ];
     if (!values.json)
-      console.error(`Checking up to ${limit} open PRs targeting ${base}…`);
+      console.error(
+        `Checking up to ${limit} open PRs from your active RL sessions targeting ${base}…`,
+      );
+    const branches = [...owners.keys()].sort();
+    const byBranch = new Map<string, number[]>();
+    await pooled(branches, 4, async (branch) => {
+      const listed = await github(data.worktree, [
+        "pr",
+        "list",
+        "--repo",
+        repository.url,
+        "--head",
+        branch,
+        "--base",
+        base,
+        "--state",
+        "open",
+        "--limit",
+        String(limit),
+        "--json",
+        "number,headRefName",
+      ]);
+      if (listed.code) throw new Error(apiError(listed.stdout, listed.stderr));
+      const list = parseJson(listed.stdout);
+      if (
+        !Array.isArray(list) ||
+        list.some(
+          (item) =>
+            !object(item) ||
+            !Number.isSafeInteger(item.number) ||
+            Number(item.number) < 1 ||
+            item.headRefName !== branch,
+        )
+      )
+        throw new Error("Invalid RL session PR list from GitHub");
+      byBranch.set(
+        branch,
+        list.map((item) => Number((item as { number: number }).number)),
+      );
+    });
+    const ids = [
+      ...new Set(branches.flatMap((branch) => byBranch.get(branch) ?? [])),
+    ].slice(0, limit);
     await pooled(ids, 4, async (number) => {
       initial.set(number, await inspect(number));
     });
@@ -347,7 +389,7 @@ export async function main(argv: string[]): Promise<number> {
       if (values.json) json(report);
       else
         console.log(
-          `No PRs selected for update.${failed.length ? ` ${failed.length} PRs could not be checked.` : ""}`,
+          `No RL session PRs selected for update.${failed.length ? ` ${failed.length} PRs could not be checked.` : ""}`,
         );
       return failed.length ? 1 : 0;
     }
@@ -397,6 +439,15 @@ export async function main(argv: string[]): Promise<number> {
           `Merging latest ${base} into #${number} ${visible(row.branch!)}…`,
         );
       recheck();
+      if (!ownsBranch(row.branch!)) {
+        results.push({
+          ...row,
+          status: "skipped",
+          detail:
+            "PR branch no longer belongs to the selected active RL session",
+        });
+        continue;
+      }
       const update = await github(data.worktree, [
         "api",
         "--hostname",
