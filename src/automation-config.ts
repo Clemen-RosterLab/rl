@@ -13,11 +13,12 @@ export const CONFIG_FILES = {
 export const SEVERITIES = ["critical", "high", "medium", "low"] as const;
 export type Severity = (typeof SEVERITIES)[number];
 export interface AgentProfile {
-  provider: Agent;
+  provider?: Agent | "inherit";
   description: string;
   instructions: string;
   model?: string;
   reasoning?: string;
+  access?: "read-only" | "workspace-write";
 }
 export interface ReviewPolicy {
   instructions: string;
@@ -38,6 +39,13 @@ export interface AgentWorkflow {
   retries: number;
   timeoutSeconds: number;
   steps: WorkflowStep[];
+  triggers?: WorkflowTrigger[];
+}
+export interface WorkflowTrigger {
+  event: string;
+  tools?: string[];
+  paths?: string[];
+  changes?: boolean;
 }
 export interface AutomationConfig {
   agents: Record<string, AgentProfile>;
@@ -98,13 +106,29 @@ export function validateAutomation(
       if (kind === "agents") {
         fields(
           item,
-          ["provider", "description", "instructions", "model", "reasoning"],
-          ["provider", "description", "instructions"],
+          [
+            "provider",
+            "description",
+            "instructions",
+            "model",
+            "reasoning",
+            "access",
+          ],
+          ["description", "instructions"],
         );
-        if (!["codex", "claude"].includes(String(item.provider)))
-          throw new Error("Agent provider must be codex or claude");
+        if (
+          item.provider !== undefined &&
+          !["inherit", "codex", "claude"].includes(String(item.provider))
+        )
+          throw new Error("Agent provider must be inherit, codex or claude");
         nonempty(item.description);
         nonempty(item.instructions);
+        if (
+          item.access !== undefined &&
+          item.access !== "read-only" &&
+          item.access !== "workspace-write"
+        )
+          throw new Error("Agent access must be read-only or workspace-write");
         if (item.model !== undefined) {
           nonempty(item.model);
           if (item.model.startsWith("-")) throw new Error("Invalid model");
@@ -112,7 +136,7 @@ export function validateAutomation(
         if (
           item.reasoning !== undefined &&
           !(
-            item.provider === "codex"
+            item.provider !== "claude"
               ? ["low", "medium", "high", "xhigh"]
               : ["low", "medium", "high", "max"]
           ).includes(String(item.reasoning))
@@ -133,14 +157,56 @@ export function validateAutomation(
         if (typeof item.blockRequired !== "boolean")
           throw new Error("blockRequired must be boolean");
       } else {
-        fields(item, [
-          "description",
-          "policy",
-          "concurrency",
-          "retries",
-          "timeoutSeconds",
-          "steps",
-        ]);
+        fields(
+          item,
+          [
+            "description",
+            "policy",
+            "concurrency",
+            "retries",
+            "timeoutSeconds",
+            "steps",
+            "triggers",
+          ],
+          [
+            "description",
+            "policy",
+            "concurrency",
+            "retries",
+            "timeoutSeconds",
+            "steps",
+          ],
+        );
+        if (item.triggers !== undefined) {
+          if (!Array.isArray(item.triggers) || item.triggers.length > 32)
+            throw new Error("Expected up to 32 workflow triggers");
+          for (const trigger of item.triggers) {
+            fields(trigger, ["event", "tools", "paths", "changes"], ["event"]);
+            nonempty(trigger.event);
+            if (!/^[a-z][a-z0-9_.-]{0,63}$/.test(trigger.event))
+              throw new Error("Invalid trigger event");
+            for (const key of ["tools", "paths"])
+              if (
+                trigger[key] !== undefined &&
+                (!Array.isArray(trigger[key]) ||
+                  !trigger[key].length ||
+                  trigger[key].length > 64 ||
+                  trigger[key].some(
+                    (text: unknown) =>
+                      typeof text !== "string" ||
+                      !text ||
+                      text.length > 512 ||
+                      /[\x00-\x1f]/.test(text),
+                  ))
+              )
+                throw new Error(`Invalid trigger ${key}`);
+            if (
+              trigger.changes !== undefined &&
+              typeof trigger.changes !== "boolean"
+            )
+              throw new Error("Trigger changes must be boolean");
+          }
+        }
         nonempty(item.description);
         identifier(item.policy);
         if (
@@ -237,7 +303,10 @@ export function readAutomation(root: string): AutomationConfig {
   validateAutomation(result);
   return result;
 }
-export function initAutomation(root: string, provider: Agent): void {
+export function initAutomation(
+  root: string,
+  provider: Agent | "inherit",
+): void {
   const paths = Object.values(CONFIG_FILES).map((file) =>
     configPath(root, file),
   );
@@ -255,4 +324,32 @@ export function initAutomation(root: string, provider: Agent): void {
       version: 1,
       [kind]: preset[kind as keyof AutomationConfig],
     });
+}
+export function hasAutomation(root: string): boolean {
+  return Object.values(CONFIG_FILES).some((relative) =>
+    fs.existsSync(configPath(root, relative)),
+  );
+}
+export function setAutomation(
+  root: string,
+  kind: "agents" | "workflows",
+  name: string,
+  value: unknown,
+  addOnly = false,
+): void {
+  identifier(name);
+  const config = readAutomation(root);
+  if (addOnly && Object.hasOwn(config[kind], name))
+    throw new Error(`${name} already exists; use set to update it`);
+  Object.defineProperty(config[kind], name, {
+    value,
+    enumerable: true,
+    writable: true,
+    configurable: true,
+  });
+  validateAutomation(config);
+  writeJson(configPath(root, CONFIG_FILES[kind]), {
+    version: 1,
+    [kind]: config[kind],
+  });
 }

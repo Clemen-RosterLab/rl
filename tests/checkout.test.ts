@@ -14,14 +14,14 @@ function fixture(t: TestContext) {
     "remote",
     "add",
     "origin",
-    "git@example.invalid:RosterLab/rosterlab-frontend.git",
+    "git@example.invalid:example/frontend.git",
   );
   w.git(
     other,
     "remote",
     "add",
     "origin",
-    "https://example.invalid/team/romeo.git",
+    "https://example.invalid/team/backend.git",
   );
   w.rl(["repo", "add", "."], { cwd: w.a });
   w.rl(["repo", "add"], { cwd: other });
@@ -42,10 +42,10 @@ if (process.env.CHECKOUT_EXIT) process.exit(Number(process.env.CHECKOUT_EXIT));
 if (process.env.CHECKOUT_REPLACE) {
  const file = process.env.CHECKOUT_REGISTRY;
  const data = JSON.parse(fs.readFileSync(file, 'utf8'));
- data.repositories.romeo.root = process.env.CHECKOUT_REPLACE;
+ data.repositories.backend.root = process.env.CHECKOUT_REPLACE;
  fs.writeFileSync(file, JSON.stringify(data));
 }
-console.log(process.env.CHECKOUT_OUTPUT ?? input.trimEnd().split('\\n').find(line => line.startsWith('romeo\\t')));
+console.log(process.env.CHECKOUT_OUTPUT ?? input.trimEnd().split('\\n').find(line => line.startsWith('backend\\t')));
 `,
   );
   return capture;
@@ -54,24 +54,24 @@ console.log(process.env.CHECKOUT_OUTPUT ?? input.trimEnd().split('\\n').find(lin
 test("registration infers origin names from linked worktrees and accepts optional aliases", (t) => {
   const { w, other, registry } = fixture(t);
   const data = readJson(registry);
-  assert.equal(data.repositories["rosterlab-frontend"].root, w.repo);
-  assert.equal(data.repositories["rosterlab-frontend"].worktreeName, "example");
-  assert.equal(data.repositories.romeo.root, other);
-  w.rl(["repo", "remove", "romeo"]);
-  w.rl(["repo", "add", ".", "--alias", "backend"], { cwd: other });
-  assert.equal(readJson(registry).repositories.backend.root, other);
+  assert.equal(data.repositories["frontend"].root, w.repo);
+  assert.equal(data.repositories["frontend"].worktreeName, "example");
+  assert.equal(data.repositories.backend.root, other);
   w.rl(["repo", "remove", "backend"]);
+  w.rl(["repo", "add", ".", "--alias", "services"], { cwd: other });
+  assert.equal(readJson(registry).repositories.services.root, other);
+  w.rl(["repo", "remove", "services"]);
   w.rl(["repo", "add", "legacy", other]);
   assert.equal(readJson(registry).repositories.legacy.root, other);
 });
 
 test("registration falls back to the main directory and reports inferred name collisions", (t) => {
   const { w, other, registry } = fixture(t);
-  w.rl(["repo", "remove", "rosterlab-frontend"]);
+  w.rl(["repo", "remove", "frontend"]);
   w.git(w.repo, "remote", "remove", "origin");
   w.rl(["repo", "add", "."], { cwd: w.b });
   assert.equal(readJson(registry).repositories.repo.root, w.repo);
-  w.rl(["repo", "remove", "romeo"]);
+  w.rl(["repo", "remove", "backend"]);
   w.git(
     other,
     "remote",
@@ -85,7 +85,7 @@ test("registration falls back to the main directory and reports inferred name co
     /already registered: repo.*--alias/,
   );
   assert.equal(read(registry), before);
-  w.rl(["repo", "add", other, "--alias", "romeo"]);
+  w.rl(["repo", "add", other, "--alias", "backend"]);
 });
 
 test("checkout selects across repositories without changing branches, dirty files or default", (t) => {
@@ -95,9 +95,12 @@ test("checkout selects across repositories without changing branches, dirty file
   write(path.join(other, "dirty.txt"), "keep unstaged");
   const before = read(registry),
     status = w.git(other, "status", "--porcelain");
-  assert.equal(w.rl(["checkout", "romeo"], { cwd: w.a }).stdout.trim(), other);
   assert.equal(
-    w.rl(["checkout", "rosterlab-frontend"], { cwd: other }).stdout.trim(),
+    w.rl(["checkout", "backend"], { cwd: w.a }).stdout.trim(),
+    other,
+  );
+  assert.equal(
+    w.rl(["checkout", "frontend"], { cwd: other }).stdout.trim(),
     w.repo,
   );
   assert.equal(w.git(other, "branch", "--show-current"), "test");
@@ -113,8 +116,8 @@ test("repository picker includes every registration, supports cancellation and r
     capture = picker(w);
   const before = read(registry);
   assert.equal(w.rl(["checkout"], { cwd: w.a }).stdout.trim(), other);
-  assert.match(read(capture), /rosterlab-frontend\t/);
-  assert.match(read(capture), /romeo\t/);
+  assert.match(read(capture), /frontend\t/);
+  assert.match(read(capture), /backend\t/);
   for (const code of [1, 130]) {
     w.env.CHECKOUT_EXIT = String(code);
     assert.equal(w.rl(["checkout"]).stdout, "");
@@ -150,13 +153,13 @@ test("checkout rejects missing or replaced repositories and registrations change
     /registration changed/,
   );
   delete w.env.CHECKOUT_REPLACE;
-  w.rl(["repo", "remove", "romeo"]);
+  w.rl(["repo", "remove", "backend"]);
   w.rl(["repo", "add", other]);
   fs.renameSync(other, other + "-moved");
-  assert.equal(w.rl(["checkout", "romeo"], { ok: false }).stdout, "");
+  assert.equal(w.rl(["checkout", "backend"], { ok: false }).stdout, "");
   w.git(w.repo, "worktree", "add", "-q", "-b", "replacement", other);
   assert.match(
-    w.rl(["checkout", "romeo"], { ok: false }).stderr,
+    w.rl(["checkout", "backend"], { ok: false }).stderr,
     /no longer matches/,
   );
 });
@@ -173,11 +176,11 @@ test("zsh and bash checkout enter the selected repository and scope subsequent w
       w.env.RL_TEST_SCRIPT!,
       `
 eval "$("$RL_TEST_CLI" setup shell ${shell})"
-rl checkout romeo || exit 10
+rl checkout backend || exit 10
 [[ "$PWD" == "$RL_TEST_OTHER" ]] || exit 11
 rl list --json > "$RL_TEST_OTHER/list.json" || exit 12
 rl status --json > "$RL_TEST_OTHER/status.json" || exit 21
-rl checkout rosterlab-frontend || exit 13
+rl checkout frontend || exit 13
 [[ "$PWD" == "$RL_REPO_ROOT" ]] || exit 14
 rl checkout || exit 15
 [[ "$PWD" == "$RL_TEST_OTHER" ]] || exit 16
@@ -195,7 +198,7 @@ rl checkout missing && exit 19
     assert.deepEqual(readJson(path.join(other, "list.json")).instances, []);
     assert.equal(
       readJson(path.join(other, "status.json")).repository.name,
-      "romeo",
+      "backend",
     );
   }
   assert.equal(read(registry), before);
@@ -210,7 +213,7 @@ test("repository status explains selection, current workspace, base and scoped s
   const report = (args: string[] = [], cwd = w.a) =>
     JSON.parse(w.rl(["status", ...args, "--json"], { cwd }).stdout);
   const status = report();
-  assert.equal(status.repository.name, "rosterlab-frontend");
+  assert.equal(status.repository.name, "frontend");
   assert.equal(status.repository.root, w.repo);
   assert.equal(status.repository.base, "origin/develop");
   assert.equal(status.selection, "current checkout");
@@ -222,11 +225,11 @@ test("repository status explains selection, current workspace, base and scoped s
   assert.deepEqual(status.workspaces, { total: 2, dirty: 1, unavailable: 0 });
   assert.deepEqual(status.sessions, { codex: 0, claude: 1 });
   const main = report([], other);
-  assert.equal(main.repository.name, "romeo");
+  assert.equal(main.repository.name, "backend");
   assert.equal(main.currentWorkspace.main, true);
   assert.deepEqual(main.sessions, { codex: 0, claude: 0 });
   assert.equal(report([], w.root).selection, "default");
-  w.env.RL_REPO = "romeo";
+  w.env.RL_REPO = "backend";
   assert.equal(report().selection, "explicit");
   assert.equal(report().currentWorkspace, null);
   delete w.env.RL_REPO;

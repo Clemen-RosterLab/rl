@@ -386,128 +386,178 @@ CLI help: Codex 0.160.1 and Claude Code 2.1.290. Live model sessions and all old
 versions are not certified. See the official [Codex hooks](https://learn.chatgpt.com/docs/hooks)
 and [Claude hooks](https://code.claude.com/docs/en/hooks) contracts.
 
-## Agent workflows
+## Session-driven agent workflows
 
-RL owns agent profiles, workflow execution, review policies, and saved run state.
-The built-in `triple-review` preset runs three independent, read-only roles:
-behavior/security, reuse/complexity, and implementation quality. Each role can
-use Codex or Claude; its model defaults to that CLI's configured model unless
-you set one explicitly. Your existing interactive agent and session commands
-continue to work alongside these review workflows.
+Your current Codex or Claude session owns its native subagents. RL supplies
+reusable roles, workflow dependencies, trigger rules, policies and durable run
+records. RL never launches a provider CLI, model API or check process for a
+workflow. The parent session claims ready steps, creates native children and
+reports their evidence; it runs configured checks itself.
 
 ```sh
-rl workflow init                    # create editable configuration in this workspace
-rl workflow init --provider claude  # alternative: initialize every role with Claude
+rl workflow init                     # configure this adopted workspace and refresh hooks
+rl agent add auth --instructions auth-review.md --description "Authentication reviewer"
 rl agent list
-rl agent show behavior
-rl policy show review
-rl workflow show triple-review
-rl workflow run --base origin/test --dry-run
-rl workflow run --base origin/test --prompt "Check the leave replacement feature"
-rl workflow status                  # latest run in this workspace
-rl status --workspace               # includes a compact summary of the latest workflow
+rl agent show auth
+rl workflow add auth-review --file auth-workflow.json
+rl workflow set auth-review --file auth-workflow.json
+rl workflow context --json            # discover definitions and trigger rules
+rl workflow status                    # latest saved run
 rl workflow metrics
-rl workflow pause                   # request a pause from another terminal
-rl workflow cancel
-rl workflow resume                  # continue unfinished steps using the saved configuration
-rl workflow score --policy review   # apply current policy to saved findings; no agent calls
+rl policy show review
 ```
 
-All commands operate on the current adopted RL workspace. Run IDs may be passed
-after `status`, `metrics`, `pause`, `cancel`, `resume`, and `score`; `latest` or
-omitting the ID selects the most recently created run. `--json` is available for
-scripts. Inspection and dry runs never start agents. A real run uses your existing
-CLI authentication and can consume model usage. Review workers are ephemeral;
-their conversations do not replace your saved interactive sessions or become
-the target of `rl resume --latest`. RL does not change global agent
-settings, bypass approval or sandbox controls, or install dependencies.
-
-Configuration is deliberately split into three versioned files:
+Configuration stays in this worktree:
 
 | File | Owns |
 | --- | --- |
-| `.rl/agents.json` | Named profiles: `provider`, `description`, `instructions`, optional `model` and `reasoning` |
-| `.rl/agent-workflows.json` | Named workflows: steps, dependencies, concurrency, reviewer retries, stage timeouts, and selected policy |
-| `.rl/policies.json` | Shared review criteria, severity deduction weights, minimum passing score, and required-fix gating |
+| `.rl/agents.json` | Roles: description, instructions, optional model/reasoning and `access` preferences; provider defaults to `inherit` |
+| `.rl/agent-workflows.json` | Trigger rules, ordered/parallel steps, concurrency, retry budget, report deadlines and selected policy |
+| `.rl/policies.json` | Criteria, severity deduction weights and acceptance requirements |
 
-Each file has `"version": 1` and an `agents`, `workflows`, or `policies` object
-keyed by name. Edit these project files to configure agents and add workflows or
-policies. Missing files use the built-in defaults; `init` refuses to overwrite
-existing configuration. Configuration is read from this worktree, not a sibling
-checkout. Agent profiles contain no score formula: agents receive the policy's
-shared criteria and return structured findings, evidence, confidence and coverage
-limitations. RL calculates the score and readiness verdict.
+Each file has `"version": 1` and a named `agents`, `workflows` or `policies` map.
+`rl agent add/set <name> --file profile.json` also saves complete profiles.
+Missing files use preset definitions for discovery, but automatic trigger
+handling requires at least one explicit configuration file. Existing legacy
+provider preferences remain readable; they never authorize starting a separate
+Codex/Claude process. Native model and reasoning options are applied by the
+parent where supported; unavailable settings must be reported explicitly.
 
-For example, a workflow can run one shared check, then two reviewers in parallel:
+Session-start hooks detect configuration and teach the parent the protocol.
+Prompt hooks refresh it after configuration changes, including after compaction.
+Tool hooks deliver matching requests as the parent works. Before-edit/tool rules
+deny the pending tool until their request completes or is explicitly dismissed
+(or the user cancels its run), so the parent can delegate before retrying.
+Workflow coordination tools are excluded from this gate. The preset queues
+`triple-review` before finishing changed work: behavior/security, reuse/complexity
+and implementation-quality roles, all read-only. Child hooks do not recursively
+queue workflows. Normal session resume and task checkpoints remain independent.
+
+For example, save the following as `auth-workflow.json`, then add it using the
+command above:
 
 ```json
 {
-  "description": "Check once, then review",
+  "description": "Review authentication changes before finishing",
   "policy": "review",
   "concurrency": 2,
   "retries": 1,
   "timeoutSeconds": 600,
+  "triggers": [
+    { "event": "before_edit", "tools": ["Edit", "apply_patch"], "paths": ["src/auth/**"] },
+    { "event": "before_finish", "changes": true },
+    { "event": "task_planned" }
+  ],
   "steps": [
     { "id": "types", "command": ["pnpm", "tsc", "--noEmit"], "after": [] },
-    { "id": "behavior", "agent": "behavior", "after": ["types"] },
+    { "id": "auth", "agent": "auth", "after": ["types"] },
     { "id": "quality", "agent": "quality", "after": ["types"] }
   ]
 }
 ```
 
-Add that object under a name in the `workflows` map, then run
-`rl workflow run <name>`. Steps with no dependencies can run concurrently;
-`after` lists the steps that must complete first. Commands are explicit argv
-arrays, run without a shell, and execute once per run unless explicitly resumed
-after failure. Configure only checks you intend RL to execute. A failed check
-blocks its dependents. Reviewer failures retry according to `retries` (default
-one); invalid output and provider errors cannot silently become clean reviews.
-Reviewers can request configured check IDs. An unconfigured or failed requested
-check makes the verdict incomplete.
+Automatic events are `session_start`, `prompt`, `before_edit`, `after_edit`,
+`before_tool`, `after_tool`, and `before_finish`. Edit events recognize
+Edit/Write/MultiEdit/apply_patch; other tools, including shell commands, use the
+tool events. `tools` matches exact hook tool names; `paths` matches workspace
+relative file paths with `*` (one path segment) and `**` (across segments).
+Path filtering uses structured edit paths/patch headers, not guesses about shell
+commands. `changes: true` requires changes in the locally available comparison
+scope. Semantic events such as `task_planned` are explicitly reported by the
+parent, since RL cannot observe private reasoning. All conditions on a rule
+must match; multiple rules are alternatives.
 
-Independent reviewers receive no peer reports. An explicit agent dependency
-passes only its declared predecessors' results. After the initial passes, routed
-leads receive one focused follow-up by their owning step; follow-ups never get
-the source reviewer's full report. Remaining routing leads are coverage gaps.
+Matching events queue requests for that parent conversation only. Identical
+scope/configuration events are deduplicated; newer changes coalesce into an
+unclaimed request. Before-finish hooks can continue the turn once with the
+request, and guard against repeated Stop-hook loops. They cannot force a client
+to offer or use native delegation. If unavailable or disallowed by current
+instructions, the session must dismiss the request with its concrete reason
+and report that limitation. Current permissions and workspace boundaries apply
+to every child. Read-only roles receive instructions to remain read-only; host
+permissions are enforced by the host, not by RL.
 
-The review scope includes committed branch changes from the merge-base, staged
-and unstaged changes, and non-ignored untracked files. The base uses local refs
-without fetching; specify `--base` or use the repository's configured default.
-Scope snapshots are limited to 4 MiB. RL checks scope fingerprints before and
-after steps, and rejects resuming results against changed code. No changes means
-no agents are launched and no score is assigned.
+The MCP server (`rl agent mcp`) exposes:
 
-The default policy starts at 100 and deducts 50/20/10/2 for critical/high/medium/low
-findings, flooring at zero. Exact file/line/root-cause matches are deduplicated
-conservatively, retaining the strongest severity and required-fix designation.
-Any required fix blocks readiness by default; material coverage gaps, failed
-steps and interrupted runs remain incomplete regardless of score. Evidence paths
-and result contracts are validated; inferred findings still require human
-judgment. Changing a policy and running `score` evaluates the recorded findings,
-not newly changed code. It does not rerun reviewers or rewrite agent profiles.
-Each assessment records its policy and result; the original run configuration
-and earlier assessments remain available for comparison.
+1. `rl_workflow_context`: discover roles, workflows, triggers and policies.
+2. `rl_workflow_pending`: read this parent session's queued requests.
+3. `rl_workflow_event`: report an explicit milestone and match trigger rules.
+4. `rl_workflow_start`: create a session-owned run, optionally from a request ID.
+5. `rl_workflow_claim`: atomically claim one ready stage and receive its prompt,
+   dependencies, scope path, output schema and native settings.
+6. `rl_workflow_report`: submit the claim token and child findings, an actual
+   check result, or a failure. RL validates the report and calculates the score.
+7. `rl_workflow_dismiss`: decline a queued request with a recorded reason.
 
-Runs, configuration snapshots, scope, outputs and measured stage durations live
-under the current instance's `workflow-runs/<UUID>/` state directory. Pause and
-cancel requests terminate only child processes owned by that runner; Ctrl-C
-pauses the run. Resume retains completed stages and reruns unfinished ones.
-Only one runner may own a given run. After an unclean process exit, its lock may
-take up to ten seconds to become stale before resume is available. Token/cost
-metrics use provider-reported values; unavailable or incomplete totals are
-`null`, including totals where failed/retried attempts weren't fully reported.
+Supply `agent` and the parent conversation's full `sessionId`; Codex may infer
+its ID from the environment, while Claude supplies its UUID explicitly. Observed
+Codex `thr_` IDs also coordinate workflows, but never enter UUID-based resumable
+session history. These are
+coordination identities within the local workspace, not an authentication
+boundary against a process that already has access to its state files.
+CLI equivalents are available when the session has no MCP connection:
 
-The backend contracts follow the official
-[Codex non-interactive documentation](https://learn.chatgpt.com/docs/non-interactive-mode)
-and [Claude programmatic CLI documentation](https://code.claude.com/docs/en/headless).
-These workflow profiles currently produce structured, read-only reviews;
-interactive implementation remains available through `rl agent start`.
+```sh
+rl workflow pending --agent claude --session <UUID>
+rl workflow run --request <request-UUID> --agent claude --session <UUID>
+rl workflow event --file event.json --agent claude --session <UUID>
+rl workflow run auth-review --base origin/test --agent claude --session <UUID>
+rl workflow claim <run> --agent claude --session <UUID>
+rl workflow report <run> --file report.json --agent claude --session <UUID>
+```
+
+An event file contains `{ "event": "task_planned" }`; report files contain
+`step`, `claim`, and `result` (the returned schema), or `check` with actual
+`stdout`, `stderr`, `exitCode`, or `error`. Reports may include `childId` and
+parent-reported token/cost usage. Commands and reports return data for the parent;
+`workflow run` prepares work and returns without spawning agents. `--dry-run`
+previews scope without creating a run.
+
+Dependencies and concurrency are enforced when stages are claimed. Explicit
+predecessor results are supplied to dependent agents; independent roles receive
+no peer reports. A failed check blocks dependents. Reported agent failures may
+be retried within the configured budget. Routing leads receive one focused
+follow-up by their owning role. Further leads remain coverage limitations.
+
+Review scope includes committed branch changes from the merge-base, staged,
+unstaged and non-ignored untracked changes, capped at 4 MiB. The selected base
+uses local refs, without fetching; event detection uses HEAD if the saved base
+is not locally resolvable. RL checks fingerprints before claims and reports.
+Unexpected changed scope requires a new run. Roles default to read-only. A profile with `"access": "workspace-write"` may
+implement its assigned changes within the host's existing permissions. Writing
+stages run exclusively. RL refreshes scope after the writer reports, so later
+reviewers inspect its changes. Earlier checks/reviews remain historical; they
+cannot justify readiness for changed code unless refreshed after writing. Place
+final validation after the writer in the workflow. Unexpected edits during a
+read-only stage still invalidate its result.
+
+Policies remain separate. The default deducts 50/20/10/2 for
+critical/high/medium/low findings, deduplicates exact file/line/root-cause matches,
+and blocks readiness on required fixes or coverage gaps. Agents return evidence
+without assigning scores. `rl workflow score --policy review` rescores recorded
+findings and preserves assessment history without agent calls.
+
+`workflow pause` stops new claims but accepts reports from already claimed
+children. The parent owns child cancellation and must stop its native agents.
+After existing children have reported, that parent can `workflow resume` using
+the saved configuration. Cancellation rejects further results and requires a
+new run. Neither command sends process signals. Runs retain their parent UUID,
+claim tokens, native child IDs, evidence, scope and policy assessments under the
+current instance's `workflow-runs/` directory. RL measures claim-to-report elapsed
+time; token/cost usage is parent-reported and missing totals remain unknown.
+
+After upgrading existing workspaces, run `rl doctor --repair` to add tool hooks,
+and restart/review hooks as required by your host. Native hook integration follows
+the [Codex hooks](https://learn.chatgpt.com/docs/hooks) and
+[Claude hooks](https://code.claude.com/docs/en/hooks) contracts. Automated tests
+exercise hook payloads and MCP/CLI coordination; they do not certify live model
+compliance or native delegation availability in every client.
 
 ## Let agents use notes through MCP
 
 `rl agent mcp` serves workspace-scoped tools over stdio: `rl_status`, `rl_context`,
 `rl_progress`, `rl_context_append`, `rl_progress_append`, `rl_session_save`,
-and `rl_task_pause`.
+`rl_task_pause`, and the seven `rl_workflow_*` coordination tools described above.
 `rl_task_pause` accepts the handoff JSON described above and atomically saves
 the session and task checkpoint. `rl_status` includes task state and handoff history.
 `rl_status` automatically discovers Codex sessions for this workspace.
@@ -569,16 +619,16 @@ with separate sessions. Back up state alongside your work.
 ## Multiple repositories and settings
 
 ```sh
-rl repo add /path/to/rosterlab-frontend --base origin/test
-rl repo add /path/to/romeo --base origin/test
+rl repo add /path/to/frontend --base origin/test
+rl repo add /path/to/backend --base origin/test
 # Or run `rl repo add .` inside each repository.
-rl checkout rosterlab-frontend
+rl checkout frontend
 rl                            # pick a frontend workspace
-rl checkout romeo
+rl checkout backend
 rl checkout                   # pick a repository
 rl repo list
-rl repo use romeo              # default when outside registered repositories
-rl --repo romeo list           # inspect another repo without switching
+rl repo use backend            # default when outside registered repositories
+rl --repo backend list         # inspect another repo without switching
 ```
 
 Registration uses the repository name from `origin`, or the main checkout folder
@@ -599,6 +649,9 @@ Repositories are registered explicitly; RL does not scan siblings. Command selec
 uses `--repo`, then `RL_REPO`, the current registered worktree, and the registry
 default. An explicit `RL_REPO` override still applies after changing directories.
 Removing a repository registration retains all worktrees and state.
+Without registered repositories or an explicit `RL_REPO_ROOT`, RL detects the
+main checkout of the current Git repository, including from linked worktrees
+and subdirectories.
 
 | Environment setting | Default |
 | --- | --- |

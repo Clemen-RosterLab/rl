@@ -21,11 +21,7 @@ const topics: Record<string, Topic> = {
       "Enters its main checkout. Bare rl then selects a workspace in that repository.",
       "Shell integration changes your directory; the standalone executable prints the path.",
     ],
-    examples: [
-      "rl checkout",
-      "rl checkout rosterlab-frontend",
-      "rl checkout romeo",
-    ],
+    examples: ["rl checkout", "rl checkout frontend", "rl checkout backend"],
     related: ["repo add", "switch"],
   },
   switch: {
@@ -133,7 +129,7 @@ const topics: Record<string, Topic> = {
   },
   agent: {
     group: "Agents and tasks",
-    description: "Launch agents and manage profiles and sessions",
+    description: "Configure native agent roles and saved sessions",
     usage: "rl agent <command>",
     related: ["resume", "workflow", "policy"],
   },
@@ -154,6 +150,18 @@ const topics: Record<string, Topic> = {
   "agent list": {
     description: "List workflow agent profiles",
     usage: "rl agent list [--json]",
+  },
+  "agent add": {
+    description: "Add a role for your session's native subagents",
+    usage:
+      "rl agent add <name> --instructions <file|-> [--description <text>] [--model <name>] [--reasoning <level>]",
+    notes: [
+      "Alternatively use --file <profile.json|->. Profiles never launch another provider; the current session supplies native subagents.",
+    ],
+  },
+  "agent set": {
+    description: "Save an agent profile",
+    usage: "rl agent set <name> --file <profile.json|->",
   },
   "agent show": {
     description: "Inspect a workflow agent profile",
@@ -188,7 +196,7 @@ const topics: Record<string, Topic> = {
   },
   workflow: {
     group: "Agents and tasks",
-    description: "Run and control agent workflows",
+    description: "Define and track session-driven agent workflows",
     usage: "rl workflow <command>",
     notes: [
       "Run controls apply only to this adopted workspace.",
@@ -198,10 +206,11 @@ const topics: Record<string, Topic> = {
   },
   "workflow init": {
     description: "Create editable profiles, policies and workflows",
-    usage: "rl workflow init [--provider codex|claude] [--json]",
+    usage: "rl workflow init [--provider inherit|codex|claude] [--json]",
     notes: [
       "Creates .rl/agents.json, .rl/policies.json and .rl/agent-workflows.json.",
       "Existing configuration is never overwritten.",
+      "Roles inherit the current session by default. The preset queues a review before finishing changed work.",
     ],
   },
   "workflow list": {
@@ -213,19 +222,58 @@ const topics: Record<string, Topic> = {
     usage: "rl workflow show <name> [--json]",
   },
   "workflow run": {
-    description: "Run a configured agent workflow",
+    description: "Prepare a workflow for this session's native agents",
     usage: "rl workflow run [name] [options]",
     options: [
       "--base <ref>     Local comparison ref (default: repository setting)",
       "--prompt <text>  Feature intent for the reviewers",
       "--dry-run        Preview scope and steps without launching agents",
       "--json           Print structured results",
+      "--agent codex|claude  Parent session provider",
+      "--session <UUID>     Parent conversation (inferred inside Codex)",
+      "--request <UUID>     Start a queued workflow request instead of choosing a name",
     ],
     notes: [
-      "Default workflow: triple-review. Uses your existing CLI authentication.",
-      "Review criteria and scores come from the selected policy; metrics are measured by RL.",
+      "Default workflow: triple-review. RL never launches workflow agent or check processes.",
+      "The parent claims ready steps, spawns native subagents and reports evidence. RL applies the policy; provider usage is parent-reported.",
     ],
     examples: ["rl workflow run --base origin/test --dry-run"],
+  },
+  "workflow add": {
+    description: "Add a workflow with dependencies and spawn triggers",
+    usage: "rl workflow add <name> --file <workflow.json|->",
+  },
+  "workflow set": {
+    description: "Save a workflow definition and trigger rules",
+    usage: "rl workflow set <name> --file <workflow.json|->",
+  },
+  "workflow context": {
+    description: "Discover profiles, policies, workflows and trigger rules",
+    usage: "rl workflow context [--json]",
+  },
+  "workflow pending": {
+    description: "Read queued workflows for the parent session",
+    usage: "rl workflow pending [--agent codex|claude] [--session <UUID>]",
+  },
+  "workflow event": {
+    description: "Report a milestone and match workflow triggers",
+    usage:
+      "rl workflow event --file <event.json|-> [--agent codex|claude] [--session <UUID>]",
+  },
+  "workflow claim": {
+    description: "Claim a ready step for a native subagent",
+    usage:
+      "rl workflow claim <run> [--step <name>] [--agent codex|claude] [--session <UUID>]",
+  },
+  "workflow report": {
+    description: "Submit a claimed native agent's evidence or a check result",
+    usage:
+      "rl workflow report <run> --file <report.json|-> [--agent codex|claude] [--session <UUID>]",
+  },
+  "workflow dismiss": {
+    description: "Dismiss an unavailable workflow with a reason",
+    usage:
+      "rl workflow dismiss --file <dismissal.json|-> [--agent codex|claude] [--session <UUID>]",
   },
   "workflow status": {
     description: "Inspect a saved run",
@@ -238,7 +286,9 @@ const topics: Record<string, Topic> = {
   "workflow pause": {
     description: "Pause a workflow run",
     usage: "rl workflow pause [UUID|latest] [--json]",
-    notes: ["Pauses worker processes; completed stages remain saved."],
+    notes: [
+      "Stops new step claims. The parent session owns and stops native child processes; existing claims may still report while paused.",
+    ],
   },
   "workflow cancel": {
     description: "Cancel a workflow run",
@@ -246,7 +296,8 @@ const topics: Record<string, Topic> = {
   },
   "workflow resume": {
     description: "Continue unfinished workflow stages",
-    usage: "rl workflow resume [UUID|latest] [--json]",
+    usage:
+      "rl workflow resume [UUID|latest] [--agent codex|claude] [--session <UUID>] [--json]",
     notes: [
       "Uses the saved configuration. Changed review scope requires a new run.",
     ],

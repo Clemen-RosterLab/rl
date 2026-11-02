@@ -27,6 +27,32 @@ function fixture(t: TestContext) {
       JSON.parse(w.rl(["status", "--all", "--json", ...extra], { ok }).stdout),
   };
 }
+test("unconfigured repository detection finds the main checkout from subdirectories and linked worktrees", (t) => {
+  const w = new Workspace(t);
+  delete w.env.RL_REPO_ROOT;
+  delete w.env.RL_REPO_NAME;
+  for (const root of [w.repo, w.a]) {
+    const nested = path.join(root, "nested directory");
+    fs.mkdirSync(nested);
+    assert.equal(w.rl(["path", "@"], { cwd: nested }).stdout.trim(), w.repo);
+  }
+  assert.equal(w.status().repository, w.repo);
+  w.rl(["repo", "add", "."], { cwd: path.join(w.a, "nested directory") });
+  const data = JSON.parse(w.rl(["repo", "list", "--json"]).stdout);
+  assert.equal(data.repositories.repo.root, w.repo);
+  assert.equal(data.repositories.repo.worktreeName, "repo");
+});
+test("registered repositories still resolve outside Git without a configured legacy root", (t) => {
+  const { w, other } = fixture(t);
+  delete w.env.RL_REPO_ROOT;
+  delete w.env.RL_REPO_NAME;
+  w.rl(["repo", "use", "beta"]);
+  assert.equal(w.rl(["path", "@"]).stdout.trim(), other);
+  assert.equal(w.rl(["--repo", "alpha", "path", "@"]).stdout.trim(), w.repo);
+  // An inherited Git override must not redirect automatic checkout detection.
+  w.env.GIT_DIR = path.join(other, ".git");
+  assert.equal(w.rl(["path", "@"], { cwd: w.a }).stdout.trim(), w.repo);
+});
 test("repository routing isolates identical branches and prioritizes current checkout over default", (t) => {
   const { w, other } = fixture(t);
   for (const name of ["alpha", "beta"])

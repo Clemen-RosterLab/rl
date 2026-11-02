@@ -1,3 +1,4 @@
+import { automationContext } from "./session-workflows.js";
 import { adapters } from "./agent-registry.js";
 import { Agent } from "./agents.js";
 import { Tracking, validateTracking } from "./activity.js";
@@ -505,6 +506,8 @@ export function contextText(file: string, data: Instance): string {
   sections.push(
     "When the user asks to pause or save this task for later, save a task handoff with rl_task_pause through MCP, or 'rl pause --summary <text> --changes <text> --validation <text> --next <text> [--blockers <text>]'. Include the current session UUID (Codex shell commands can infer it), concrete changes, checks actually run and their results, remaining work, and blockers. Use 'Not run' for unperformed checks. A pause saves task state; it does not terminate the agent. The user can return with 'rl continue'.",
   );
+  const automation = automationContext(data.worktree);
+  if (automation) sections.push(automation);
   const latest = data.task?.handoffs.at(-1);
   if (latest)
     sections.push(

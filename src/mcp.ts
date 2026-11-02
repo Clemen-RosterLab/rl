@@ -8,6 +8,11 @@ import { currentSessionId } from "./session.js";
 import { syncCodexSessions } from "./codex-sessions.js";
 import { pauseTask, PAUSE_FIELDS } from "./task.js";
 import { HANDOFF_FIELDS, MAX_HANDOFF_TEXT } from "./task-state.js";
+import {
+  automationContext,
+  callWorkflowTool,
+  WORKFLOW_TOOLS,
+} from "./session-workflows.js";
 
 import {
   isJsonObject,
@@ -221,72 +226,106 @@ export async function serveMcp(store: Store): Promise<number> {
           protocolVersion: PROTOCOL_VERSION,
           capabilities: { tools: {} },
           serverInfo: { name: "rl", version },
+          instructions:
+            automationContext(store.current()[1].worktree) ||
+            "Use RL tools for the current workspace's shared context and sessions.",
         };
       } else if (raw.method === "ping") result = {};
       else {
         if (!ready) throw new Error("Initialize before using tools");
         if (raw.method === "tools/list") {
           result = {
-            tools: TOOLS.map((tool): JsonObject => ({
-              name: tool.name,
-              description: tool.description,
-              inputSchema: {
-                type: "object",
-                properties:
-                  tool.name === "rl_task_pause"
-                    ? {
-                        ...Object.fromEntries(
-                          HANDOFF_FIELDS.map((field) => [
-                            field,
-                            {
-                              type: "string",
-                              maxLength: MAX_HANDOFF_TEXT,
-                              ...(field === "blockers" ? {} : { minLength: 1 }),
-                            },
-                          ]),
-                        ),
-                        agent: { type: "string", enum: ["codex", "claude"] },
-                        sessionId: {
-                          type: "string",
-                          description: "Full UUID of the current conversation.",
-                        },
-                      }
-                    : tool.name === "rl_session_save"
+            tools: [
+              ...TOOLS.map((tool): JsonObject => ({
+                name: tool.name,
+                description: tool.description,
+                inputSchema: {
+                  type: "object",
+                  properties:
+                    tool.name === "rl_task_pause"
                       ? {
+                          ...Object.fromEntries(
+                            HANDOFF_FIELDS.map((field) => [
+                              field,
+                              {
+                                type: "string",
+                                maxLength: MAX_HANDOFF_TEXT,
+                                ...(field === "blockers"
+                                  ? {}
+                                  : { minLength: 1 }),
+                              },
+                            ]),
+                          ),
                           agent: { type: "string", enum: ["codex", "claude"] },
                           sessionId: {
                             type: "string",
                             description:
-                              "Full session UUID; never a name or prefix.",
+                              "Full UUID of the current conversation.",
                           },
                         }
-                      : tool.append
+                      : tool.name === "rl_session_save"
                         ? {
-                            text: {
+                            agent: {
                               type: "string",
-                              minLength: 1,
-                              maxLength: MAX_NOTE_LENGTH,
+                              enum: ["codex", "claude"],
+                            },
+                            sessionId: {
+                              type: "string",
+                              description:
+                                "Full session UUID; never a name or prefix.",
                             },
                           }
-                        : {},
-                required:
-                  tool.name === "rl_task_pause"
-                    ? ["summary", "changes", "validation", "next"]
-                    : tool.append
-                      ? ["text"]
-                      : [],
-                additionalProperties: false,
-              },
-              annotations: {
-                readOnlyHint:
-                  !tool.append &&
-                  tool.name !== "rl_session_save" &&
-                  tool.name !== "rl_status" &&
-                  tool.name !== "rl_task_pause",
-                destructiveHint: false,
-                openWorldHint: false,
-              },
-            })),
+                        : tool.append
+                          ? {
+                              text: {
+                                type: "string",
+                                minLength: 1,
+                                maxLength: MAX_NOTE_LENGTH,
+                              },
+                            }
+                          : {},
+                  required:
+                    tool.name === "rl_task_pause"
+                      ? ["summary", "changes", "validation", "next"]
+                      : tool.append
+                        ? ["text"]
+                        : [],
+                  additionalProperties: false,
+                },
+                annotations: {
+                  readOnlyHint:
+                    !tool.append &&
+                    tool.name !== "rl_session_save" &&
+                    tool.name !== "rl_status" &&
+                    tool.name !== "rl_task_pause",
+                  destructiveHint: false,
+                  openWorldHint: false,
+                },
+              })),
+              ...WORKFLOW_TOOLS.map((tool) => ({
+                name: tool.name,
+                description: tool.description,
+                inputSchema: {
+                  type: "object",
+                  properties: {
+                    agent: { type: "string", enum: ["codex", "claude"] },
+                    sessionId: {
+                      type: "string",
+                      description:
+                        "Current parent conversation ID. Claude requires a UUID; Codex also accepts observed thr_ IDs and may inherit it.",
+                    },
+                    ...tool.properties,
+                  },
+                  required: tool.required,
+                  additionalProperties: false,
+                },
+                annotations: {
+                  readOnlyHint: tool.readOnly,
+                  destructiveHint: false,
+                  openWorldHint: false,
+                },
+              })),
+            ],
           };
         } else if (raw.method === "tools/call") {
           if (
@@ -295,9 +334,21 @@ export async function serveMcp(store: Store): Promise<number> {
           )
             throw new Error("Invalid tool call");
           const tool = TOOLS.find((item) => item.name === params.name);
-          if (!tool) throw new Error(`Unknown tool: ${params.name}`);
+          const workflowTool = WORKFLOW_TOOLS.find(
+            (item) => item.name === params.name,
+          );
+          if (!tool && !workflowTool)
+            throw new Error(`Unknown tool: ${params.name}`);
           try {
-            const text = await callTool(store, tool, params.arguments ?? {});
+            const text = workflowTool
+              ? JSON.stringify(
+                  await callWorkflowTool(
+                    store,
+                    workflowTool.name,
+                    params.arguments ?? {},
+                  ),
+                )
+              : await callTool(store, tool!, params.arguments ?? {});
             result = { content: [{ type: "text", text }] };
           } catch (error) {
             result = {

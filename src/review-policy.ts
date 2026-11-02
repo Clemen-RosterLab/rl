@@ -28,7 +28,7 @@ export interface ReviewResult {
 const string = { type: "string" };
 const findingProperties = {
   title: string,
-  severity: { type: "string", enum: SEVERITIES },
+  severity: { type: "string", enum: [...SEVERITIES] },
   required: { type: "boolean" },
   rootCause: string,
   file: string,

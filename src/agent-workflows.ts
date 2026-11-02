@@ -1,4 +1,5 @@
 import path from "node:path";
+import fs from "node:fs";
 import { stripVTControlCharacters } from "node:util";
 import { args, arity, json } from "./common.js";
 import { commandContext, contextOptions } from "./command-context.js";
@@ -6,17 +7,18 @@ import {
   CONFIG_FILES,
   initAutomation,
   readAutomation,
+  setAutomation,
 } from "./automation-config.js";
 import {
   controlRun,
-  createRun,
-  executeRun,
   planRun,
   readRun,
   rescoreRun,
   runMetrics,
   type WorkflowRun,
 } from "./agent-runner.js";
+import { callWorkflowTool, resumeNativeRun } from "./session-workflows.js";
+import { parseJsonObject } from "./json.js";
 
 const visible = (value: unknown) =>
   stripVTControlCharacters(String(value ?? "")).replace(
@@ -56,7 +58,22 @@ function report(run: WorkflowRun, asJson: boolean) {
 export async function main(argv: string[]): Promise<number> {
   const { values, positionals } = args(
     argv,
-    [...contextOptions, "base", "prompt", "provider", "policy"],
+    [
+      ...contextOptions,
+      "base",
+      "prompt",
+      "provider",
+      "policy",
+      "file",
+      "instructions",
+      "description",
+      "model",
+      "reasoning",
+      "agent",
+      "session",
+      "step",
+      "request",
+    ],
     ["json", "dry-run"],
   );
   const context = commandContext(values);
@@ -64,8 +81,28 @@ export async function main(argv: string[]): Promise<number> {
   arity(rest, 0, 1);
   const [, data] = context.store.current();
   const asJson = !!values.json;
+  if (values.file && values.instructions)
+    throw new Error("Choose --file or --instructions, not both");
+  if (
+    (values.description || values.model || values.reasoning) &&
+    !(
+      namespace === "agent" &&
+      ["add", "set"].includes(action) &&
+      values.instructions
+    )
+  )
+    throw new Error(
+      "--description, --model and --reasoning require agent add/set --instructions",
+    );
   if (values.provider && !(namespace === "workflow" && action === "init"))
     throw new Error("--provider is only supported by workflow init");
+  if (
+    values.request &&
+    !(namespace === "workflow" && action === "run" && !values["dry-run"])
+  )
+    throw new Error(
+      "--request is only supported by workflow run without --dry-run",
+    );
   if (
     (values.base || values.prompt || values["dry-run"]) &&
     !(namespace === "workflow" && action === "run")
@@ -77,10 +114,11 @@ export async function main(argv: string[]): Promise<number> {
     throw new Error("--policy is only supported by workflow score");
   if (namespace === "workflow" && action === "init") {
     arity(rest, 0);
-    const provider = values.provider ?? "codex";
-    if (provider !== "codex" && provider !== "claude")
-      throw new Error("Provider must be codex or claude");
+    const provider = values.provider ?? "inherit";
+    if (provider !== "inherit" && provider !== "codex" && provider !== "claude")
+      throw new Error("Provider must be inherit, codex or claude");
     await context.store.locked(() => initAutomation(data.worktree, provider));
+    await context.store.adopt(data.worktree);
     const paths = Object.values(CONFIG_FILES).map((file) =>
       path.join(data.worktree, file),
     );
@@ -89,6 +127,73 @@ export async function main(argv: string[]): Promise<number> {
       console.log(
         `Created separate agent, policy and workflow configurations:\n${paths.map((file) => "  " + visible(file)).join("\n")}`,
       );
+    return 0;
+  }
+  const loadInput = () => {
+    if (typeof values.file !== "string")
+      throw new Error("Missing --file <json|->");
+    return parseJsonObject(
+      fs.readFileSync(values.file === "-" ? 0 : values.file, "utf8"),
+    );
+  };
+  if (
+    (namespace === "agent" || namespace === "workflow") &&
+    ["add", "set"].includes(action)
+  ) {
+    arity(rest, 1);
+    const value =
+      namespace === "agent" && values.instructions !== undefined
+        ? {
+            provider: "inherit",
+            description: String(values.description ?? rest[0]),
+            instructions: fs.readFileSync(
+              values.instructions === "-" ? 0 : String(values.instructions),
+              "utf8",
+            ),
+            ...(values.model ? { model: values.model } : {}),
+            ...(values.reasoning ? { reasoning: values.reasoning } : {}),
+          }
+        : loadInput();
+    await context.store.locked(() =>
+      setAutomation(
+        data.worktree,
+        namespace === "agent" ? "agents" : "workflows",
+        rest[0],
+        value,
+        action === "add",
+      ),
+    );
+    await context.store.adopt(data.worktree);
+    if (asJson) json(value);
+    else console.log(`${namespace} ${action}: ${visible(rest[0])}`);
+    return 0;
+  }
+  const parent = {
+    ...(values.agent ? { agent: values.agent } : {}),
+    ...(values.session ? { sessionId: values.session } : {}),
+  };
+  if (
+    namespace === "workflow" &&
+    ["context", "pending", "event", "claim", "report", "dismiss"].includes(
+      action,
+    )
+  ) {
+    const input =
+      action === "report" || action === "dismiss" || action === "event"
+        ? loadInput()
+        : {};
+    const result = await callWorkflowTool(
+      context.store,
+      `rl_workflow_${action}`,
+      {
+        ...input,
+        ...parent,
+        ...(rest[0] ? { run: rest[0] } : {}),
+        ...(values.step ? { step: values.step } : {}),
+      },
+    );
+    if (asJson || action !== "context") json(result);
+    else console.log((result as { instructions: string }).instructions);
     return 0;
   }
   const configuration = () => readAutomation(data.worktree);
@@ -145,34 +250,29 @@ export async function main(argv: string[]): Promise<number> {
         );
         for (const step of plan.definition.steps)
           console.log(
-            `  ${step.id}: ${step.agent ? `${step.agent} (${config.agents[step.agent].provider})` : JSON.stringify(step.command)} · after ${step.after.join(", ") || "start"}`,
+            `  ${step.id}: ${step.agent ? `${step.agent} (${config.agents[step.agent].provider ?? "inherit"})` : JSON.stringify(step.command)} · after ${step.after.join(", ") || "start"}`,
           );
       }
       return 0;
     }
-    const created = await createRun(
-      context.store,
-      config,
-      workflow,
-      base,
-      String(values.prompt ?? ""),
-    );
-    if (!asJson) console.error(`Starting ${workflow} · ${created.run.id}`);
-    const run = await executeRun(context.store, created.run.id, (text) =>
-      console.error(text),
-    );
+    const run = (await callWorkflowTool(context.store, "rl_workflow_start", {
+      ...parent,
+      ...(name || !values.request ? { workflow } : {}),
+      ...(values.base || !values.request ? { base } : {}),
+      ...(values.request ? { requestId: values.request } : {}),
+      ...(values.prompt ? { prompt: values.prompt } : {}),
+    })) as WorkflowRun;
     report(run, asJson);
-    return run.scope.files.length && run.evaluation?.verdict !== "ready"
-      ? 1
-      : 0;
+    if (!asJson)
+      console.log(
+        "Prepared for this session's native subagents. Claim ready steps with rl_workflow_claim or rl workflow claim; RL has not started any agent processes.",
+      );
+    return 0;
   }
   if (action === "resume") {
-    const { run: saved } = readRun(context.store, name);
-    const run = await executeRun(context.store, saved.id, (text) =>
-      console.error(text),
-    );
+    const run = await resumeNativeRun(context.store, name, parent);
     report(run, asJson);
-    return run.evaluation?.verdict === "ready" ? 0 : 1;
+    return 0;
   }
   if (action === "pause" || action === "cancel") {
     const run = await controlRun(context.store, name, action);

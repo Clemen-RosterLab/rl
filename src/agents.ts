@@ -12,7 +12,9 @@ export type EventType =
   | "child.stopped"
   | "turn.interrupted"
   | "turn.failed"
-  | "notification";
+  | "notification"
+  | "tool.before"
+  | "tool.after";
 export interface AgentEvent {
   type: EventType;
   nativeEvent: string;
@@ -36,6 +38,8 @@ export interface AgentAdapter {
 export const lifecycleEvents: Readonly<Record<string, EventType>> = {
   SessionStart: "session.started",
   UserPromptSubmit: "turn.started",
+  PreToolUse: "tool.before",
+  PostToolUse: "tool.after",
   Stop: "turn.stopped",
   SessionEnd: "session.ended",
   SubagentStart: "child.started",
@@ -95,6 +99,8 @@ export function contextResponse(
       "context.restored",
       "child.started",
       "turn.started",
+      "tool.before",
+      "tool.after",
     ].includes(event.type)
   )
     return {

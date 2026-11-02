@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import { observeWorkflowEvent } from "./session-workflows.js";
 import path from "node:path";
 import { createHash } from "node:crypto";
 import { agentAdapter } from "./agent-registry.js";
@@ -92,7 +93,98 @@ export async function handleHook(
       recordActivity(data, adapter.name, event, stamp, hash);
       if (used) store.touch(file, data, stamp);
       else store.save(file, data);
-      const response = adapter.response(event, context);
+      // Native workers never recursively schedule their own workflow. Tool hooks
+      // describe what happened; the parent remains responsible for delegation.
+      let queued: ReturnType<typeof observeWorkflowEvent> = [];
+      if (!event.childId && !payload.stop_hook_active) {
+        const tool =
+          typeof payload.tool_name === "string" ? payload.tool_name : undefined;
+        const input = object(payload.tool_input) ? payload.tool_input : {};
+        const coordination =
+          !!tool &&
+          (tool.includes("rl_workflow_") ||
+            (tool === "Bash" &&
+              [input.command, input.cmd].some(
+                (value) =>
+                  typeof value === "string" &&
+                  /^(?:command\s+)?rl\s+workflow\s+/.test(value.trim()),
+              )));
+        const paths: string[] = [];
+        const addPath = (value: unknown) => {
+          if (typeof value === "string") {
+            const relative = path.relative(
+              root,
+              path.resolve(event.cwd, value),
+            );
+            if (relative && relative !== ".." && !relative.startsWith("../"))
+              paths.push(relative);
+          }
+        };
+        for (const value of [input.file_path, input.path]) addPath(value);
+        const patch =
+          typeof input.patch === "string"
+            ? input.patch
+            : typeof input.input === "string"
+              ? input.input
+              : typeof payload.tool_input === "string"
+                ? payload.tool_input
+                : "";
+        for (const match of patch.matchAll(
+          /^\*\*\* (?:(?:Add|Update|Delete) File|Move to): (.+)$/gm,
+        ))
+          addPath(match[1]);
+        const edit =
+          !!tool &&
+          ["Edit", "Write", "MultiEdit", "apply_patch"].includes(tool);
+        const milestone =
+          event.type === "session.started"
+            ? "session_start"
+            : event.type === "turn.started"
+              ? "prompt"
+              : event.type === "turn.stopped"
+                ? "before_finish"
+                : event.type === "tool.before"
+                  ? edit
+                    ? "before_edit"
+                    : "before_tool"
+                  : event.type === "tool.after"
+                    ? edit
+                      ? "after_edit"
+                      : "after_tool"
+                    : undefined;
+        if (milestone && !coordination)
+          queued = observeWorkflowEvent(
+            store,
+            file,
+            data,
+            { agent: adapter.name, sessionId: event.sessionId },
+            milestone,
+            tool,
+            paths,
+          );
+      }
+      const notification = queued.length
+        ? `RL workflow requests for this parent session (${adapter.name}, sessionId ${event.sessionId}): ${JSON.stringify(queued)}. Use rl_workflow_start with requestId, then rl_workflow_claim, spawn your own native subagents, and rl_workflow_report their evidence. If native delegation is unavailable, dismiss the request with the reason and tell the user. Follow current instructions and workspace permissions.`
+        : undefined;
+      if (notification)
+        context = [context, notification].filter(Boolean).join("\n\n");
+      if (context && !event.childId)
+        context += `\nCurrent RL parent conversation: agent=${adapter.name}, sessionId=${event.sessionId}. Use this identity for workflow coordination tools.`;
+      if (event.childId && context)
+        context +=
+          "\nYou are a native child. Follow your assigned role; do not create workflows or spawn further agents.";
+      const response =
+        event.type === "tool.before" && notification
+          ? {
+              hookSpecificOutput: {
+                hookEventName: event.nativeEvent,
+                permissionDecision: "deny",
+                permissionDecisionReason: notification,
+              },
+            }
+          : event.type === "turn.stopped" && notification
+            ? { decision: "block", reason: notification }
+            : adapter.response(event, context);
       if (response !== undefined) json(response);
       return 0;
     } catch (error) {

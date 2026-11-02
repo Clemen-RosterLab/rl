@@ -151,6 +151,14 @@ export function statusText(
       "",
       `  ${paint("Workflow", 1)} · ${text(workflow.workflow)} · ${text(workflow.status)}`,
       row("Steps", `${workflow.completed}/${workflow.total} completed`),
+      ...(workflow.owner
+        ? [
+            row(
+              "Owner",
+              `${workflow.owner.agent} · native subagents · ${workflow.owner.sessionId}`,
+            ),
+          ]
+        : []),
       ...(workflow.verdict
         ? [
             row(

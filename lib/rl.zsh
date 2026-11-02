@@ -119,7 +119,21 @@ _rl_main() {
     print -u2 -r -- "Configuration not found: $config_file"
     return 1
   fi
-  local repo_root="${env_root:-${RL_REPO_ROOT:-$HOME/Documents/GitHub/rosterlab-frontend}}"
+  local repo_root="${env_root:-$RL_REPO_ROOT}"
+  if [[ -z "$repo_root" ]]; then
+    # Resolve only the current repository; the first NUL-delimited worktree
+    # record identifies its main checkout, including from a linked worktree.
+    local -a current_repository
+    current_repository=("${(@0)$(command env -u GIT_DIR -u GIT_WORK_TREE -u GIT_COMMON_DIR -u GIT_INDEX_FILE \
+      git -C "$PWD" worktree list --porcelain -z 2>/dev/null)}")
+    if [[ "$current_repository[1]" == 'worktree '* ]]; then
+      repo_root="${current_repository[1]#worktree }"
+    else
+      # Repository-management commands can run outside Git; registered defaults
+      # are resolved below before workspace commands use this placeholder.
+      repo_root="$PWD"
+    fi
+  fi
   local base_dir="${env_dir:-${RL_WORKTREE_DIR:-$HOME/.rl/worktrees}}"
   local repo_name="${env_name:-${RL_REPO_NAME:-${repo_root:t}}}"
   local default_base="${env_base:-${RL_DEFAULT_BASE:-origin/test}}"
@@ -226,7 +240,7 @@ _rl_main() {
         --default-base "$default_base" "$@"
       return ;;
     agent|handoff)
-      if [[ "$command" == agent && ( "$2" == list || "$2" == show ) ]]; then
+      if [[ "$command" == agent && ( "$2" == list || "$2" == show || "$2" == add || "$2" == set ) ]]; then
         command node "${${functions_source[_rl_main]}:A:h:h}/dist/cli.js" automation \
           --repo "$repo_root" --state-dir "$state_dir" --base-dir "$base_dir/$repo_name" \
           --default-base "$default_base" "$@"
