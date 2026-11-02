@@ -18,7 +18,7 @@ Install from npm:
 npm install --global rl-workspaces
 ```
 
-The first npm release is pending; see Development below to build the unpublished version.
+See Development below to build and try unpublished changes.
 
 Add one line to your shell configuration, then open a new terminal:
 
@@ -173,20 +173,13 @@ deleted automatically.
 
 ## Finish a feature
 
+Use Git directly to inspect changes, commit, rebase, or squash feature history.
+RL handles merging across checkouts and removing the finished workspace:
+
 ```sh
-rl git diff --base origin/test -- --stat
-rl git log --base origin/test -- --graph
-rl git commit -m "Add login"         # staged changes
-rl git commit --all -m "Fix login"   # tracked changes; untracked files require git add
-rl git rebase --base origin/test
-rl git squash --base origin/test -m "Add login"
 rl git merge test --dry-run
 rl git merge test --cleanup
 ```
-
-Git mutation commands also accept `--dry-run`. Rebase and squash require a clean
-workspace. Squash preserves the original HEAD under a printed
-`refs/rl/backups/<UUID>` ref; it rewrites local feature history without pushing.
 
 Merge targets a checked-out local branch in the main or a managed checkout.
 It requires clean source and target workspaces and defaults to fast-forward only.
@@ -388,176 +381,215 @@ and [Claude hooks](https://code.claude.com/docs/en/hooks) contracts.
 
 ## Session-driven agent workflows
 
-Your current Codex or Claude session owns its native subagents. RL supplies
-reusable roles, workflow dependencies, trigger rules, policies and durable run
-records. RL never launches a provider CLI, model API or check process for a
-workflow. The parent session claims ready steps, creates native children and
-reports their evidence; it runs configured checks itself.
+An adopted workspace has a built-in `writer-reviewer-dry` workflow immediately,
+without creating configuration files. Your current Codex or Claude session
+creates and controls its native children. RL supplies their editable roles,
+handoff rules, review policy and durable run records. RL never launches a
+provider CLI, model API or check process for a workflow.
+
+The default team starts together and stays available for the task:
+
+- **Writer** implements scoped changes. Before adding a function, it asks DRY
+  about existing implementations and waits for the answer. It submits stable
+  file groups to the reviewer, then fixes and resubmits rejected work.
+- **Reviewer** stays read-only, reviews writer checkpoints and returns a rating
+  with evidence and actionable feedback. On suspected duplication it asks the
+  same DRY agent before returning its review.
+- **DRY** stays read-only and serves both peers, returning paths, symbols,
+  behavioral differences and reuse options, or explicitly reporting that no
+  suitable implementation was found.
+
+Submitted files stay frozen while awaiting review; the writer can work on
+unrelated files meanwhile. Ratings apply to saved file contents and staged
+versions. RL rejects changed or superseded checkpoints and requires current
+accepted reviews for the writer's changes before completion. The defaults are
+**90/100** and at most **five review rounds** per file group. Required fixes
+and incomplete coverage block acceptance regardless of rating. Pending check
+requests or routing leads must be resolved before a checkpoint can be accepted.
 
 ```sh
-rl workflow init                     # configure this adopted workspace and refresh hooks
-rl agent add auth --instructions auth-review.md --description "Authentication reviewer"
+rl workflow context --json           # discover active definitions and their source
 rl agent list
-rl agent show auth
-rl workflow add auth-review --file auth-workflow.json
-rl workflow set auth-review --file auth-workflow.json
-rl workflow context --json            # discover definitions and trigger rules
-rl workflow status                    # latest saved run
-rl workflow metrics
+rl agent show writer
 rl policy show review
+rl workflow init                     # write editable copies and refresh workspace hooks
+rl agent set writer --instructions writer.md
+rl workflow set writer-reviewer-dry --file workflow.json --default
+rl workflow status                   # latest saved run and checkpoint ratings
+rl workflow metrics
 ```
 
-Configuration stays in this worktree:
+Export a definition before editing it:
+`rl workflow show writer-reviewer-dry --json > workflow.json`.
+`agent set --instructions` preserves the profile's other settings. Complete
+profiles can be saved with `rl agent set writer --file profile.json`.
+Use `rl agent add` and `rl workflow add` to create additional definitions.
+
+Configuration stays in this worktree. The three concerns remain separate:
 
 | File | Owns |
 | --- | --- |
-| `.rl/agents.json` | Roles: description, instructions, optional model/reasoning and `access` preferences; provider defaults to `inherit` |
-| `.rl/agent-workflows.json` | Trigger rules, ordered/parallel steps, concurrency, retry budget, report deadlines and selected policy |
-| `.rl/policies.json` | Criteria, severity deduction weights and acceptance requirements |
+| `.rl/agents.json` | Roles: description, instructions, optional model/reasoning and access preferences; provider defaults to inherit |
+| `.rl/agent-workflows.json` | Default workflow, triggers, dependencies, concurrency, retries, deadlines, collaboration routes and review rounds |
+| `.rl/policies.json` | Review criteria, rating scale/threshold, severity deduction weights and acceptance requirements |
 
 Each file has `"version": 1` and a named `agents`, `workflows` or `policies` map.
-`rl agent add/set <name> --file profile.json` also saves complete profiles.
-Missing files use preset definitions for discovery, but automatic trigger
-handling requires at least one explicit configuration file. Existing legacy
-provider preferences remain readable; they never authorize starting a separate
-Codex/Claude process. Native model and reasoning options are applied by the
-parent where supported; unavailable settings must be reported explicitly.
+The workflow file also accepts `"default": "writer-reviewer-dry"`; use
+`workflow add/set --default` to select a different default. Existing explicit
+configurations are preserved, including workspaces with partial legacy settings.
+A missing file uses built-in definitions, which
+are active for automatic triggers too. Run `workflow init` only when you want
+editable copies and none of the three files exists yet.
 
-Session-start hooks detect configuration and teach the parent the protocol.
-Prompt hooks refresh it after configuration changes, including after compaction.
-Tool hooks deliver matching requests as the parent works. Before-edit/tool rules
-deny the pending tool until their request completes or is explicitly dismissed
-(or the user cancels its run), so the parent can delegate before retrying.
-Workflow coordination tools are excluded from this gate. The preset queues
-`triple-review` before finishing changed work: behavior/security, reuse/complexity
-and implementation-quality roles, all read-only. Child hooks do not recursively
-queue workflows. Normal session resume and task checkpoints remain independent.
-
-For example, save the following as `auth-workflow.json`, then add it using the
-command above:
+The default workflow's `collaboration` section is editable:
 
 ```json
 {
-  "description": "Review authentication changes before finishing",
-  "policy": "review",
-  "concurrency": 2,
-  "retries": 1,
-  "timeoutSeconds": 600,
-  "triggers": [
-    { "event": "before_edit", "tools": ["Edit", "apply_patch"], "paths": ["src/auth/**"] },
-    { "event": "before_finish", "changes": true },
-    { "event": "task_planned" }
-  ],
-  "steps": [
-    { "id": "types", "command": ["pnpm", "tsc", "--noEmit"], "after": [] },
-    { "id": "auth", "agent": "auth", "after": ["types"] },
-    { "id": "quality", "agent": "quality", "after": ["types"] }
+  "writer": "writer",
+  "reviewer": "reviewer",
+  "dry": "dry",
+  "maxRounds": 5,
+  "rules": [
+    { "from": "writer", "event": "new_function", "to": "dry", "required": true },
+    { "from": "reviewer", "event": "suspected_duplicate", "to": "dry", "required": true }
   ]
 }
 ```
 
+These names refer to step IDs. All three collaboration steps must be ready at
+startup with concurrency at least three; reviewer and DRY must be read-only.
+Change routes, requirements, review rounds, triggers and profiles as needed.
+Required gates support writer `new_function` and reviewer `suspected_duplicate`;
+additional event routes can be added with `required: false` for optional messaging.
+Other workflows can use sequential/parallel dependencies and parent-run command
+steps without collaboration. A writing stage runs exclusively in those workflows;
+explicit dependency results are shared and independent reviews remain isolated.
+
+The separate policy has a `rating` object with `min`, `max`, `minimum` and
+`instructions`. Agents use that rubric to rate checkpoints. RL also calculates
+a separate score from findings: the default deducts 50/20/10/2 for
+critical/high/medium/low findings, deduplicates exact file/line/root-cause matches,
+and blocks readiness on required fixes or coverage gaps. `rl workflow score`
+rescores saved evidence without agent calls. Native model/reasoning settings are
+preferences applied by the parent where supported; unsupported settings must be
+reported. Provider preferences never authorize another provider process.
+
+Session-start hooks identify the active configuration and teach the parent the
+protocol. Prompt hooks refresh it after configuration changes and compaction.
+The default queues the team at the parent's `task_planned` coding milestone or
+before its first edit. Before-edit/tool rules deny the pending tool until their
+request completes, is explicitly dismissed or its run is cancelled. Coordination
+tools are excluded from this gate. Child hooks do not recursively queue teams.
+Normal session resume and task checkpoints remain independent.
+
 Automatic events are `session_start`, `prompt`, `before_edit`, `after_edit`,
-`before_tool`, `after_tool`, and `before_finish`. Edit events recognize
+`before_tool`, `after_tool` and `before_finish`. Edit events recognize
 Edit/Write/MultiEdit/apply_patch; other tools, including shell commands, use the
 tool events. `tools` matches exact hook tool names; `paths` matches workspace
-relative file paths with `*` (one path segment) and `**` (across segments).
-Path filtering uses structured edit paths/patch headers, not guesses about shell
-commands. `changes: true` requires changes in the locally available comparison
-scope. Semantic events such as `task_planned` are explicitly reported by the
-parent, since RL cannot observe private reasoning. All conditions on a rule
-must match; multiple rules are alternatives.
+relative paths with `*` and `**`. Path filtering reads structured edit paths
+and patch headers, without guessing about shell commands. `changes: true`
+requires changes in the local comparison scope. Semantic events such as
+`task_planned` are reported by the parent, since RL cannot observe private
+reasoning. All conditions on a rule must match; multiple rules are alternatives.
 
-Matching events queue requests for that parent conversation only. Identical
+Matching requests belong to that parent conversation only. Identical
 scope/configuration events are deduplicated; newer changes coalesce into an
-unclaimed request. Before-finish hooks can continue the turn once with the
-request, and guard against repeated Stop-hook loops. They cannot force a client
-to offer or use native delegation. If unavailable or disallowed by current
-instructions, the session must dismiss the request with its concrete reason
-and report that limitation. Current permissions and workspace boundaries apply
-to every child. Read-only roles receive instructions to remain read-only; host
-permissions are enforced by the host, not by RL.
+unclaimed request. Before-finish hooks can continue the turn once, guarding
+against repeated Stop-hook loops. If native delegation is unavailable or
+disallowed, the session must dismiss the request with its concrete reason and
+report that limitation. Current permissions and workspace boundaries apply to
+every child. Host permissions are enforced by the host.
 
 The MCP server (`rl agent mcp`) exposes:
 
-1. `rl_workflow_context`: discover roles, workflows, triggers and policies.
-2. `rl_workflow_pending`: read this parent session's queued requests.
-3. `rl_workflow_event`: report an explicit milestone and match trigger rules.
-4. `rl_workflow_start`: create a session-owned run, optionally from a request ID.
-5. `rl_workflow_claim`: atomically claim one ready stage and receive its prompt,
-   dependencies, scope path, output schema and native settings.
-6. `rl_workflow_report`: submit the claim token and child findings, an actual
-   check result, or a failure. RL validates the report and calculates the score.
-7. `rl_workflow_dismiss`: decline a queued request with a recorded reason.
+| Tool | Purpose |
+| --- | --- |
+| `rl_workflow_context` | Discover roles, workflows, triggers, policies and configuration source |
+| `rl_workflow_pending` | Read this parent's queued requests |
+| `rl_workflow_event` | Report a milestone and match trigger rules |
+| `rl_workflow_start` | Prepare a session-owned run, optionally from a request |
+| `rl_workflow_claim` | Claim a ready step and receive its prompt, scope, result schema and native settings |
+| `rl_workflow_report` | Return final evidence, actual check output or failure with the claim token |
+| `rl_workflow_dismiss` | Decline a queued request with a recorded reason |
+| `rl_workflow_bind` | Bind a claimed role to its unique native child ID |
+| `rl_workflow_inbox` | Read that role's consultations, submissions, ratings and peer handles |
+| `rl_workflow_consult` | Ask an existing peer through a configured route |
+| `rl_workflow_answer` | Answer a consultation addressed to that role |
+| `rl_workflow_submit` | Submit a writer checkpoint and declare new functions as path#function subjects |
+| `rl_workflow_review` | Return a rating, rationale, evidence and declared duplicate suspicions |
 
-Supply `agent` and the parent conversation's full `sessionId`; Codex may infer
-its ID from the environment, while Claude supplies its UUID explicitly. Observed
-Codex `thr_` IDs also coordinate workflows, but never enter UUID-based resumable
-session history. These are
-coordination identities within the local workspace, not an authentication
-boundary against a process that already has access to its state files.
-CLI equivalents are available when the session has no MCP connection:
+The parent claims, spawns and binds all three peers, then announces readiness.
+Handoff tools return a `notify` destination with the peer's native handle. The
+caller delivers it through native messaging or asks the parent to relay it.
+RL persists the handoff; it cannot wake native children on its own. Peers use
+native wait/messaging tools while idle. Finish the writer first, then reviewer,
+then DRY, reporting final evidence through `rl_workflow_report`.
+
+RL verifies answered consultations for declared new functions and duplicate
+suspicions. Identifying those semantic events and declaring them honestly is
+the agents' responsibility; RL cannot independently prove that every new
+function was declared.
+
+Supply `agent` and the parent's full `sessionId`; Codex may infer its ID from
+the environment, while Claude supplies its UUID explicitly. Observed Codex
+`thr_` IDs also coordinate workflows, but never enter UUID-based resumable
+history. These are local coordination identities, not an authentication boundary
+against a process that already has access to the state files.
+
+CLI equivalents are available without an MCP connection:
 
 ```sh
 rl workflow pending --agent claude --session <UUID>
-rl workflow run --request <request-UUID> --agent claude --session <UUID>
 rl workflow event --file event.json --agent claude --session <UUID>
-rl workflow run auth-review --base origin/test --agent claude --session <UUID>
-rl workflow claim <run> --agent claude --session <UUID>
+rl workflow run --request <request-UUID> --agent claude --session <UUID>
+rl workflow claim <run> --step writer --agent claude --session <UUID>
+rl workflow bind <run> --file binding.json --agent claude --session <UUID>
+rl workflow inbox <run> --step writer --claim <token> --agent claude --session <UUID>
 rl workflow report <run> --file report.json --agent claude --session <UUID>
 ```
 
-An event file contains `{ "event": "task_planned" }`; report files contain
-`step`, `claim`, and `result` (the returned schema), or `check` with actual
-`stdout`, `stderr`, `exitCode`, or `error`. Reports may include `childId` and
-parent-reported token/cost usage. Commands and reports return data for the parent;
-`workflow run` prepares work and returns without spawning agents. `--dry-run`
-previews scope without creating a run.
-
-Dependencies and concurrency are enforced when stages are claimed. Explicit
-predecessor results are supplied to dependent agents; independent roles receive
-no peer reports. A failed check blocks dependents. Reported agent failures may
-be retried within the configured budget. Routing leads receive one focused
-follow-up by their owning role. Further leads remain coverage limitations.
+An event file contains `{ "event": "task_planned" }`. Binding files contain
+`step`, `claim` and `childId`. CLI equivalents for `consult`, `answer`,
+`submit` and `review` take `--file` with the same tool fields. Each role's
+prompt supplies its claim token and parent conversation identity. Final reports
+contain `step`, `claim` and `result` (the supplied schema), or an actual
+`check` result or `error`. Reports may include native `childId` and token/cost
+usage. `workflow run` prepares work without spawning agents; `--dry-run`
+previews the scope without creating a run.
 
 Review scope includes committed branch changes from the merge-base, staged,
-unstaged and non-ignored untracked changes, capped at 4 MiB. The selected base
-uses local refs, without fetching; event detection uses HEAD if the saved base
-is not locally resolvable. RL checks fingerprints before claims and reports.
-Unexpected changed scope requires a new run. Roles default to read-only. A profile with `"access": "workspace-write"` may
-implement its assigned changes within the host's existing permissions. Writing
-stages run exclusively. RL refreshes scope after the writer reports, so later
-reviewers inspect its changes. Earlier checks/reviews remain historical; they
-cannot justify readiness for changed code unless refreshed after writing. Place
-final validation after the writer in the workflow. Unexpected edits during a
-read-only stage still invalidate its result.
+unstaged and non-ignored untracked changes, capped at 4 MiB. Bases use local refs
+without fetching; event detection falls back to HEAD if the saved base is
+unresolvable. Generic workflows validate whole-scope fingerprints; collaborative
+reviews validate each saved file group while implementation continues. Initial
+unrelated dirty files need no submission unless changed during the run. RL
+refreshes the whole scope when the writer closes and verifies it for remaining
+final reports. Earlier checks/reviews in generic workflows remain historical
+after writing; place final validation after the writer. Failed checks block
+dependents. Reported failures can be retried within the configured budget.
+Generic routing leads receive one focused follow-up; further leads remain
+limitations. Collaborative peers handle consultations without replacement stages.
 
-Policies remain separate. The default deducts 50/20/10/2 for
-critical/high/medium/low findings, deduplicates exact file/line/root-cause matches,
-and blocks readiness on required fixes or coverage gaps. Agents return evidence
-without assigning scores. `rl workflow score --policy review` rescores recorded
-findings and preserves assessment history without agent calls.
-
-`workflow pause` stops new claims but accepts reports from already claimed
-children. The parent owns child cancellation and must stop its native agents.
-After existing children have reported, that parent can `workflow resume` using
-the saved configuration. Cancellation rejects further results and requires a
-new run. Neither command sends process signals. Runs retain their parent UUID,
-claim tokens, native child IDs, evidence, scope and policy assessments under the
-current instance's `workflow-runs/` directory. RL measures claim-to-report elapsed
-time; token/cost usage is parent-reported and missing totals remain unknown.
+`workflow pause` stops new claims and submissions but lets claimed children
+report and finish pending answers/reviews. The parent owns child cancellation.
+`workflow resume` lets collaborative peers continue with the same claims and
+native handles. Generic workflows require running children to report first.
+Cancellation rejects further results and requires a new run. Neither command
+sends process signals. Run records retain the parent identity, native IDs,
+claims, evidence, checkpoints and assessments under this instance's
+`workflow-runs/` directory. RL measures claim-to-report elapsed time; token/cost
+usage is parent-reported and missing totals remain unknown.
 
 After upgrading existing workspaces, run `rl doctor --repair` to add tool hooks,
-and restart/review hooks as required by your host. Native hook integration follows
-the [Codex hooks](https://learn.chatgpt.com/docs/hooks) and
-[Claude hooks](https://code.claude.com/docs/en/hooks) contracts. Automated tests
-exercise hook payloads and MCP/CLI coordination; they do not certify live model
-compliance or native delegation availability in every client.
+and restart/review hooks as required by your host. Automated tests exercise
+hook payloads and MCP/CLI coordination; they do not certify live model compliance
+or native delegation availability in every client.
 
 ## Let agents use notes through MCP
 
 `rl agent mcp` serves workspace-scoped tools over stdio: `rl_status`, `rl_context`,
 `rl_progress`, `rl_context_append`, `rl_progress_append`, `rl_session_save`,
-`rl_task_pause`, and the seven `rl_workflow_*` coordination tools described above.
+`rl_task_pause`, and the thirteen `rl_workflow_*` coordination tools described above.
 `rl_task_pause` accepts the handoff JSON described above and atomically saves
 the session and task checkpoint. `rl_status` includes task state and handoff history.
 `rl_status` automatically discovers Codex sessions for this workspace.
@@ -672,7 +704,7 @@ keep one primary spelling for each operation:
 
 | Previous command | Primary command |
 | --- | --- |
-| `rl step commit/rebase/squash`, `rl diff/log/merge` | `rl git commit/rebase/squash/diff/log/merge` |
+| `rl merge` | `rl git merge` |
 | `rl context/progress show/set/append/path` | `rl notes show/set/append/path context/progress` |
 | `rl summary` | `rl notes summary` |
 | `rl session list/save/add` | `rl agent sessions/save` |

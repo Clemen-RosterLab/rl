@@ -83,47 +83,39 @@ test("invalid arguments print only the command's usage and options", (t) => {
   });
   assert.match(missingFlag.stderr, /--prompt <text>/);
   assert.doesNotMatch(missingFlag.stderr, /rl resume/);
-  const missing = w.rl(["git", "commit"], { cwd: w.a, ok: false });
+  const missing = w.rl(["git", "merge", "--squash"], { cwd: w.a, ok: false });
   assert.match(missing.stderr, /Missing --message/);
-  assert.match(missing.stderr, /Usage: rl git commit/);
+  assert.match(missing.stderr, /Usage: rl git merge/);
   const unknown = w.rl(["nonsense"], { cwd: w.a, ok: false });
   assert.equal(unknown.stdout, "");
   assert.ok(unknown.stderr.split("\n").length <= 4);
 });
 
-test("canonical Git, notes and agent commands preserve behavior and literal arguments", (t) => {
+test("Git help exposes only merge and removed wrappers are rejected", (t) => {
+  const w = new Workspace(t);
+  const help = w.rl(["help", "git"]).stdout;
+  assert.match(help, /merge\s+Integrate/);
+  for (const command of ["diff", "log", "commit", "rebase", "squash"]) {
+    assert.doesNotMatch(help, new RegExp(`^  ${command}\\s`, "m"));
+    const removed = w.rl(["git", command], { cwd: w.a, ok: false });
+    assert.match(removed.stderr, /Unknown git command/);
+    w.rl(["help", "git", command], { ok: false });
+  }
+  for (const command of [
+    ["diff"],
+    ["log"],
+    ["step", "commit"],
+    ["step", "rebase"],
+    ["step", "squash"],
+  ])
+    w.rl(command, { cwd: w.a, ok: false });
+});
+
+test("canonical merge, notes and agent commands preserve behavior", (t) => {
   const w = new Workspace(t);
   write(path.join(w.a, "feature.txt"), "change");
   w.git(w.a, "add", "feature.txt");
-  assert.equal(
-    w.rl(["git", "diff", "--base", "develop", "--", "--stat"], { cwd: w.a })
-      .stdout,
-    w.rl(["diff", "--base", "develop", "--", "--stat"], { cwd: w.a }).stdout,
-  );
-  assert.match(
-    w.rl(["git", "commit", "-m", "literal $(touch nope)", "--dry-run"], {
-      cwd: w.a,
-    }).stdout,
-    /literal \$\(touch nope\)/,
-  );
-  assert.ok(!fs.existsSync(path.join(w.a, "nope")));
   w.git(w.a, "commit", "-qm", "Feature");
-  assert.match(
-    w.rl(["git", "log", "--base", "develop"], { cwd: w.a }).stdout,
-    /Feature/,
-  );
-  assert.match(
-    w.rl(["git", "rebase", "--base", "develop", "--dry-run"], { cwd: w.a })
-      .stdout,
-    /Would rebase/,
-  );
-  assert.match(
-    w.rl(
-      ["git", "squash", "--base", "develop", "-m", "Squashed", "--dry-run"],
-      { cwd: w.a },
-    ).stdout,
-    /Would squash/,
-  );
   assert.match(
     w.rl(["git", "merge", "develop", "--dry-run"], { cwd: w.a }).stdout,
     /Would fast-forward merge/,

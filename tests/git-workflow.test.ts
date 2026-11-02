@@ -37,53 +37,6 @@ function commit(w: Workspace, root: string, name: string) {
   w.git(root, "commit", "-qm", name);
 }
 
-test("step commit stages only explicitly tracked --all changes and preserves untracked files", (t) => {
-  const w = new Workspace(t);
-  write(path.join(w.a, "staged"), "staged");
-  write(path.join(w.a, "untracked"), "untracked");
-  w.git(w.a, "add", "staged");
-  workflow(w, ["step", "commit", "-m", "first"]);
-  assert.equal(
-    w.git(w.a, "show", "--format=", "--name-only", "HEAD"),
-    "staged",
-  );
-  write(path.join(w.a, "staged"), "changed");
-  workflow(w, ["step", "commit", "--all", "-m", "tracked"]);
-  assert.equal(w.git(w.a, "status", "--porcelain"), "?? untracked");
-  workflow(w, ["step", "commit"], { ok: false });
-});
-
-test("squash retains tree, merge-base parent and backup of original head", (t) => {
-  const w = new Workspace(t);
-  commit(w, w.a, "one");
-  commit(w, w.a, "two");
-  const before = w.git(w.a, "rev-parse", "HEAD"),
-    tree = w.git(w.a, "rev-parse", "HEAD^{tree}");
-  const out = workflow(w, ["step", "squash", "-m", "combined"]).stdout;
-  const backup = out.match(/refs\/rl\/backups\/[^\s]+/)![0];
-  assert.equal(w.git(w.a, "rev-parse", backup), before);
-  assert.equal(w.git(w.a, "rev-parse", "HEAD^{tree}"), tree);
-  assert.equal(w.git(w.a, "rev-list", "--count", "develop..HEAD"), "1");
-  assert.equal(w.git(w.a, "status", "--porcelain"), "");
-});
-
-test("rebase refuses dirty or ongoing operations and preserves recoverable conflicts", (t) => {
-  const w = new Workspace(t);
-  write(path.join(w.a, "dirty"), "keep");
-  workflow(w, ["step", "rebase"], { ok: false });
-  assert.equal(read(path.join(w.a, "dirty")), "keep");
-  fs.unlinkSync(path.join(w.a, "dirty"));
-  commit(w, w.repo, "conflict");
-  write(path.join(w.a, "conflict"), "different");
-  w.git(w.a, "add", "conflict");
-  w.git(w.a, "commit", "-qm", "conflicting");
-  const failed = workflow(w, ["step", "rebase"], { ok: false });
-  assert.match(failed.stderr, /rebase --abort/);
-  workflow(w, ["step", "squash", "-m", "bad"], { ok: false });
-  w.git(w.a, "rebase", "--abort");
-  assert.equal(read(path.join(w.a, "conflict")), "different");
-});
-
 test("merge dry run and diverged/dirty guards preserve both branches", (t) => {
   const w = new Workspace(t),
     source = w.managed("topic");
@@ -149,22 +102,6 @@ test("squash conflict retains source and reports incomplete merge", (t) => {
   assert.ok(fs.existsSync(source));
   assert.equal(read(path.join(source, "same")), "different");
   assert.ok(w.git(w.repo, "ls-files", "--unmerged"));
-});
-
-test("diff/log are offline and disallow output/execute options", (t) => {
-  const w = new Workspace(t);
-  commit(w, w.a, "one");
-  assert.match(workflow(w, ["diff", "--", "--stat"]).stdout, /one/);
-  assert.match(workflow(w, ["log", "--", "--oneline"]).stdout, /one/);
-  for (const option of [
-    "--output=/tmp/rl-unsafe",
-    "--ext-diff",
-    "--textconv",
-    "--format=%x00",
-    "--exec=touch /tmp/no",
-  ])
-    workflow(w, ["diff", "--", option], { ok: false });
-  workflow(w, ["step", "rebase", "--base=--exec=bad"], { ok: false });
 });
 
 function github(w: Workspace, fork = false) {
@@ -295,7 +232,7 @@ test("PR checkout fetches exact verified head into new adopted worktree without 
   assert.ok(!fs.existsSync(path.join(w.root, "worktrees/example/moved")));
 });
 
-test("squash rejects a branch switch while waiting for the workflow lock", async (t) => {
+test("merge rejects a branch switch while waiting for the workflow lock", async (t) => {
   const w = new Workspace(t);
   commit(w, w.a, "one");
   const stateRoot = path.dirname(w.status(w.a).stateDirectory);
@@ -324,10 +261,7 @@ test("squash rejects a branch switch while waiting for the workflow lock", async
       path.join(w.root, "worktrees/example"),
       "--default-base",
       "develop",
-      "step",
-      "squash",
-      "-m",
-      "should not happen",
+      "merge",
     ],
     { cwd: w.a },
   );
@@ -343,25 +277,4 @@ test("squash rejects a branch switch while waiting for the workflow lock", async
   await rejected;
   assert.equal(w.git(w.a, "rev-parse", "refs/heads/feature/a"), before);
   assert.equal(w.git(w.a, "rev-parse", "refs/heads/other"), before);
-});
-
-test("step dry runs preserve HEAD, index and backup refs", (t) => {
-  const w = new Workspace(t);
-  commit(w, w.a, "one");
-  const head = w.git(w.a, "rev-parse", "HEAD");
-  workflow(w, ["step", "squash", "-m", "preview", "--dry-run"]);
-  workflow(w, ["step", "rebase", "--dry-run"]);
-  write(path.join(w.a, "one"), "pending");
-  w.git(w.a, "add", "one");
-  const tree = w.git(w.a, "write-tree");
-  assert.match(
-    workflow(w, ["step", "commit", "-m", "preview", "--dry-run"]).stdout,
-    /Would commit staged/,
-  );
-  assert.equal(w.git(w.a, "rev-parse", "HEAD"), head);
-  assert.equal(w.git(w.a, "write-tree"), tree);
-  assert.equal(
-    w.git(w.a, "for-each-ref", "--format=%(refname)", "refs/rl/backups"),
-    "",
-  );
 });

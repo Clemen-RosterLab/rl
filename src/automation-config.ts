@@ -25,6 +25,7 @@ export interface ReviewPolicy {
   weights: Record<Severity, number>;
   minimumScore: number;
   blockRequired: boolean;
+  rating?: { min: number; max: number; minimum: number; instructions: string };
 }
 export interface WorkflowStep {
   id: string;
@@ -40,6 +41,13 @@ export interface AgentWorkflow {
   timeoutSeconds: number;
   steps: WorkflowStep[];
   triggers?: WorkflowTrigger[];
+  collaboration?: {
+    writer: string;
+    reviewer: string;
+    dry: string;
+    maxRounds: number;
+    rules: { from: string; event: string; to: string; required: boolean }[];
+  };
 }
 export interface WorkflowTrigger {
   event: string;
@@ -51,6 +59,7 @@ export interface AutomationConfig {
   agents: Record<string, AgentProfile>;
   policies: Record<string, ReviewPolicy>;
   workflows: Record<string, AgentWorkflow>;
+  defaultWorkflow?: string;
 }
 const ID = /^[a-z][a-z0-9_-]{0,63}$/;
 export function identifier(value: unknown): asserts value is string {
@@ -92,7 +101,11 @@ function integer(value: unknown, min: number, max: number) {
 export function validateAutomation(
   value: unknown,
 ): asserts value is AutomationConfig {
-  fields(value, ["agents", "policies", "workflows"]);
+  fields(
+    value,
+    ["agents", "policies", "workflows", "defaultWorkflow"],
+    ["agents", "policies", "workflows"],
+  );
   for (const kind of ["agents", "policies", "workflows"] as const) {
     const entries = value[kind];
     if (
@@ -143,12 +156,17 @@ export function validateAutomation(
         )
           throw new Error("Unsupported reasoning setting for this provider");
       } else if (kind === "policies") {
-        fields(item, [
-          "instructions",
-          "weights",
-          "minimumScore",
-          "blockRequired",
-        ]);
+        fields(
+          item,
+          [
+            "instructions",
+            "weights",
+            "minimumScore",
+            "blockRequired",
+            "rating",
+          ],
+          ["instructions", "weights", "minimumScore", "blockRequired"],
+        );
         nonempty(item.instructions);
         fields(item.weights, [...SEVERITIES]);
         for (const weight of Object.values(item.weights))
@@ -156,6 +174,18 @@ export function validateAutomation(
         integer(item.minimumScore, 0, 100);
         if (typeof item.blockRequired !== "boolean")
           throw new Error("blockRequired must be boolean");
+        if (item.rating !== undefined) {
+          fields(item.rating, ["min", "max", "minimum", "instructions"]);
+          for (const key of ["min", "max", "minimum"])
+            integer(item.rating[key], 0, 1000);
+          if (
+            Number(item.rating.max) <= Number(item.rating.min) ||
+            Number(item.rating.minimum) < Number(item.rating.min) ||
+            Number(item.rating.minimum) > Number(item.rating.max)
+          )
+            throw new Error("Invalid reviewer rating range");
+          nonempty(item.rating.instructions);
+        }
       } else {
         fields(
           item,
@@ -167,6 +197,7 @@ export function validateAutomation(
             "timeoutSeconds",
             "steps",
             "triggers",
+            "collaboration",
           ],
           [
             "description",
@@ -272,9 +303,101 @@ export function validateAutomation(
             done.add(id);
           }
         }
+        if (item.collaboration !== undefined) {
+          const collaboration = item.collaboration;
+          fields(collaboration, [
+            "writer",
+            "reviewer",
+            "dry",
+            "maxRounds",
+            "rules",
+          ]);
+          const roles = [
+            collaboration.writer,
+            collaboration.reviewer,
+            collaboration.dry,
+          ];
+          if (new Set(roles).size !== 3 || Number(item.concurrency) < 3)
+            throw new Error(
+              "Collaborative roles require three distinct steps and concurrency of at least three",
+            );
+          for (const role of roles) {
+            identifier(role);
+            const step = item.steps.find((step) => step.id === role);
+            if (!step?.agent || step.after.length)
+              throw new Error(
+                "Collaborative roles must be agent steps ready together at startup",
+              );
+            const profile = object(value.agents)
+              ? value.agents[step.agent]
+              : undefined;
+            if (
+              role === collaboration.writer &&
+              object(profile) &&
+              profile.access !== "workspace-write"
+            )
+              throw new Error(
+                "Collaborative writer must have workspace-write access",
+              );
+            if (
+              role !== collaboration.writer &&
+              object(profile) &&
+              profile.access === "workspace-write"
+            )
+              throw new Error("Reviewer and DRY roles must be read-only");
+          }
+          integer(collaboration.maxRounds, 1, 20);
+          const policy = object(value.policies)
+            ? value.policies[item.policy]
+            : undefined;
+          if (!object(policy) || !object(policy.rating))
+            throw new Error(
+              "Collaborative workflows require a reviewer rating policy",
+            );
+          if (
+            !Array.isArray(collaboration.rules) ||
+            collaboration.rules.length > 32
+          )
+            throw new Error("Expected up to 32 collaboration rules");
+          const routes = new Set<string>();
+          for (const rule of collaboration.rules) {
+            fields(rule, ["from", "event", "to", "required"]);
+            if (
+              !roles.includes(rule.from) ||
+              !roles.includes(rule.to) ||
+              rule.from === rule.to ||
+              typeof rule.required !== "boolean"
+            )
+              throw new Error("Invalid collaboration route");
+            identifier(rule.event);
+            if (
+              rule.required &&
+              !(
+                (rule.from === collaboration.writer &&
+                  rule.event === "new_function") ||
+                (rule.from === collaboration.reviewer &&
+                  rule.event === "suspected_duplicate")
+              )
+            )
+              throw new Error(
+                "Required consultations support writer new_function and reviewer suspected_duplicate; use required: false for additional message routes",
+              );
+            const key = `${rule.from}:${rule.event}:${rule.to}`;
+            if (routes.has(key))
+              throw new Error("Duplicate collaboration rule");
+            routes.add(key);
+          }
+        }
       }
     }
   }
+  if (
+    value.defaultWorkflow !== undefined &&
+    (!object(value.workflows) ||
+      typeof value.defaultWorkflow !== "string" ||
+      !Object.hasOwn(value.workflows, value.defaultWorkflow))
+  )
+    throw new Error("Unknown default workflow");
 }
 function configPath(root: string, relative: string) {
   const directory = path.join(root, ".rl"),
@@ -290,15 +413,79 @@ export function readAutomation(root: string): AutomationConfig {
   const result: Record<string, unknown> = {};
   for (const [kind, relative] of Object.entries(CONFIG_FILES)) {
     const file = configPath(root, relative);
-    if (!fs.existsSync(file))
-      result[kind] = structuredClone(PRESET[kind as keyof AutomationConfig]);
-    else {
+    if (!fs.existsSync(file)) {
+      result[kind] = structuredClone(PRESET[kind as keyof typeof CONFIG_FILES]);
+      if (kind === "workflows") result.defaultWorkflow = PRESET.defaultWorkflow;
+    } else {
       const data = readJsonObject(file);
-      fields(data, ["version", kind]);
+      fields(
+        data,
+        kind === "workflows" ? ["version", kind, "default"] : ["version", kind],
+        ["version", kind],
+      );
       if (data.version !== 1)
         throw new Error("Unsupported agent configuration version");
       result[kind] = data[kind];
+      if (kind === "workflows")
+        result.defaultWorkflow =
+          data.default === undefined
+            ? object(data.workflows)
+              ? Object.keys(data.workflows)[0]
+              : undefined
+            : data.default;
     }
+  }
+  // Older add/set commands could write just one configuration file. Supply
+  // the roles/rating needed by the inherited workflow without replacing any
+  // explicit profile or changing the user's files.
+  if (!fs.existsSync(configPath(root, CONFIG_FILES.workflows))) {
+    if (object(result.agents))
+      result.agents = { ...structuredClone(PRESET.agents), ...result.agents };
+    if (
+      object(result.policies) &&
+      object(result.policies.review) &&
+      result.policies.review.rating === undefined
+    )
+      result.policies.review = {
+        ...result.policies.review,
+        rating: structuredClone(PRESET.policies.review.rating),
+      };
+  } else if (
+    !fs.existsSync(configPath(root, CONFIG_FILES.agents)) &&
+    object(result.workflows) &&
+    object(result.agents)
+  ) {
+    const legacy = {
+      behavior: {
+        ...PRESET.agents.reviewer,
+        description: "Review runtime correctness and security",
+        instructions:
+          "Independently review the supplied scope for runtime correctness, authorization, persistence and concurrency defects. Stay read-only; report concrete evidence and coverage limitations using the supplied result schema.",
+      },
+      reuse: {
+        ...PRESET.agents.dry,
+        description: "Review reuse and complexity",
+        instructions:
+          "Independently search existing source and dependencies for concrete reuse opportunities in the supplied scope. Stay read-only; distinguish behavioral overlap from superficial similarity and report paths, symbols, findings and coverage limitations using the supplied result schema.",
+      },
+      quality: {
+        ...PRESET.agents.reviewer,
+        description: "Review implementation quality and validation",
+        instructions:
+          "Independently review the supplied scope for type contracts, maintainability, failure handling and meaningful validation. Stay read-only; report evidence-backed findings and coverage limitations using the supplied result schema.",
+      },
+    };
+    for (const workflow of Object.values(result.workflows))
+      if (object(workflow) && Array.isArray(workflow.steps))
+        for (const step of workflow.steps)
+          if (
+            object(step) &&
+            typeof step.agent === "string" &&
+            Object.hasOwn(legacy, step.agent)
+          )
+            result.agents[step.agent] = structuredClone(
+              legacy[step.agent as keyof typeof legacy],
+            );
   }
   validateAutomation(result);
   return result;
@@ -323,6 +510,7 @@ export function initAutomation(
     writeJson(configPath(root, relative), {
       version: 1,
       [kind]: preset[kind as keyof AutomationConfig],
+      ...(kind === "workflows" ? { default: preset.defaultWorkflow } : {}),
     });
 }
 export function hasAutomation(root: string): boolean {
@@ -336,6 +524,7 @@ export function setAutomation(
   name: string,
   value: unknown,
   addOnly = false,
+  makeDefault = false,
 ): void {
   identifier(name);
   const config = readAutomation(root);
@@ -347,9 +536,14 @@ export function setAutomation(
     writable: true,
     configurable: true,
   });
+  if (makeDefault) config.defaultWorkflow = name;
   validateAutomation(config);
   writeJson(configPath(root, CONFIG_FILES[kind]), {
     version: 1,
     [kind]: config[kind],
+    ...(kind === "workflows" ? { default: config.defaultWorkflow } : {}),
   });
+}
+export function defaultWorkflow(config: AutomationConfig): string {
+  return config.defaultWorkflow ?? Object.keys(config.workflows)[0];
 }

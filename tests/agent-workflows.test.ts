@@ -37,6 +37,41 @@ const initialize = {
 function setup(t: TestContext) {
   const w = new Workspace(t);
   w.rl(["workflow", "init"], { cwd: w.a });
+  // Explicit legacy definitions keep exercising the generic DAG engine after
+  // the out-of-box preset changes to the collaborative writer/reviewer/DRY team.
+  const profilesFile = path.join(w.a, ".rl/agents.json");
+  const profiles = readJson(profilesFile);
+  profiles.agents = {
+    behavior: {
+      ...profiles.agents.reviewer,
+      instructions: "Review runtime correctness",
+    },
+    reuse: profiles.agents.dry,
+    quality: profiles.agents.reviewer,
+  };
+  write(profilesFile, JSON.stringify(profiles));
+  write(
+    path.join(w.a, ".rl/agent-workflows.json"),
+    JSON.stringify({
+      version: 1,
+      default: "triple-review",
+      workflows: {
+        "triple-review": {
+          description: "Legacy independent review lanes",
+          policy: "review",
+          concurrency: 3,
+          retries: 1,
+          timeoutSeconds: 600,
+          triggers: [{ event: "before_finish", changes: true }],
+          steps: [
+            { id: "behavior", agent: "behavior", after: [] },
+            { id: "reuse", agent: "reuse", after: [] },
+            { id: "quality", agent: "quality", after: [] },
+          ],
+        },
+      },
+    }),
+  );
   write(path.join(w.a, "app.ts"), "export const value = 1;\n");
   const parent = { agent: "claude", sessionId: randomUUID() };
   const rpc = (

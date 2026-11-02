@@ -8,6 +8,7 @@ import {
   initAutomation,
   readAutomation,
   setAutomation,
+  defaultWorkflow,
 } from "./automation-config.js";
 import {
   controlRun,
@@ -38,6 +39,19 @@ function report(run: WorkflowRun, asJson: boolean) {
     console.log(
       `  ${stage.id.padEnd(22)} ${stage.status.padEnd(10)} ${stage.attempts} attempt(s) · ${(stage.durationMs / 1000).toFixed(1)}s${stage.error ? ` · ${visible(stage.error)}` : ""}`,
     );
+  if (run.collaboration) {
+    const rating =
+      run.config.policies[run.config.workflows[run.workflow].policy].rating!;
+    for (const submission of run.collaboration.submissions.filter(
+      (item) => !item.supersededBy,
+    ))
+      console.log(
+        `  Review ${submission.id.slice(0, 8)} · round ${submission.round} · ${submission.review ? `${submission.review.rating}/${rating.max} · ${submission.review.accepted ? "accepted" : "changes required"}` : "awaiting reviewer"}`,
+      );
+    console.log(
+      `  DRY: ${run.collaboration.consultations.filter((item) => !item.answer).length} unanswered consultation(s)`,
+    );
+  }
   if (run.evaluation) {
     const result = run.evaluation;
     console.log(
@@ -73,8 +87,9 @@ export async function main(argv: string[]): Promise<number> {
       "session",
       "step",
       "request",
+      "claim",
     ],
-    ["json", "dry-run"],
+    ["json", "dry-run", "default"],
   );
   const context = commandContext(values);
   const [namespace, action, ...rest] = positionals;
@@ -83,6 +98,11 @@ export async function main(argv: string[]): Promise<number> {
   const asJson = !!values.json;
   if (values.file && values.instructions)
     throw new Error("Choose --file or --instructions, not both");
+  if (
+    values.default &&
+    !(namespace === "workflow" && ["add", "set"].includes(action))
+  )
+    throw new Error("--default requires workflow add/set");
   if (
     (values.description || values.model || values.reasoning) &&
     !(
@@ -141,28 +161,42 @@ export async function main(argv: string[]): Promise<number> {
     ["add", "set"].includes(action)
   ) {
     arity(rest, 1);
-    const value =
+    const instructions =
       namespace === "agent" && values.instructions !== undefined
-        ? {
-            provider: "inherit",
-            description: String(values.description ?? rest[0]),
-            instructions: fs.readFileSync(
-              values.instructions === "-" ? 0 : String(values.instructions),
-              "utf8",
-            ),
-            ...(values.model ? { model: values.model } : {}),
-            ...(values.reasoning ? { reasoning: values.reasoning } : {}),
-          }
-        : loadInput();
-    await context.store.locked(() =>
+        ? fs.readFileSync(
+            values.instructions === "-" ? 0 : String(values.instructions),
+            "utf8",
+          )
+        : undefined;
+    const input = instructions === undefined ? loadInput() : undefined;
+    const value = await context.store.locked(() => {
+      const previous =
+        namespace === "agent" && action === "set"
+          ? readAutomation(data.worktree).agents[rest[0]]
+          : undefined;
+      const profile =
+        instructions === undefined
+          ? input
+          : {
+              provider: "inherit",
+              ...previous,
+              description: String(
+                values.description ?? previous?.description ?? rest[0],
+              ),
+              instructions,
+              ...(values.model ? { model: values.model } : {}),
+              ...(values.reasoning ? { reasoning: values.reasoning } : {}),
+            };
       setAutomation(
         data.worktree,
         namespace === "agent" ? "agents" : "workflows",
         rest[0],
-        value,
+        profile,
         action === "add",
-      ),
-    );
+        !!values.default,
+      );
+      return profile;
+    });
     await context.store.adopt(data.worktree);
     if (asJson) json(value);
     else console.log(`${namespace} ${action}: ${visible(rest[0])}`);
@@ -174,12 +208,27 @@ export async function main(argv: string[]): Promise<number> {
   };
   if (
     namespace === "workflow" &&
-    ["context", "pending", "event", "claim", "report", "dismiss"].includes(
-      action,
-    )
+    [
+      "context",
+      "pending",
+      "event",
+      "claim",
+      "report",
+      "dismiss",
+      "bind",
+      "inbox",
+      "consult",
+      "answer",
+      "submit",
+      "review",
+    ].includes(action)
   ) {
     const input =
-      action === "report" || action === "dismiss" || action === "event"
+      action === "report" ||
+      action === "dismiss" ||
+      action === "event" ||
+      ["bind", "consult", "answer", "submit", "review"].includes(action) ||
+      values.file
         ? loadInput()
         : {};
     const result = await callWorkflowTool(
@@ -190,6 +239,7 @@ export async function main(argv: string[]): Promise<number> {
         ...parent,
         ...(rest[0] ? { run: rest[0] } : {}),
         ...(values.step ? { step: values.step } : {}),
+        ...(values.claim ? { claim: values.claim } : {}),
       },
     );
     if (asJson || action !== "context") json(result);
@@ -239,7 +289,7 @@ export async function main(argv: string[]): Promise<number> {
   const name = rest[0];
   if (action === "run") {
     const config = configuration();
-    const workflow = name ?? "triple-review",
+    const workflow = name ?? defaultWorkflow(config),
       base = String(values.base ?? context.defaultBase);
     if (values["dry-run"]) {
       const plan = planRun(context.store, config, workflow, base);
@@ -291,7 +341,16 @@ export async function main(argv: string[]): Promise<number> {
     else {
       console.log(`Metrics: ${run.id}`);
       for (const [key, value] of Object.entries(metrics))
-        if (key !== "stages") console.log(`${key}: ${value ?? "not reported"}`);
+        if (key === "collaboration" && metrics.collaboration) {
+          const team = metrics.collaboration;
+          console.log(
+            `Reviews: ${team.accepted} accepted · ${team.submissions} submissions · latest rating ${team.latestRating ?? "not reported"}`,
+          );
+          console.log(
+            `Consultations: ${team.consultations} total · ${team.awaitingAnswers} awaiting answers`,
+          );
+        } else if (key !== "stages")
+          console.log(`${key}: ${value ?? "not reported"}`);
     }
     return 0;
   }

@@ -57,7 +57,7 @@ _rl_main() {
       return
     fi
   done
-  if (( ${#help_args} == 1 )) && [[ "$help_args[1]" == (agent|workflow|policy|repo|git|notes|session|config|step) ]]; then
+  if (( ${#help_args} == 1 )) && [[ "$help_args[1]" == (agent|workflow|policy|repo|git|notes|session|config) ]]; then
     _rl_help "${help_args[@]}"
     return
   fi
@@ -73,8 +73,7 @@ _rl_main() {
     shift
   fi
   case "$1:$2" in
-    git:commit|git:rebase|git:squash) argv=(step "$2" "${@:3}") ;;
-    git:diff|git:log|git:merge) argv=("$2" "${@:3}") ;;
+    git:merge) argv=("$2" "${@:3}") ;;
     agent:sessions) argv=(session list "${@:3}") ;;
     agent:save) argv=(session save "${@:3}") ;;
     agent:handoff) argv=(handoff "${@:3}") ;;
@@ -227,7 +226,7 @@ _rl_main() {
         --repo "$repo_root" --state-dir "$state_dir" --base-dir "$base_dir/$repo_name" \
         --default-base "$default_base" "$@"
       return ;;
-    step|merge|diff|log)
+    merge)
       command node "${${functions_source[_rl_main]}:A:h:h}/dist/cli.js" git \
         --repo "$repo_root" --state-dir "$state_dir" --base-dir "$base_dir/$repo_name" \
         --default-base "$default_base" "$@"

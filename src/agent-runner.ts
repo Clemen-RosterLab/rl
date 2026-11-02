@@ -17,6 +17,12 @@ import {
 } from "./review-policy.js";
 import type { Store } from "./store.js";
 import { agentAdapter } from "./agent-registry.js";
+import {
+  collaborationAssessment,
+  initializeCollaboration,
+  validateCollaborationState,
+  type CollaborationState,
+} from "./workflow-collaboration.js";
 
 export interface Usage {
   inputTokens: number | null;
@@ -70,6 +76,7 @@ export interface WorkflowRun {
     policy: ReviewPolicy;
     evaluation: Evaluation;
   }[];
+  collaboration?: CollaborationState;
 }
 export function captureScope(
   cwd: string,
@@ -267,6 +274,7 @@ function load(directory: string): WorkflowRun {
   if (!Object.hasOwn(raw.config.workflows, raw.workflow))
     throw new Error("Invalid saved workflow");
   const definition = raw.config.workflows[raw.workflow];
+  if (definition.collaboration) validateCollaborationState(raw.collaboration);
   const seen = new Set<string>();
   for (const stage of raw.stages) {
     if (
@@ -387,10 +395,13 @@ export function evaluation(
         currentScope(stage),
     )
     .map((stage) => ({ owner: stage.id, result: stage.result }));
+  const collaboration = collaborationAssessment(run);
+  reports.push(...collaboration.reports);
   const limitations = run.stages
     .filter((stage) => stage.status !== "completed")
     .map((stage) => `${stage.id}: ${stage.error ?? stage.status}`);
   if (run.status !== "completed") limitations.push(`Run ${run.status}`);
+  limitations.push(...collaboration.limitations);
   for (const stage of run.stages.filter(
     (stage) => stage.status === "completed" && !currentScope(stage),
   )) {
@@ -462,6 +473,24 @@ export function runMetrics(run: WorkflowRun) {
     outputTokens: total("outputTokens"),
     costUsd: total("costUsd"),
     usageCoverage: `${reported.length}/${run.stages.filter((step) => step.agent && step.attempts).length} agent stages`,
+    ...(run.collaboration
+      ? {
+          collaboration: {
+            consultations: run.collaboration.consultations.length,
+            awaitingAnswers: run.collaboration.consultations.filter(
+              (item) => !item.answer,
+            ).length,
+            submissions: run.collaboration.submissions.length,
+            accepted: run.collaboration.submissions.filter(
+              (item) => !item.supersededBy && item.review?.accepted,
+            ).length,
+            latestRating:
+              [...run.collaboration.submissions]
+                .reverse()
+                .find((item) => item.review)?.review?.rating ?? null,
+          },
+        }
+      : {}),
     stages: run.stages.map(({ id, status, attempts, durationMs, usage }) => ({
       id,
       status,
@@ -531,6 +560,7 @@ export function createRunLocked(
       durationMs: 0,
     })),
   };
+  initializeCollaboration(run);
   fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
   fs.writeFileSync(path.join(directory, "scope.json"), context, {
     mode: 0o600,

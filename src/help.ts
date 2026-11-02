@@ -162,6 +162,9 @@ const topics: Record<string, Topic> = {
   "agent set": {
     description: "Save an agent profile",
     usage: "rl agent set <name> --file <profile.json|->",
+    notes: [
+      "Use --instructions <file|-> to change instructions while preserving the profile's access, model and other settings.",
+    ],
   },
   "agent show": {
     description: "Inspect a workflow agent profile",
@@ -210,7 +213,7 @@ const topics: Record<string, Topic> = {
     notes: [
       "Creates .rl/agents.json, .rl/policies.json and .rl/agent-workflows.json.",
       "Existing configuration is never overwritten.",
-      "Roles inherit the current session by default. The preset queues a review before finishing changed work.",
+      "Adopted workspaces use built-in writer/reviewer/DRY roles immediately. Init writes editable copies of their profiles, policy and workflow.",
     ],
   },
   "workflow list": {
@@ -234,18 +237,18 @@ const topics: Record<string, Topic> = {
       "--request <UUID>     Start a queued workflow request instead of choosing a name",
     ],
     notes: [
-      "Default workflow: triple-review. RL never launches workflow agent or check processes.",
+      "Default workflow: writer-reviewer-dry. The parent spawns all three native peers in parallel and binds their handles; RL never launches agent processes.",
       "The parent claims ready steps, spawns native subagents and reports evidence. RL applies the policy; provider usage is parent-reported.",
     ],
     examples: ["rl workflow run --base origin/test --dry-run"],
   },
   "workflow add": {
     description: "Add a workflow with dependencies and spawn triggers",
-    usage: "rl workflow add <name> --file <workflow.json|->",
+    usage: "rl workflow add <name> --file <workflow.json|-> [--default]",
   },
   "workflow set": {
     description: "Save a workflow definition and trigger rules",
-    usage: "rl workflow set <name> --file <workflow.json|->",
+    usage: "rl workflow set <name> --file <workflow.json|-> [--default]",
   },
   "workflow context": {
     description: "Discover profiles, policies, workflows and trigger rules",
@@ -274,6 +277,36 @@ const topics: Record<string, Topic> = {
     description: "Dismiss an unavailable workflow with a reason",
     usage:
       "rl workflow dismiss --file <dismissal.json|-> [--agent codex|claude] [--session <UUID>]",
+  },
+  "workflow bind": {
+    description: "Bind a role to the native peer spawned by this session",
+    usage:
+      "rl workflow bind <run> --file <binding.json|-> [--agent codex|claude] [--session <UUID>]",
+  },
+  "workflow inbox": {
+    description: "Read a peer's requests, review checkpoints and ratings",
+    usage:
+      "rl workflow inbox <run> --step <step> --claim <token> [--agent codex|claude] [--session <UUID>]",
+  },
+  "workflow consult": {
+    description: "Ask an existing peer through a configured workflow route",
+    usage:
+      "rl workflow consult <run> --file <consultation.json|-> [--agent codex|claude] [--session <UUID>]",
+  },
+  "workflow answer": {
+    description: "Return reuse or duplication evidence to a requesting peer",
+    usage:
+      "rl workflow answer <run> --file <answer.json|-> [--agent codex|claude] [--session <UUID>]",
+  },
+  "workflow submit": {
+    description: "Submit writer work to the existing reviewer",
+    usage:
+      "rl workflow submit <run> --file <submission.json|-> [--agent codex|claude] [--session <UUID>]",
+  },
+  "workflow review": {
+    description: "Return a rating and evidence for a stable writer checkpoint",
+    usage:
+      "rl workflow review <run> --file <review.json|-> [--agent codex|claude] [--session <UUID>]",
   },
   "workflow status": {
     description: "Inspect a saved run",
@@ -357,32 +390,8 @@ const topics: Record<string, Topic> = {
   },
   git: {
     group: "Code and reviews",
-    description: "Inspect and integrate branch changes",
+    description: "Integrate changes across workspaces",
     usage: "rl git <command>",
-  },
-  "git diff": {
-    description: "Show workspace changes against the base",
-    usage: "rl git diff [--base <ref>] [-- <display options> [-- paths...]]",
-    examples: ["rl git diff -- --stat"],
-  },
-  "git log": {
-    description: "Show feature commits",
-    usage: "rl git log [--base <ref>] [-- <display options>]",
-    examples: ["rl git log -- --graph"],
-  },
-  "git commit": {
-    description: "Commit staged changes",
-    usage: "rl git commit -m <message> [--all] [--dry-run]",
-    notes: ["--all includes modified tracked files."],
-  },
-  "git rebase": {
-    description: "Rebase onto the base branch",
-    usage: "rl git rebase [--base <ref>] [--dry-run]",
-  },
-  "git squash": {
-    description: "Squash feature commits",
-    usage: "rl git squash -m <message> [--base <ref>] [--dry-run]",
-    notes: ["The original HEAD is retained under a printed backup ref."],
   },
   "git merge": {
     description: "Integrate into a checked-out base branch",
@@ -573,9 +582,6 @@ const topics: Record<string, Topic> = {
 };
 
 const aliases: [string[], string[]][] = [
-  [["step"], ["git"]],
-  [["diff"], ["git", "diff"]],
-  [["log"], ["git", "log"]],
   [["merge"], ["git", "merge"]],
   [["clean"], ["storage", "clean"]],
   [["summary"], ["notes", "summary"]],

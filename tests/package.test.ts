@@ -52,6 +52,7 @@ test("npm tarball ships built JavaScript and bundled runtime dependencies, with 
     "pr-workflow",
     "agent-launch",
     "mcp",
+    "workflow-collaboration",
   ])
     assert.ok(names.includes(`package/dist/${name}.js`));
   assert.ok(names.includes("package/LICENSE"));
@@ -115,7 +116,7 @@ test("offline npm install, relocation and reinstall preserve hooks, sessions and
   );
   for (const command of [
     ["switch"],
-    ["step"],
+    ["git", "merge"],
     ["merge"],
     ["agent"],
     ["handoff"],

@@ -1,12 +1,10 @@
 import path from "node:path";
-import { randomUUID } from "node:crypto";
 import {
   args,
   arity,
   canonical,
   execute,
   git,
-  gitRaw,
   locked,
   required,
 } from "./common.js";
@@ -21,19 +19,6 @@ import {
   GIT_WORKFLOW_DIRECTORY,
   GIT_WORKFLOW_LOCK,
 } from "./git-safety.js";
-const BACKUP_PREFIX = "refs/rl/backups/";
-const READ_OPTIONS = new Set([
-  "--stat",
-  "--name-only",
-  "--name-status",
-  "--numstat",
-  "--patch",
-  "--oneline",
-  "--graph",
-  "--decorate",
-  "--all",
-]);
-
 function revision(root: string, ref: string): string {
   return git(
     root,
@@ -45,167 +30,23 @@ function revision(root: string, ref: string): string {
 }
 
 export async function main(argv: string[]): Promise<number> {
-  const separator = argv.indexOf("--");
-  const trailing = separator < 0 ? [] : argv.slice(separator + 1);
   const { values, positionals } = args(
-    separator < 0 ? argv : argv.slice(0, separator),
-    [...contextOptions, "base", "message"],
-    ["all", "squash", "cleanup", "dry-run"],
+    argv,
+    [...contextOptions, "message"],
+    ["squash", "cleanup", "dry-run"],
     { message: "m" },
   );
-  const context = commandContext(values);
   const [command, ...rest] = positionals;
+  if (command !== "merge") throw new Error("Unknown Git workflow command");
+  arity(rest, 0, 1);
+  if (values.message && !values.squash)
+    throw new Error("Invalid merge options");
+  const context = commandContext(values);
   const source = resolveWorkspace(context);
-  if (command === "diff" || command === "log") {
-    arity(rest, 0);
-    if (
-      values.all ||
-      values.squash ||
-      values.cleanup ||
-      values.message ||
-      values["dry-run"]
-    )
-      throw new Error("Invalid display options");
-    const pathSeparator = trailing.indexOf("--");
-    const flags =
-      pathSeparator < 0 ? trailing : trailing.slice(0, pathSeparator);
-    const paths = pathSeparator < 0 ? [] : trailing.slice(pathSeparator + 1);
-    for (const flag of flags)
-      if (!READ_OPTIONS.has(flag) && !/^(-\d+|--max-count=\d+)$/.test(flag))
-        throw new Error(`Unsupported display option: ${flag}`);
-    const base = revision(
-      source.path,
-      String(values.base ?? context.defaultBase),
-    );
-    const range =
-      command === "diff"
-        ? git(source.path, "merge-base", base, "HEAD")
-        : `${base}..HEAD`;
-    process.stdout.write(
-      gitRaw(
-        source.path,
-        "--no-pager",
-        command,
-        "--no-ext-diff",
-        "--no-textconv",
-        ...(command === "log" ? ["--oneline"] : []),
-        ...flags,
-        range,
-        "--",
-        ...paths,
-      ),
-    );
-    return 0;
-  }
-  if (trailing.length)
-    throw new Error("Extra arguments are only supported by diff and log");
   return locked(
     path.join(context.store.root, GIT_WORKFLOW_DIRECTORY),
     GIT_WORKFLOW_LOCK,
     async () => {
-      if (command === "step") {
-        arity(rest, 1);
-        const [action] = rest;
-        if (!["commit", "rebase", "squash"].includes(action))
-          throw new Error("Usage: rl step commit|rebase|squash");
-        if (
-          values.cleanup ||
-          values.squash ||
-          (values.all && action !== "commit")
-        )
-          throw new Error("Invalid step options");
-        assertReady(source.path, action !== "commit", source.branch);
-        if (action === "commit") {
-          if (values.base) throw new Error("commit does not accept --base");
-          const commitMessage = required(values, "message");
-          if (values["dry-run"]) {
-            const changes = git(
-              source.path,
-              "diff",
-              "--name-only",
-              ...(values.all ? ["HEAD"] : ["--cached"]),
-            );
-            if (!changes) throw new Error("No changes to commit");
-            console.log(
-              `Would commit ${values.all ? "tracked" : "staged"} changes in ${source.branch}: ${commitMessage}\n${changes}`,
-            );
-            return 0;
-          }
-          console.log(
-            git(
-              source.path,
-              "commit",
-              ...(values.all ? ["--all"] : []),
-              "-m",
-              required(values, "message"),
-            ),
-          );
-          return 0;
-        }
-        if (action === "rebase" && values.message)
-          throw new Error("rebase does not accept --message");
-        const base = revision(
-          source.path,
-          String(values.base ?? context.defaultBase),
-        );
-        if (action === "rebase") {
-          if (values["dry-run"]) {
-            console.log(`Would rebase ${source.branch} onto ${base}`);
-            return 0;
-          }
-          const result = await execute(
-            ["git", "-C", source.path, "rebase", base],
-            source.path,
-          );
-          process.stdout.write(result.stdout);
-          if (result.code)
-            throw new Error(
-              `${result.stderr.trim()}\nRebase did not complete. Resolve conflicts and run git rebase --continue, or git rebase --abort in ${source.path}`,
-            );
-          return 0;
-        }
-        const message = required(values, "message");
-        const head = revision(source.path, "HEAD");
-        const baseCommit = git(source.path, "merge-base", base, head);
-        if (baseCommit === head)
-          throw new Error("No feature commits to squash");
-        if (values["dry-run"]) {
-          console.log(
-            `Would squash commits after ${baseCommit} in ${source.branch}: ${message}`,
-          );
-          return 0;
-        }
-        const tree = git(source.path, "rev-parse", `${head}^{tree}`);
-        const backup = BACKUP_PREFIX + randomUUID();
-        const squashed = git(
-          source.path,
-          "commit-tree",
-          tree,
-          "-p",
-          baseCommit,
-          "-m",
-          message,
-        );
-        git(source.path, "update-ref", backup, head);
-        // CAS leaves concurrent branch changes untouched; the worktree and index never change.
-        git(
-          source.path,
-          "update-ref",
-          "-m",
-          "rl step squash",
-          `refs/heads/${source.branch}`,
-          squashed,
-          head,
-        );
-        console.log(
-          `Squashed feature commits. Original HEAD retained at ${backup}`,
-        );
-        return 0;
-      }
-      if (command !== "merge") throw new Error("Unknown Git workflow command");
-      arity(rest, 0, 1);
-      if (values.all || values.base || (values.message && !values.squash))
-        throw new Error("Invalid merge options");
       const selected = rest[0] ?? context.defaultBase.replace(/^origin\//, "");
       const targetRecord = worktrees(context.repo).find(
         (record) => record.branch === `refs/heads/${selected}`,
