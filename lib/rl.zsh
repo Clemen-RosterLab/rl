@@ -24,6 +24,12 @@ _rl_change_directory() {
     print -rn -- "$PWD" > "$RL_SHELL_OUTPUT"
   else
     print -r -- "$PWD"
+    if [[ -t 1 && -t 2 ]]; then
+      case "${SHELL:t}" in
+        zsh|bash) print -u2 -r -- "Enable directory switching: eval \"\$(rl setup shell ${SHELL:t})\"" ;;
+        *) print -u2 'Enable directory switching with shell integration: rl help setup shell' ;;
+      esac
+    fi
   fi
 }
 
@@ -57,12 +63,12 @@ _rl_main() {
       return
     fi
   done
-  if (( ${#help_args} == 1 )) && [[ "$help_args[1]" == (agent|workflow|policy|repo|git|notes|session|config) ]]; then
+  if (( ${#help_args} == 1 )) && [[ "$help_args[1]" == (agent|workflow|policy|repo|git|notes) ]]; then
     _rl_help "${help_args[@]}"
     return
   fi
 
-  # Canonical command families; older spellings remain compatibility aliases.
+  # Translate public command families to their internal handlers.
   # Preserve a leading repository selector while normalizing the public command.
   local -a routing_prefix=()
   if [[ "$1" == --repo ]]; then
@@ -72,7 +78,23 @@ _rl_main() {
     routing_prefix=("$1")
     shift
   fi
+  case "$1" in
+    new|open|instances|merge|clean|summary|handoff|mcp|session|context|progress|config|adopt|init)
+      print -u2 -r -- "Unknown command: $1"
+      print -u2 'Run rl help for available commands.'
+      return 1 ;;
+    status)
+      if (( ${argv[(Ie)--all]} || ${argv[(Ie)--list]} )); then
+        print -u2 'Use rl list for workspace overviews.'
+        return 1
+      fi ;;
+  esac
   case "$1:$2" in
+    setup:dependencies|setup:install)
+      local setup_module=dependencies
+      [[ "$2" == install ]] && setup_module=install
+      command node "${${functions_source[_rl_main]}:A:h:h}/dist/$setup_module.js" "${@:3}"
+      return ;;
     git:merge) argv=("$2" "${@:3}") ;;
     agent:sessions) argv=(session list "${@:3}") ;;
     agent:save) argv=(session save "${@:3}") ;;
@@ -81,9 +103,10 @@ _rl_main() {
     storage:clean) argv=(clean "${@:3}") ;;
     setup:init|setup:show) argv=(config "$2" "${@:3}") ;;
     setup:adopt) argv=(adopt "${@:3}") ;;
+    setup:mcp) argv=(mcp-setup "${@:3}") ;;
     setup:run) argv=(setup "${@:3}") ;;
     setup:shell)
-      command "${${functions_source[_rl_main]}:A:h:h}/bin/rl" init "${@:3}"
+      command "${${functions_source[_rl_main]}:A:h:h}/bin/rl" setup shell "${@:3}"
       return ;;
     notes:summary) argv=(summary "${@:3}") ;;
     notes:show|notes:path|notes:set|notes:append)
@@ -209,13 +232,19 @@ _rl_main() {
       --default-base "$default_base" "$@"
     return
   fi
-  if [[ "$command" == pr && ( "$2" == checks || "$2" == checkout ) ]]; then
+  if [[ "$command" == pr && "$2" == checkout ]]; then
     command node "${${functions_source[_rl_main]}:A:h:h}/dist/cli.js" pr \
       --repo "$repo_root" --state-dir "$state_dir" --base-dir "$base_dir/$repo_name" \
       --default-base "$default_base" "$@"
     return
   fi
   case "$command" in
+    mcp-setup)
+      shift
+      command node "${${functions_source[_rl_main]}:A:h:h}/dist/cli.js" mcp-setup \
+        --repo "$repo_root" --state-dir "$state_dir" --base-dir "$base_dir/$repo_name" \
+        --default-base "$default_base" "$@"
+      return ;;
     storage|clean)
       command node "${${functions_source[_rl_main]}:A:h:h}/dist/cli.js" storage \
         --repo "$repo_root" --state-dir "$state_dir" --base-dir "$base_dir/$repo_name" \
@@ -260,13 +289,13 @@ _rl_main() {
       command node "${${functions_source[_rl_main]}:A:h:h}/dist/cli.js" summary \
         --repo "$repo_root" --state-dir "$state_dir" --default-base "$default_base" "$@"
       return ;;
-    adopt|doctor|status|instances|resume|session|context|progress|pr)
+    adopt|doctor|status|resume|session|context|progress|pr)
       _rl_state "$@"
       return ;;
   esac
 
   case "$command" in
-    switch|new|open|continue)
+    switch|continue)
       if [[ "$command" == switch && "$2" == - ]]; then
         [[ -n "${RL_PREVIOUS_WORKSPACE:-}" ]] || { print -u2 'No previous workspace in this shell'; return 1; }
         argv[2]="$RL_PREVIOUS_WORKSPACE"

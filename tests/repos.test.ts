@@ -24,7 +24,7 @@ function fixture(t: TestContext) {
     w,
     other,
     overview: (extra: string[] = [], ok = true) =>
-      JSON.parse(w.rl(["status", "--all", "--json", ...extra], { ok }).stdout),
+      JSON.parse(w.rl(["list", "--all", "--json", ...extra], { ok }).stdout),
   };
 }
 test("unconfigured repository detection finds the main checkout from subdirectories and linked worktrees", (t) => {
@@ -56,12 +56,12 @@ test("registered repositories still resolve outside Git without a configured leg
 test("repository routing isolates identical branches and prioritizes current checkout over default", (t) => {
   const { w, other } = fixture(t);
   for (const name of ["alpha", "beta"])
-    w.rl(["--repo", name, "new", "same-task"]);
+    w.rl(["--repo", name, "switch", "-c", "same-task"]);
   const alpha = path.join(w.root, "worktrees/example/same-task"),
     beta = path.join(w.root, "worktrees/beta/same-task"),
     [sidA, sidB] = [randomUUID(), randomUUID()];
-  w.rl(["session", "add", "codex", sidA], { cwd: alpha });
-  w.rl(["session", "add", "codex", sidB], { cwd: beta });
+  w.rl(["agent", "save", "codex", sidA], { cwd: alpha });
+  w.rl(["agent", "save", "codex", sidB], { cwd: beta });
   w.rl(["repo", "use", "beta"]);
   w.rl(["resume", "codex"], { cwd: alpha });
   w.rl(["resume", "codex"], { cwd: beta });
@@ -71,9 +71,9 @@ test("repository routing isolates identical branches and prioritizes current che
   );
   assert.deepEqual(
     new Set(
-      JSON.parse(w.rl(["instances"]).stdout).map(
-        (r: { repository: string }) => r.repository,
-      ),
+      JSON.parse(
+        w.rl(["list", "--include-deleted", "--json"]).stdout,
+      ).instances.map((r: { repository: string }) => r.repository),
     ),
     new Set([other]),
   );
@@ -93,7 +93,7 @@ test("registry validation and unregister preserve state and explicit hook identi
   );
   w.rl(["repo", "add", "duplicate", w.repo], { ok: false });
   w.rl(["repo", "add", "../escape", other], { ok: false });
-  w.rl(["--repo", "missing", "new", "task"], { ok: false });
+  w.rl(["--repo", "missing", "switch", "-c", "task"], { ok: false });
   const before = w.status();
   w.rl(["repo", "remove", "alpha"]);
   const sid = randomUUID();
@@ -134,7 +134,7 @@ test("overview reports staged, unstaged, untracked and diverged upstream counts"
       .gitStatus,
     s,
   );
-  const table = w.rl(["status", "--all"]).stdout;
+  const table = w.rl(["list", "--all"]).stdout;
   assert.match(table, /1S\/1M\/1\?/);
   assert.match(table, /\+1\/-1/);
 });
@@ -158,10 +158,10 @@ test("overview exposes detached, switched, missing and archived worktrees", (t) 
   assert.equal(row().gitStatus.branch, "(detached)");
   assert.equal(row().gitStatus.branchChanged, true);
   w.git(w.a, "checkout", "-q", "-b", "switched");
-  assert.match(w.rl(["status", "--all"]).stdout, /switched \[changed\]/);
+  assert.match(w.rl(["list", "--all"]).stdout, /switched \[changed\]/);
   w.git(w.repo, "worktree", "remove", "--force", w.a);
   assert.equal(row().gitStatus.availability, "missing");
-  w.rl(["--repo", "beta", "new", "deleted-task"]);
+  w.rl(["--repo", "beta", "switch", "-c", "deleted-task"]);
   w.rl(["--repo", "beta", "delete", "deleted-task"]);
   assert.ok(
     !overview().instances.some((r: { id: string }) => r.id === "deleted-task"),
@@ -199,19 +199,17 @@ test("rename source with status-like filename is not counted as untracked", (t) 
 });
 test("selected overview and corrupt registry fail closed", (t) => {
   const { w, other } = fixture(t);
-  const report = JSON.parse(
-    w.rl(["--repo", "alpha", "status", "--list", "--json"]).stdout,
-  );
+  const report = JSON.parse(w.rl(["--repo", "alpha", "list", "--json"]).stdout);
   assert.deepEqual(
     new Set(
       report.instances.map((r: { repositoryName: string }) => r.repositoryName),
     ),
     new Set(["alpha"]),
   );
-  w.rl(["--repo", "alpha", "status", "--all"], { ok: false });
+  w.rl(["--repo", "alpha", "list", "--all"], { ok: false });
   const file = path.join(w.state, "repositories.json");
   write(file, "{broken");
-  w.rl(["status", "--all"], { ok: false });
+  w.rl(["list", "--all"], { ok: false });
   w.rl(["repo", "add", "new", other], { ok: false });
   assert.equal(read(file), "{broken");
 });
@@ -238,15 +236,12 @@ test("environment selection and linked-worktree registration resolve the correct
   const { w } = fixture(t);
   w.env.RL_REPO = "beta";
   assert.deepEqual(
-    JSON.parse(w.rl(["status", "--list", "--json"], { cwd: w.a }).stdout)
-      .instances,
+    JSON.parse(w.rl(["list", "--json"], { cwd: w.a }).stdout).instances,
     [],
   );
   assert.equal(
-    JSON.parse(
-      w.rl(["--repo", "alpha", "status", "--list", "--json"], { cwd: w.a })
-        .stdout,
-    ).instances.length,
+    JSON.parse(w.rl(["--repo", "alpha", "list", "--json"], { cwd: w.a }).stdout)
+      .instances.length,
     2,
   );
   delete w.env.RL_REPO;

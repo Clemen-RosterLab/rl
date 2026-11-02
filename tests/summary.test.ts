@@ -5,11 +5,11 @@ import path from "node:path";
 import { Workspace, read, write, readJson } from "./helpers.js";
 test("summary includes scoped Git evidence and notes without dirtying checkout", (t) => {
   const w = new Workspace(t);
-  w.rl(["context", "set", "-"], {
+  w.rl(["notes", "set", "context", "-"], {
     cwd: w.a,
     input: "# Domain\nFixed shifts cannot overlap.\n",
   });
-  w.rl(["progress", "set", "-"], {
+  w.rl(["notes", "set", "progress", "-"], {
     cwd: w.a,
     input:
       "# Progress\n## Completed\nAdded parser.\n## Remaining\nFinish UI.\n## Validation\nParser tests pass.\n",
@@ -26,7 +26,7 @@ test("summary includes scoped Git evidence and notes without dirtying checkout",
   const before = w.git(w.a, "status", "--porcelain"),
     sub = path.join(w.a, "nested");
   fs.mkdirSync(sub);
-  const output = w.rl(["summary"], { cwd: sub }).stdout.trim();
+  const output = w.rl(["notes", "summary"], { cwd: sub }).stdout.trim();
   assert.equal(path.dirname(output), w.status().stateDirectory);
   const text = read(output);
   for (const expected of [
@@ -48,42 +48,45 @@ test("summary stdout, custom destinations, overwrite and source-document protect
   const w = new Workspace(t),
     state = w.status().stateDirectory;
   assert.match(
-    w.rl(["summary", "--stdout"], { cwd: w.a }).stdout,
+    w.rl(["notes", "summary", "--stdout"], { cwd: w.a }).stdout,
     /No notes recorded/,
   );
   assert.ok(!fs.existsSync(path.join(state, "summary.md")));
-  w.rl(["summary", "-o", "report.md"], { cwd: w.a });
+  w.rl(["notes", "summary", "-o", "report.md"], { cwd: w.a });
   const target = path.join(w.a, "report.md");
   write(target, "Keep this existing document");
-  w.rl(["summary", "-o", "report.md"], { cwd: w.a, ok: false });
+  w.rl(["notes", "summary", "-o", "report.md"], { cwd: w.a, ok: false });
   assert.equal(read(target), "Keep this existing document");
-  w.rl(["summary", "-o", "report.md", "--force"], { cwd: w.a });
+  w.rl(["notes", "summary", "-o", "report.md", "--force"], { cwd: w.a });
   assert.match(read(target), /^# RL worktree summary/);
   const source = path.join(state, "context.md"),
     before = read(source);
-  w.rl(["summary", "-o", source, "--force"], { cwd: w.a, ok: false });
+  w.rl(["notes", "summary", "-o", source, "--force"], { cwd: w.a, ok: false });
   assert.equal(read(source), before);
   const link = path.join(w.a, "link.md");
   fs.symlinkSync(target, link);
-  w.rl(["summary", "-o", link, "--force"], { cwd: w.a, ok: false });
+  w.rl(["notes", "summary", "-o", link, "--force"], { cwd: w.a, ok: false });
 });
 test("summary comparison base scopes commits and failures preserve previous export", (t) => {
   const w = new Workspace(t);
   w.git(w.a, "commit", "-q", "--allow-empty", "-m", "Earlier implementation");
   w.git(w.a, "branch", "milestone");
   w.git(w.a, "commit", "-q", "--allow-empty", "-m", "After milestone");
-  const text = w.rl(["summary", "--stdout", "--base", "milestone"], {
+  const text = w.rl(["notes", "summary", "--stdout", "--base", "milestone"], {
     cwd: w.a,
   }).stdout;
   assert.match(text, /After milestone/);
   assert.doesNotMatch(text, /Earlier implementation/);
-  const target = w.rl(["summary"], { cwd: w.a }).stdout.trim(),
+  const target = w.rl(["notes", "summary"], { cwd: w.a }).stdout.trim(),
     before = read(target);
-  w.rl(["summary", "--base", "does-not-exist"], { cwd: w.a, ok: false });
+  w.rl(["notes", "summary", "--base", "does-not-exist"], {
+    cwd: w.a,
+    ok: false,
+  });
   assert.equal(read(target), before);
   w.env.RL_DEFAULT_BASE = "unavailable-default";
   assert.match(
-    w.rl(["summary", "--stdout"], { cwd: w.a }).stdout,
+    w.rl(["notes", "summary", "--stdout"], { cwd: w.a }).stdout,
     /Committed work was omitted/,
   );
 });
@@ -99,7 +102,7 @@ test("summary retains cached PR and survives deleting its worktree", (t) => {
     syncedAt: "2026-10-01T00:00:00Z",
   };
   write(file, JSON.stringify(data));
-  const target = w.rl(["summary"], { cwd: root }).stdout.trim();
+  const target = w.rl(["notes", "summary"], { cwd: root }).stdout.trim();
   assert.match(read(target), /https:\/\/github.com\/example\/repo\/pull\/7/);
   w.rl(["delete", "task"]);
   assert.ok(fs.existsSync(target));
@@ -107,12 +110,12 @@ test("summary retains cached PR and survives deleting its worktree", (t) => {
 test("summary routes registered repositories and refuses changed branches", (t) => {
   const w = new Workspace(t);
   w.rl(["repo", "add", "example", w.repo, "--base", "develop"]);
-  const text = w.rl(["summary", "--stdout"], { cwd: w.a }).stdout;
+  const text = w.rl(["notes", "summary", "--stdout"], { cwd: w.a }).stdout;
   assert.match(text, /feature\/a/);
   assert.doesNotMatch(text, /feature\/b/);
   w.git(w.a, "checkout", "-q", "-b", "different");
-  w.rl(["summary"], { cwd: w.a, ok: false });
-  w.rl(["summary"], { ok: false });
+  w.rl(["notes", "summary"], { cwd: w.a, ok: false });
+  w.rl(["notes", "summary"], { ok: false });
 });
 
 test("summary uses the PR target over saved base and updates after PR retargeting", (t) => {
@@ -131,25 +134,26 @@ test("summary uses the PR target over saved base and updates after PR retargetin
     state: "OPEN",
   };
   write(file, JSON.stringify(data));
-  const report = w.rl(["summary", "--stdout"], { cwd: w.a }).stdout;
+  const report = w.rl(["notes", "summary", "--stdout"], { cwd: w.a }).stdout;
   assert.match(report, /Comparison reference: .*origin\/release\/next/);
   assert.match(report, /Feature after target/);
   assert.doesNotMatch(report, /Already on PR target/);
   data.pr.baseRefName = "develop";
   write(file, JSON.stringify(data));
   assert.match(
-    w.rl(["summary", "--stdout"], { cwd: w.a }).stdout,
+    w.rl(["notes", "summary", "--stdout"], { cwd: w.a }).stdout,
     /Already on PR target/,
   );
   data.pr.baseRefName = "missing-target";
   write(file, JSON.stringify(data));
   assert.match(
-    w.rl(["summary", "--stdout"], { cwd: w.a, ok: false }).stderr,
+    w.rl(["notes", "summary", "--stdout"], { cwd: w.a, ok: false }).stderr,
     /PR target branch is unavailable locally: missing-target/,
   );
   // --base is still an explicit one-off report override.
   assert.match(
-    w.rl(["summary", "--stdout", "--base", "develop"], { cwd: w.a }).stdout,
+    w.rl(["notes", "summary", "--stdout", "--base", "develop"], { cwd: w.a })
+      .stdout,
     /Already on PR target/,
   );
 });

@@ -158,7 +158,7 @@ export async function doctor(
       );
       if (item.missingEvents.length)
         console.log(
-          `  Missing hooks: ${item.missingEvents.join(", ")}. Run rl adopt.`,
+          `  Missing hooks: ${item.missingEvents.join(", ")}. Run rl setup adopt.`,
         );
       if (item.configError)
         console.log(`  Configuration error: ${item.configError}`);

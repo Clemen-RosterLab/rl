@@ -61,7 +61,6 @@ test("help is specific and works without valid configuration or repository selec
   assert.match(workflow, /score\s+Rescore/);
   assert.doesNotMatch(workflow, /--provider|--policy|--base/);
   assert.match(w.rl(["workflow", "run", "--help"]).stdout, /--base/);
-  assert.match(w.rl(["init", "--help"]).stdout, /rl setup shell/);
   assert.match(w.rl(["setup", "shell", "--help"]).stdout, /rl setup shell/);
   assert.equal(read(file), before);
   assert.ok(!fs.existsSync(w.log));
@@ -111,6 +110,51 @@ test("Git help exposes only merge and removed wrappers are rejected", (t) => {
     w.rl(command, { cwd: w.a, ok: false });
 });
 
+test("removed commands and compatibility aliases are unavailable", (t) => {
+  const w = new Workspace(t);
+  const before = w.git(w.a, "rev-parse", "HEAD");
+  const removed = [
+    "new",
+    "open",
+    "instances",
+    "merge",
+    "clean",
+    "summary",
+    "handoff",
+    "mcp",
+    "session",
+    "context",
+    "progress",
+    "config",
+    "adopt",
+    "init",
+  ];
+  for (const name of removed) {
+    assert.match(
+      w.rl([name], { cwd: w.a, ok: false }).stderr,
+      /Unknown command/,
+    );
+    assert.match(
+      w.rl(["help", name], { ok: false }).stderr,
+      /Unknown help topic/,
+    );
+  }
+  for (const option of ["--list", "--all"])
+    assert.match(
+      w.rl(["status", option], { cwd: w.a, ok: false }).stderr,
+      /Use rl list/,
+    );
+  w.stub(
+    "gh",
+    "require('node:fs').writeFileSync(process.env.AGENT_LOG, 'unexpected gh call');process.exit(99)",
+  );
+  w.rl(["pr", "checks"], { cwd: w.a, ok: false });
+  w.rl(["pr", "checks", "--help"], { ok: false });
+  assert.doesNotMatch(w.rl(["help", "pr"]).stdout, /^  checks\s/m);
+  assert.ok(!fs.existsSync(w.log));
+  assert.equal(w.git(w.a, "rev-parse", "HEAD"), before);
+});
+
 test("canonical merge, notes and agent commands preserve behavior", (t) => {
   const w = new Workspace(t);
   write(path.join(w.a, "feature.txt"), "change");
@@ -124,17 +168,13 @@ test("canonical merge, notes and agent commands preserve behavior", (t) => {
     cwd: w.a,
     input: "Saved milestone",
   });
-  assert.equal(
+  assert.match(
     w.rl(["notes", "show", "progress"], { cwd: w.a }).stdout,
-    w.rl(["progress", "show"], { cwd: w.a }).stdout,
+    /Saved milestone/,
   );
   assert.equal(
     w.rl(["notes", "show"], { cwd: w.a }).stdout,
-    w.rl(["context", "show"], { cwd: w.a }).stdout,
-  );
-  assert.equal(
-    w.rl(["notes", "path", "progress"], { cwd: w.a }).stdout,
-    w.rl(["progress", "path"], { cwd: w.a }).stdout,
+    w.rl(["notes", "show", "context"], { cwd: w.a }).stdout,
   );
   assert.match(
     w.rl(["notes", "summary", "--stdout"], { cwd: w.a }).stdout,
@@ -178,14 +218,14 @@ test("setup, cleanup and repository selectors work through the grouped commands"
   w.rl(["setup", "init"], { cwd: w.a });
   assert.deepEqual(
     JSON.parse(w.rl(["setup", "show"], { cwd: w.a }).stdout),
-    JSON.parse(w.rl(["config", "show"], { cwd: w.a }).stdout),
+    readJson(path.join(w.repo, ".rl/workflows.json")),
   );
   w.rl(["setup", "run", "--dry-run"], { cwd: w.a });
-  for (const shell of ["zsh", "bash"])
-    assert.equal(
-      w.rl(["setup", "shell", shell]).stdout,
-      w.rl(["init", shell]).stdout,
-    );
+  assert.match(
+    w.rl(["setup", "shell", "zsh"]).stdout,
+    /source .*shell\/rl.zsh/,
+  );
+  assert.match(w.rl(["setup", "shell", "bash"]).stdout, /rl\(\)/);
   fs.mkdirSync(path.join(w.a, ".rl"));
   write(
     path.join(w.a, ".rl/workflows.json"),
@@ -203,16 +243,12 @@ test("setup, cleanup and repository selectors work through the grouped commands"
   for (const prefix of [["--repo", "local"], ["--repo=local"]])
     assert.equal(
       w.rl([...prefix, "notes", "show"], { cwd: w.a }).stdout,
-      w.rl(["context", "show"], { cwd: w.a }).stdout,
+      w.rl(["notes", "show", "context"], { cwd: w.a }).stdout,
     );
   const all = JSON.parse(
     w.rl(["list", "--all", "--json"], { cwd: w.a }).stdout,
   );
   assert.ok(all.instances.length >= 2);
-  assert.deepEqual(
-    all,
-    JSON.parse(w.rl(["status", "--all", "--json"], { cwd: w.a }).stdout),
-  );
   assert.ok(
     readJson(path.join(w.a, ".rl/workflows.json")).clean.includes("generated"),
   );

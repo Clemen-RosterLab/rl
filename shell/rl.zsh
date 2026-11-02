@@ -1,4 +1,4 @@
-# Load with: eval "$(command rl init zsh)"
+# Load with: eval "$(command rl setup shell zsh)"
 rl() {
   local RL_INTERNAL_SHELL=1
   if [[ "$1" == init || "$1" == --version || "$1" == -V || "$1" == __hook ]]; then

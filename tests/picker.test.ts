@@ -37,7 +37,7 @@ test("offline pickers mark cached PR snapshots stale and do not invent absence",
   for (const command of [[], ["delete"]]) {
     w.rl(command);
     const captured = readJson(file);
-    assert.equal(captured.rows.length, 5);
+    assert.equal(captured.rows.length, command.length ? 5 : 7);
     assert.ok(captured.args.includes("--ansi"));
     for (const [state, code] of Object.entries({
       merged: 35,
@@ -122,7 +122,7 @@ test("new --base persists comparison reference for future picker invocations", (
   w.command(["git", "init", "--bare", "-q", remote]);
   w.git(w.repo, "remote", "add", "origin", remote);
   w.git(w.repo, "push", "-q", "origin", "develop");
-  w.rl(["new", "custom-created", "--base", "develop"]);
+  w.rl(["switch", "-c", "custom-created", "--base", "develop"]);
   assert.equal(
     w.status(path.join(w.root, "worktrees/example/custom-created")).baseBranch,
     "develop",
@@ -205,7 +205,9 @@ test("pickers sort by last access, retain order when filtering, and do not count
   w.git(w.repo, "worktree", "add", "-q", "-b", "unregistered", unknown);
   const captured = capture(w);
   const names = () =>
-    readJson(captured).rows.map((row: string) => row.split("\t")[0]);
+    readJson(captured)
+      .rows.map((row: string) => row.split("\t")[0])
+      .filter((name: string) => !["workspace A", "workspace B"].includes(name));
   for (const args of [[], ["delete"]]) {
     w.rl(args);
     assert.deepEqual(names(), ["z-recent", "a-older", "unregistered"]);
@@ -213,11 +215,24 @@ test("pickers sort by last access, retain order when filtering, and do not count
     assert.ok(
       readJson(captured).args.some((arg: string) => /LAST ACCESSED$/.test(arg)),
     );
-    assert.match(readJson(captured).rows[0], /\d+d ago$/);
-    assert.match(readJson(captured).rows[2], /—$/);
+    assert.match(
+      readJson(captured).rows.find((row: string) =>
+        row.startsWith("z-recent\t"),
+      ),
+      /\d+d ago$/,
+    );
+    assert.match(
+      readJson(captured).rows.find((row: string) =>
+        row.startsWith("unregistered\t"),
+      ),
+      /—$/,
+    );
   }
   const before = w.status(older).lastAccessedAt;
-  w.rl(["context", "append", "-"], { cwd: older, input: "metadata edit" });
+  w.rl(["notes", "append", "context", "-"], {
+    cwd: older,
+    input: "metadata edit",
+  });
   w.rl([]);
   assert.equal(w.status(older).lastAccessedAt, before);
   assert.deepEqual(names(), ["z-recent", "a-older", "unregistered"]);
@@ -255,6 +270,7 @@ test("legacy instances use session history then creation time, not metadata edit
   }
   const file = capture(w);
   w.rl([]);
-  assert.ok(readJson(file).rows[0].startsWith("active\t"));
+  const names = readJson(file).rows.map((row: string) => row.split("\t")[0]);
+  assert.ok(names.indexOf("active") < names.indexOf("old"));
   assert.equal(w.status(active).lastAccessedAt, undefined);
 });

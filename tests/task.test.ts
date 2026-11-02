@@ -26,7 +26,7 @@ test("pause saves the current Codex session and durable handoff together without
     id = randomUUID();
   w.env.CODEX_THREAD_ID = id;
   const head = w.git(w.a, "rev-parse", "HEAD");
-  const progress = w.rl(["progress", "show"], { cwd: w.a }).stdout;
+  const progress = w.rl(["notes", "show", "progress"], { cwd: w.a }).stdout;
   const nested = path.join(w.a, "nested");
   fs.mkdirSync(nested);
   const result = w.rl(
@@ -55,11 +55,17 @@ test("pause saves the current Codex session and durable handoff together without
   assert.equal(status.sessions.codex[0].lastUsedAt, handoff.savedAt);
   assert.equal(w.git(w.a, "rev-parse", "HEAD"), head);
   assert.equal(w.git(w.a, "status", "--porcelain"), "");
-  assert.equal(w.rl(["progress", "show"], { cwd: w.a }).stdout, progress);
+  assert.equal(
+    w.rl(["notes", "show", "progress"], { cwd: w.a }).stdout,
+    progress,
+  );
   const injected = w.hook("codex", id).stdout;
   assert.match(injected, /Login form task/);
   assert.match(injected, /rl_task_pause/);
-  assert.match(w.rl(["handoff"], { cwd: w.a }).stdout, /Add the error states/);
+  assert.match(
+    w.rl(["agent", "handoff"], { cwd: w.a }).stdout,
+    /Add the error states/,
+  );
   assert.match(w.rl(["list"], { cwd: w.a }).stdout, /paused/);
 });
 
@@ -67,7 +73,7 @@ test("continue picks the latest paused task and resumes its pinned conversation 
   const w = new Workspace(t);
   const a = pause(w),
     b = pause(w, w.b, { summary: "Billing task" });
-  w.rl(["session", "add", "codex", randomUUID()], { cwd: w.b });
+  w.rl(["agent", "save", "codex", randomUUID()], { cwd: w.b });
   w.rl(["continue"], { cwd: w.repo });
   const call = w.calls()[0];
   assert.equal(call.cwd, w.b);
@@ -259,7 +265,7 @@ test("MCP pause saves the handoff visible in status and exports a bounded mutati
       { jsonrpc: "2.0", id: 4, method: "tools/list" },
     ];
     return w
-      .rl(["mcp"], {
+      .rl(["agent", "mcp"], {
         cwd,
         input: messages.map((item) => JSON.stringify(item)).join("\n") + "\n",
       })
@@ -303,7 +309,7 @@ test("continue switches both zsh and bash to the saved workspace without launchi
   const w = new Workspace(t);
   pause(w);
   for (const shell of ["zsh", "bash"]) {
-    const script = `eval "$(${JSON.stringify(CLI)} init ${shell})"\nrl continue --no-agent\n[[ "$PWD" == "$EXPECTED_WORKSPACE" ]]\n`;
+    const script = `eval "$(${JSON.stringify(CLI)} setup shell ${shell})"\nrl continue --no-agent\n[[ "$PWD" == "$EXPECTED_WORKSPACE" ]]\n`;
     w.env.EXPECTED_WORKSPACE = w.a;
     w.command(
       [
@@ -351,7 +357,7 @@ test("continue follows repository routing and never chooses another repository's
   w.command(["git", "init", "-q", "-b", "main", other]);
   w.git(other, "commit", "-q", "--allow-empty", "-m", "Initial");
   w.rl(["repo", "add", "beta", other]);
-  w.rl(["--repo", "beta", "new", "other-task", "--no-fetch"]);
+  w.rl(["--repo", "beta", "switch", "-c", "other-task", "--no-fetch"]);
   const root = path.join(w.root, "worktrees", "beta", "other-task");
   const second = pause(w, root);
   w.rl(["--repo", "alpha", "continue"], { cwd: other });

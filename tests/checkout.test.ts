@@ -206,7 +206,7 @@ rl checkout missing && exit 19
 
 test("repository status explains selection, current workspace, base and scoped session counts", (t) => {
   const { w, other } = fixture(t);
-  w.rl(["session", "add", "claude", "9d904862-9219-4a17-a080-297f1c3240b2"], {
+  w.rl(["agent", "save", "claude", "9d904862-9219-4a17-a080-297f1c3240b2"], {
     cwd: w.a,
   });
   write(path.join(w.a, "dirty.txt"), "change");

@@ -78,7 +78,7 @@ for (const agent of ["codex", "claude"]) {
     const w = new Workspace(t),
       sid = randomUUID();
     w.hook(agent, sid);
-    w.rl(["progress", "append", "-"], {
+    w.rl(["notes", "append", "progress", "-"], {
       cwd: w.a,
       input: "Next: finish the integration",
     });
@@ -134,7 +134,7 @@ test("doctor distinguishes installed hooks, observed events, stale activity, and
     w.rl(["doctor", "codex", "--json"], { cwd: w.a, ok: false }).stdout,
   );
   assert.deepEqual(report.agents[0].missingEvents, ["Stop"]);
-  w.rl(["adopt"], { cwd: w.a });
+  w.rl(["setup", "adopt"], { cwd: w.a });
   assert.equal(
     JSON.parse(w.rl(["doctor", "codex", "--json"], { cwd: w.a }).stdout)
       .agents[0].installed,
@@ -198,10 +198,13 @@ test("late Stop events do not change which session resumes, and missing CLIs are
 test("edits beyond the context excerpt still refresh the next prompt", (t) => {
   const w = new Workspace(t),
     sid = randomUUID();
-  w.rl(["context", "set", "-"], { cwd: w.a, input: "x".repeat(13000) });
+  w.rl(["notes", "set", "context", "-"], {
+    cwd: w.a,
+    input: "x".repeat(13000),
+  });
   w.hook("codex", sid);
   assert.equal(w.hook("codex", sid, { event: "UserPromptSubmit" }).stdout, "");
-  w.rl(["context", "append", "-"], {
+  w.rl(["notes", "append", "context", "-"], {
     cwd: w.a,
     input: "New decision beyond excerpt",
   });
@@ -216,7 +219,7 @@ test("manual session registration respects ownership established by stop-only ob
     sid = randomUUID();
   w.hook("claude", sid, { event: "Stop" });
   assert.deepEqual(w.status().sessions.claude, []);
-  w.rl(["session", "add", "claude", sid], { cwd: w.b, ok: false });
+  w.rl(["agent", "save", "claude", sid], { cwd: w.b, ok: false });
   assert.deepEqual(w.status(w.b).sessions.claude, []);
 });
 
@@ -227,7 +230,7 @@ test("extended hooks are opt-in and preserve notification activity and session o
     readJson(path.join(w.a, ".codex/hooks.json")).hooks.Interrupt,
     undefined,
   );
-  w.rl(["adopt", "--extended-hooks"], { cwd: w.a });
+  w.rl(["setup", "adopt", "--extended-hooks"], { cwd: w.a });
   assert.equal(
     readJson(path.join(w.a, ".codex/hooks.json")).hooks.Interrupt[0].hooks[0]
       .timeout,

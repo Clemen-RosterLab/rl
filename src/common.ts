@@ -6,6 +6,7 @@ import { spawnSync, spawn } from "node:child_process";
 import { parseArgs } from "node:util";
 import lockfile from "proper-lockfile";
 import { readJsonObject } from "./json.js";
+import { executableError } from "./dependencies.js";
 
 export const now = (): string => new Date().toISOString();
 export const message = (error: unknown): string =>
@@ -62,7 +63,7 @@ export function run(argv: string[], cwd: string, raw = false): string {
     env: argv[0] === "git" ? gitEnv() : process.env,
     maxBuffer: 32 * 1024 * 1024,
   });
-  if (result.error) throw result.error;
+  if (result.error) throw executableError(result.error, argv[0], cwd);
   if (result.status !== 0)
     throw new Error(
       result.stderr.trim() || `Command failed: ${argv.join(" ")}`,
@@ -151,7 +152,7 @@ export async function execute(
     };
     child.on("error", (error) => {
       cleanup();
-      reject(error);
+      reject(executableError(error, argv[0], cwd));
     });
     child.on("close", (code, signal) => {
       cleanup();

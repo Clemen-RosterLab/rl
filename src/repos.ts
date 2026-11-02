@@ -285,7 +285,15 @@ class Registry {
               "Choose either --alias <name> or the legacy <alias> <path> form",
             );
           const target = rest.length === 3 ? rest[2] : (rest[1] ?? ".");
-          const root = canonical(worktrees(expandHome(target))[0].worktree);
+          const directoryPath = path.resolve(expandHome(target));
+          if (
+            !fs.existsSync(directoryPath) ||
+            !fs.statSync(directoryPath).isDirectory()
+          )
+            throw new Error(
+              `Repository directory does not exist: ${directoryPath}. Use 'rl repo add .' for the current repository, with --alias <name> to name it.`,
+            );
+          const root = canonical(worktrees(directoryPath)[0].worktree);
           name = String(
             values.alias ?? (rest.length === 3 ? name : repositoryName(root)),
           );

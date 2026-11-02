@@ -9,7 +9,7 @@ export function currentSessionId(agent: Agent, explicit?: unknown): string {
   const id = process.env.CODEX_THREAD_ID ?? process.env.CODEX_SESSION_ID;
   if (!id)
     throw new Error(
-      "No current Codex session ID. Run 'rl session save codex' inside Codex, or supply the full UUID: rl session save codex <UUID>",
+      "No current Codex session ID. Run 'rl agent save codex' inside Codex, or supply the full UUID: rl agent save codex <UUID>",
     );
   return sessionId(id);
 }

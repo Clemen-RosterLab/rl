@@ -63,7 +63,7 @@ for (const agent of ["codex", "claude"]) {
 
 test("handoff includes saved shared notes without inventing conversations", (t) => {
   const w = new Workspace(t);
-  w.rl(["progress", "append", "-"], {
+  w.rl(["notes", "append", "progress", "-"], {
     cwd: w.a,
     input: "Next: run integration tests.",
   });
@@ -91,7 +91,9 @@ test("handoff includes saved shared notes without inventing conversations", (t) 
 
 test("handoff output refuses existing files and state documents", (t) => {
   const w = new Workspace(t);
-  const progress = w.rl(["progress", "path"], { cwd: w.a }).stdout.trim();
+  const progress = w
+    .rl(["notes", "path", "progress"], { cwd: w.a })
+    .stdout.trim();
   const before = read(progress);
   const result = w.command(
     [

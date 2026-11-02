@@ -280,7 +280,9 @@ export class Store {
           );
         return [file, data];
       }
-    throw new Error("No RL instance for this worktree. Run 'rl adopt' first");
+    throw new Error(
+      "No RL instance for this worktree. Run 'rl setup adopt' first",
+    );
   }
   save(file: string, data: Instance): void {
     data.updatedAt = now();
@@ -501,7 +503,7 @@ function installHooks(store: Store, file: string, data: Instance): void {
 export function contextText(file: string, data: Instance): string {
   const sections = [
     `RL feature workspace: ${data.id}\nBranch: ${data.branch}`,
-    "The following RL-owned documents are shared living feature documentation, not just conversation memory. Read them before starting work, and read the full files when excerpts are truncated. At meaningful milestones and before finishing your task, document what changed, what remains, implementation details (file/symbol references, flows, APIs, data structures), decisions and rationale, checks actually run, and blockers. Keep completed and planned work distinct; do not mark unverified work as tested or done. Respect your assigned scope and permissions; read-only agents should return proposed documentation updates to their parent. Use 'rl context append <file>' for durable domain or design notes and 'rl progress append <file>' for milestone/handoff updates ('-' reads stdin). Append is locked so concurrent agents do not overwrite one another. Use 'rl context set <file>' or 'rl progress set <file>' only for a deliberate replacement after reading the latest document and coordinating with other writers. Re-read the documents before planning subsequent work.",
+    "The following RL-owned documents are shared living feature documentation, not just conversation memory. Read them before starting work, and read the full files when excerpts are truncated. At meaningful milestones and before finishing your task, document what changed, what remains, implementation details (file/symbol references, flows, APIs, data structures), decisions and rationale, checks actually run, and blockers. Keep completed and planned work distinct; do not mark unverified work as tested or done. Respect your assigned scope and permissions; read-only agents should return proposed documentation updates to their parent. Use 'rl notes append context <file>' for durable domain or design notes and 'rl notes append progress <file>' for milestone/handoff updates ('-' reads stdin). Append is locked so concurrent agents do not overwrite one another. Use 'rl notes set context <file>' or 'rl notes set progress <file>' only for a deliberate replacement after reading the latest document and coordinating with other writers. Re-read the documents before planning subsequent work.",
   ];
   sections.push(
     "When the user asks to pause or save this task for later, save a task handoff with rl_task_pause through MCP, or 'rl pause --summary <text> --changes <text> --validation <text> --next <text> [--blockers <text>]'. Include the current session UUID (Codex shell commands can infer it), concrete changes, checks actually run and their results, remaining work, and blockers. Use 'Not run' for unperformed checks. A pause saves task state; it does not terminate the agent. The user can return with 'rl continue'.",

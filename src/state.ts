@@ -189,22 +189,15 @@ export async function main(argv: string[]): Promise<number> {
     arity(rest, 0, rest[0] === "open" ? 1 : 0);
     return openPr(store, !!values.json);
   }
-  if (command === "status" || command === "instances") arity(rest, 0);
+  if (command === "status") arity(rest, 0);
   if (command === "session" && rest[0] === "list") {
     arity(rest, 1, 2);
     if (rest[1]) agent(rest[1]);
   }
   if (command === "status" && values.fetch)
     git(store.repo, "fetch", "--all", "--prune");
-  if (
-    command === "status" ||
-    command === "instances" ||
-    (command === "session" && rest[0] === "list")
-  )
-    await syncCodexSessions(
-      store,
-      command === "instances" ? undefined : process.cwd(),
-    );
+  if (command === "status" || (command === "session" && rest[0] === "list"))
+    await syncCodexSessions(store, process.cwd());
   let replacement = "";
   if (
     ["context", "progress"].includes(command) &&
@@ -214,16 +207,6 @@ export async function main(argv: string[]): Promise<number> {
     replacement = fs.readFileSync(rest[1] === "-" ? 0 : rest[1], "utf8");
   }
   return store.locked(() => {
-    if (command === "instances") {
-      arity(rest, 0);
-      json(
-        store.records().map(([, data]) => ({
-          ...data,
-          gitStatus: branchStatus(store.repo, data),
-        })),
-      );
-      return 0;
-    }
     if (command === "archive") {
       arity(rest, 0);
       const root = canonical(required(values, "worktree"));
@@ -264,7 +247,7 @@ export async function main(argv: string[]): Promise<number> {
         json(rest[1] ? data.sessions[agent(rest[1])] : data.sessions);
       } else
         throw new Error(
-          "Usage: rl session list [agent] | save [agent] [UUID] | add <agent> <UUID>",
+          "Usage: rl agent sessions [agent] | save [agent] [UUID]",
         );
     } else if (command === "context" || command === "progress") {
       const target = path.join(path.dirname(file), command + ".md"),

@@ -10,18 +10,13 @@ import {
   inside,
   locked,
 } from "./common.js";
-import {
-  commandContext,
-  contextOptions,
-  resolveWorkspace,
-} from "./command-context.js";
+import { commandContext, contextOptions } from "./command-context.js";
 import { GIT_WORKFLOW_DIRECTORY, GIT_WORKFLOW_LOCK } from "./git-safety.js";
 import { isJsonObject, parseJsonObject } from "./json.js";
 
 const GH_TIMEOUT_MS = 20_000;
 const PR_FIELDS =
   "number,url,headRefName,headRefOid,baseRefName,isCrossRepository,headRepository,headRepositoryOwner";
-const CHECK_FIELDS = "name,state,bucket,link,workflow";
 const FETCH_PREFIX = "refs/rl/pr-fetch/";
 
 /** Bound requests and ignore a caller's unrelated GH_REPO override. */
@@ -78,34 +73,13 @@ export async function repositoryIdentity(
 }
 
 export async function main(argv: string[]): Promise<number> {
-  const { values, positionals } = args(
-    argv,
-    [...contextOptions, "name"],
-    ["json"],
-  );
-  const context = commandContext(values);
+  const { values, positionals } = args(argv, [...contextOptions, "name"], []);
   const [command, action, ...rest] = positionals;
-  if (command !== "pr" || !["checks", "checkout"].includes(action))
-    throw new Error("Usage: rl pr checks|checkout");
-  const identity = await repositoryIdentity(context.repo);
-  if (action === "checks") {
-    arity(rest, 0);
-    if (values.name) throw new Error("checks does not accept --name");
-    const workspace = resolveWorkspace(context);
-    const result = await github(workspace.path, [
-      "pr",
-      "checks",
-      workspace.branch,
-      "--repo",
-      identity.url,
-      ...(values.json ? ["--json", CHECK_FIELDS] : []),
-    ]);
-    process.stdout.write(result.stdout);
-    if (result.stderr) process.stderr.write(result.stderr);
-    return result.code;
-  }
+  if (command !== "pr" || action !== "checkout")
+    throw new Error("Usage: rl pr checkout <number> [--name <branch>]");
   arity(rest, 1);
-  if (values.json) throw new Error("checkout does not accept --json");
+  const context = commandContext(values);
+  const identity = await repositoryIdentity(context.repo);
   const [number] = rest;
   if (!/^[1-9]\d*$/.test(number))
     throw new Error("Expected a positive PR number");
@@ -202,7 +176,7 @@ export async function main(argv: string[]): Promise<number> {
         } catch (error) {
           // Preserve the valid checkout on adoption failure so hooks/files can be inspected.
           throw new Error(
-            `Created ${destination}, but RL adoption failed: ${error instanceof Error ? error.message : "unknown error"}. Run rl adopt inside it`,
+            `Created ${destination}, but RL adoption failed: ${error instanceof Error ? error.message : "unknown error"}. Run rl setup adopt inside it`,
           );
         }
         console.log(destination);

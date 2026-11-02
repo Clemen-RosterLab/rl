@@ -31,6 +31,7 @@ test("npm tarball ships built JavaScript and bundled runtime dependencies, with 
     "package/LICENSE",
     "package/bin/rl",
     "package/lib/rl.zsh",
+    "package/lib/entry.zsh",
     "package/shell/rl.zsh",
     "package/config.example.zsh",
   ]);
@@ -38,7 +39,7 @@ test("npm tarball ships built JavaScript and bundled runtime dependencies, with 
     assert.ok(
       runtime.has(name) ||
         /^package\/dist\/[\w-]+\.js$/.test(name) ||
-        /^package\/node_modules\/(proper-lockfile|graceful-fs|retry|signal-exit)\//.test(
+        /^package\/node_modules\/(proper-lockfile|graceful-fs|retry|signal-exit|smol-toml)\//.test(
           name,
         ),
       name,
@@ -52,12 +53,23 @@ test("npm tarball ships built JavaScript and bundled runtime dependencies, with 
     "pr-workflow",
     "agent-launch",
     "mcp",
+    "mcp-setup",
+    "bootstrap",
+    "dependencies",
+    "install",
     "workflow-collaboration",
   ])
     assert.ok(names.includes(`package/dist/${name}.js`));
   assert.ok(names.includes("package/LICENSE"));
   assert.ok(
-    !names.some((name) => name.endsWith(".py") || name.endsWith(".ts")),
+    !names.some(
+      (name) =>
+        name.endsWith(".py") ||
+        (name.endsWith(".ts") &&
+          !(
+            name.startsWith("package/node_modules/") && name.endsWith(".d.ts")
+          )),
+    ),
   );
   const manifest = JSON.parse(
     w.command(["tar", "-xOf", archive, "package/package.json"]).stdout,
@@ -65,7 +77,8 @@ test("npm tarball ships built JavaScript and bundled runtime dependencies, with 
   assert.equal(manifest.license, "MIT");
   assert.deepEqual(manifest.bin, { rl: "bin/rl" });
   assert.equal(manifest.engines.node, ">=22");
-  for (const script of ["install", "postinstall", "preinstall"])
+  assert.equal(manifest.scripts.postinstall, "node dist/install.js");
+  for (const script of ["install", "preinstall"])
     assert.ok(!(script in manifest.scripts));
 });
 test("offline npm install, relocation and reinstall preserve hooks, sessions and shell integration", (t) => {
@@ -109,7 +122,7 @@ test("offline npm install, relocation and reinstall preserve hooks, sessions and
     w.command([cli, "resume", "--help"]).stdout,
     /rl resume \[codex\|claude\]/,
   );
-  w.command([cli, "adopt"], { cwd: w.a });
+  w.command([cli, "setup", "adopt"], { cwd: w.a });
   assert.equal(
     w.command([cli, "path", "@"], { cwd: w.a }).stdout.trim(),
     w.repo,
@@ -117,11 +130,10 @@ test("offline npm install, relocation and reinstall preserve hooks, sessions and
   for (const command of [
     ["switch"],
     ["git", "merge"],
-    ["merge"],
     ["agent"],
-    ["handoff"],
-    ["pr", "checks"],
-    ["mcp"],
+    ["agent", "handoff"],
+    ["pr", "checkout"],
+    ["agent", "mcp"],
   ])
     assert.match(
       w.command([cli, ...command, "--help"], { cwd: w.a }).stdout,
@@ -137,7 +149,7 @@ test("offline npm install, relocation and reinstall preserve hooks, sessions and
   ]);
   w.command([cli, "agent", "start", "claude", "--", "--help"], { cwd: w.a });
   assert.deepEqual(w.calls().at(-1).argv.slice(1), ["--help"]);
-  const rpc = w.command([cli, "mcp"], {
+  const rpc = w.command([cli, "agent", "mcp"], {
     cwd: w.a,
     input:
       JSON.stringify({
@@ -155,12 +167,12 @@ test("offline npm install, relocation and reinstall preserve hooks, sessions and
     JSON.parse(rpc.stdout).result.serverInfo.version,
     readJson(path.join(ROOT, "package.json")).version,
   );
-  w.command([cli, "progress", "append", "-"], {
+  w.command([cli, "notes", "append", "progress", "-"], {
     cwd: w.a,
     input: "Package install complete",
   });
   assert.match(
-    w.command([cli, "summary", "--stdout"], { cwd: w.a }).stdout,
+    w.command([cli, "notes", "summary", "--stdout"], { cwd: w.a }).stdout,
     /Package install complete/,
   );
   const config = path.join(w.a, ".codex/hooks.json"),
@@ -189,7 +201,7 @@ test("offline npm install, relocation and reinstall preserve hooks, sessions and
     ).sessions.codex[0].id,
     sid,
   );
-  w.command([cli, "adopt"], { cwd: w.a });
+  w.command([cli, "setup", "adopt"], { cwd: w.a });
   assert.equal(read(config), before);
   const managed = w.managed("selected");
   w.env.RL_PACKAGE_CLI = cli;
@@ -202,11 +214,64 @@ test("offline npm install, relocation and reinstall preserve hooks, sessions and
     "zsh",
     "-f",
     "-c",
-    'eval "$("$RL_PACKAGE_CLI" init zsh)"; rl; [[ "$PWD" == "$EXPECTED_WORKTREE" ]] || exit 90; rl --version',
+    'eval "$("$RL_PACKAGE_CLI" setup shell zsh)"; rl; [[ "$PWD" == "$EXPECTED_WORKTREE" ]] || exit 90; rl --version',
   ]);
   w.command([cli, "resume", "codex"], { cwd: w.a });
   assert.deepEqual(w.calls().at(-1).argv.slice(1), ["resume", sid]);
   install();
   w.hook("claude", randomUUID());
   assert.equal(read(config), before);
+});
+
+test("global npm installation configures a fresh user's shell and bare rl changes directory on its first startup", (t) => {
+  const w = new Workspace(t),
+    archive = pack(w);
+  const home = path.join(w.root, "new user home"),
+    prefix = path.join(w.root, "global npm prefix");
+  fs.mkdirSync(home);
+  const preload = path.join(w.root, "isolated-home.cjs");
+  write(
+    preload,
+    `require('node:os').homedir = () => ${JSON.stringify(home)}; require('node:module').syncBuiltinESMExports();`,
+  );
+  w.env.NODE_OPTIONS =
+    `${w.env.NODE_OPTIONS ?? ""} --require ${JSON.stringify(preload)}`.trim();
+  w.env.SHELL = "/bin/zsh";
+  delete w.env.ZDOTDIR;
+  fs.symlinkSync("/bin/zsh", path.join(w.bin, "zsh"));
+  w.stub(
+    "fzf",
+    "if(process.argv.includes('--version')) {console.log('fzf 1.0');process.exit(0);}const rows=require('node:fs').readFileSync(0,'utf8').split(String.fromCharCode(10));console.log(rows.find(row=>row.startsWith('new-task'+String.fromCharCode(9))));",
+  );
+  w.stub("gh", "console.log('gh 1.0');");
+  w.command([
+    "npm",
+    "install",
+    "--global",
+    "--prefix",
+    prefix,
+    "--cache",
+    path.join(w.root, "cache"),
+    "--offline",
+    "--no-audit",
+    "--no-fund",
+    "--allow-scripts=rl-workspaces",
+    archive,
+  ]);
+  assert.match(read(path.join(home, ".zshrc")), /rl shell integration/);
+  const shim = path.join(home, ".local/share/rl/bin/rl");
+  assert.ok(fs.existsSync(shim));
+  assert.match(read(shim), /global npm prefix/);
+  const target = w.managed("new-task");
+  w.env.ZDOTDIR = home;
+  w.env.EXPECTED_WORKTREE = target;
+  w.command(
+    [
+      "/bin/zsh",
+      "-i",
+      "-c",
+      '[[ $(whence -w rl) == "rl: function" ]] || exit 90; rl; [[ "$PWD" == "$EXPECTED_WORKTREE" ]] || exit 91',
+    ],
+    { cwd: w.repo },
+  );
 });

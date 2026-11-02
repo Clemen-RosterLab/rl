@@ -89,7 +89,7 @@ export class Workspace {
       [this.b, "feature/b"],
     ]) {
       this.git(this.repo, "worktree", "add", "-q", "-b", branch, root);
-      this.rl(["adopt"], { cwd: root });
+      this.rl(["setup", "adopt"], { cwd: root });
     }
     fs.mkdirSync(this.bin);
     this.env.PATH = this.bin + path.delimiter + this.env.PATH;
@@ -194,7 +194,7 @@ export class Workspace {
     const root = path.join(this.root, "worktrees/example", name);
     fs.mkdirSync(path.dirname(root), { recursive: true });
     this.git(this.repo, "worktree", "add", "-q", "-b", name, root);
-    this.rl(["adopt"], { cwd: root });
+    this.rl(["setup", "adopt"], { cwd: root });
     return root;
   }
   calls() {

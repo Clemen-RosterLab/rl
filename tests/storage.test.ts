@@ -105,7 +105,7 @@ test("cleanup previews and removes only configured generated directories while p
   const head = w.git(w.a, "rev-parse", "HEAD");
   const dirty = w.git(w.a, "status", "--porcelain");
   const preview = JSON.parse(
-    w.rl(["clean", "--dry-run", "--json"], { cwd: w.a }).stdout,
+    w.rl(["storage", "clean", "--dry-run", "--json"], { cwd: w.a }).stdout,
   );
   assert.equal(preview.dryRun, true);
   assert.equal(preview.workspace.path, w.a);
@@ -113,7 +113,9 @@ test("cleanup previews and removes only configured generated directories while p
   assert.deepEqual(preview.removedPaths, []);
   assert.ok(fs.existsSync(path.join(w.a, "node_modules/pkg/index.js")));
   assert.equal(read(file), before);
-  const cleaned = JSON.parse(w.rl(["clean", "--json"], { cwd: w.a }).stdout);
+  const cleaned = JSON.parse(
+    w.rl(["storage", "clean", "--json"], { cwd: w.a }).stdout,
+  );
   assert.equal(cleaned.dryRun, false);
   assert.equal(cleaned.removedPaths.length, 2);
   assert.ok(!fs.existsSync(path.join(w.a, "node_modules")));
@@ -133,26 +135,26 @@ test("storage and clean reject workspace selectors, wrong repository routing and
   ignored(w.a);
   configure(w.a, ["node_modules"]);
   const target = generated(w.a, "node_modules/keep");
-  for (const command of ["storage", "clean"]) {
+  for (const command of [["storage"], ["storage", "clean"]]) {
     for (const args of [[w.b], ["--workspace", w.b], ["--all"], ["--force"]])
-      w.rl([command, ...args], { cwd: w.a, ok: false });
+      w.rl([...command, ...args], { cwd: w.a, ok: false });
   }
   const other = path.join(w.root, "another-repo");
   w.command(["git", "init", "-q", "-b", "main", other]);
   w.git(other, "commit", "-q", "--allow-empty", "-m", "Initial");
   w.rl(["repo", "add", "current", w.repo]);
   w.rl(["repo", "add", "other", other]);
-  for (const command of ["storage", "clean"])
+  for (const command of [["storage"], ["storage", "clean"]])
     assert.match(
-      w.rl(["--repo", "other", command], { cwd: w.a, ok: false }).stderr,
+      w.rl(["--repo", "other", ...command], { cwd: w.a, ok: false }).stderr,
       /does not belong/,
     );
   const file = record(w);
   const before = read(file);
   w.git(w.a, "checkout", "-qb", "switched");
-  for (const command of ["storage", "clean"])
+  for (const command of [["storage"], ["storage", "clean"]])
     assert.match(
-      w.rl([command], { cwd: w.a, ok: false }).stderr,
+      w.rl(command, { cwd: w.a, ok: false }).stderr,
       /Instance owns branch/,
     );
   assert.equal(read(file), before);
@@ -167,7 +169,7 @@ test("cleanup validates the entire plan before removing anything and refuses tra
   w.git(w.a, "add", "-f", ".next/tracked");
   configure(w.a, ["node_modules", ".next"]);
   assert.match(
-    w.rl(["clean"], { cwd: w.a, ok: false }).stderr,
+    w.rl(["storage", "clean"], { cwd: w.a, ok: false }).stderr,
     /tracked files/,
   );
   assert.ok(fs.existsSync(keep) && fs.existsSync(tracked));
@@ -182,7 +184,7 @@ test("cleanup validates the entire plan before removing anything and refuses tra
     "node_modules",
   ]) {
     configure(w.a, clean);
-    w.rl(["clean"], { cwd: w.a, ok: false });
+    w.rl(["storage", "clean"], { cwd: w.a, ok: false });
     assert.ok(fs.existsSync(keep));
   }
 });
@@ -194,20 +196,23 @@ test("cleanup rejects credential-containing directories, nested Git repositories
   const keep = generated(w.a, "node_modules/keep");
   const credential = generated(w.a, ".cache/.env.local");
   assert.match(
-    w.rl(["clean"], { cwd: w.a, ok: false }).stderr,
+    w.rl(["storage", "clean"], { cwd: w.a, ok: false }).stderr,
     /protected metadata or credentials/,
   );
   assert.ok(fs.existsSync(keep) && fs.existsSync(credential));
   fs.unlinkSync(credential);
   fs.mkdirSync(path.join(w.a, ".cache/nested/.git"), { recursive: true });
   assert.match(
-    w.rl(["clean"], { cwd: w.a, ok: false }).stderr,
+    w.rl(["storage", "clean"], { cwd: w.a, ok: false }).stderr,
     /protected metadata or credentials/,
   );
   fs.rmSync(path.join(w.a, ".cache"), { recursive: true });
   const neighbor = generated(w.b, "cache/keep");
   fs.symlinkSync(path.dirname(neighbor), path.join(w.a, ".cache"));
-  assert.match(w.rl(["clean"], { cwd: w.a, ok: false }).stderr, /symlinks/);
+  assert.match(
+    w.rl(["storage", "clean"], { cwd: w.a, ok: false }).stderr,
+    /symlinks/,
+  );
   assert.ok(fs.existsSync(keep) && fs.existsSync(neighbor));
   const report = JSON.parse(w.rl(["storage", "--json"], { cwd: w.a }).stdout);
   assert.match(report.clean.error, /symlinks/);
@@ -227,7 +232,7 @@ test("cleanup estimates account for hard links retained outside its configured t
   assert.ok(
     report.usage.dependenciesBytes < 2 * fs.statSync(local).blocks * 512,
   );
-  w.rl(["clean"], { cwd: w.a });
+  w.rl(["storage", "clean"], { cwd: w.a });
   assert.equal(fs.statSync(neighbor).size, 1024 * 1024);
   assert.ok(!fs.existsSync(path.join(w.a, "node_modules")));
 });
@@ -236,16 +241,19 @@ test("cleanup requires configuration, ignored directories, and a working directo
   const w = new Workspace(t);
   ignored(w.a);
   const keep = generated(w.a, "node_modules/pkg/keep");
-  assert.match(w.rl(["clean"], { cwd: w.a }).stdout, /Configure "clean"/);
+  assert.match(
+    w.rl(["storage", "clean"], { cwd: w.a }).stdout,
+    /Configure "clean"/,
+  );
   assert.ok(fs.existsSync(keep));
   configure(w.a, ["node_modules"]);
   assert.match(
-    w.rl(["clean"], { cwd: path.dirname(keep), ok: false }).stderr,
+    w.rl(["storage", "clean"], { cwd: path.dirname(keep), ok: false }).stderr,
     /current directory/,
   );
   write(path.join(w.a, ".gitignore"), "");
   assert.match(
-    w.rl(["clean"], { cwd: w.a, ok: false }).stderr,
+    w.rl(["storage", "clean"], { cwd: w.a, ok: false }).stderr,
     /must be ignored/,
   );
   ignored(w.a);
@@ -258,7 +266,7 @@ test("cleanup requires configuration, ignored directories, and a working directo
   );
   write(marker, w.git(w.a, "rev-parse", "HEAD"));
   assert.match(
-    w.rl(["clean"], { cwd: w.a, ok: false }).stderr,
+    w.rl(["storage", "clean"], { cwd: w.a, ok: false }).stderr,
     /operation is already in progress/,
   );
   assert.ok(fs.existsSync(keep));
@@ -279,7 +287,7 @@ test("cleanup restores staged artifacts when protected files appear after its in
     "git",
     `const fs=require('node:fs'); const args=process.argv.slice(2); if(args.includes('--cached')&&args.at(-1)==='.next'){const count=fs.existsSync(process.env.CLEAN_INSPECTION_COUNT)?Number(fs.readFileSync(process.env.CLEAN_INSPECTION_COUNT,'utf8'))+1:1;fs.writeFileSync(process.env.CLEAN_INSPECTION_COUNT,String(count));if(count===2)fs.writeFileSync(process.env.CLEAN_CREDENTIAL,'keep this credential');}const result=require('node:child_process').spawnSync(process.env.CLEAN_REAL_GIT,args,{stdio:'inherit'});process.exit(result.status??1);`,
   );
-  const failed = w.rl(["clean"], { cwd: w.a, ok: false });
+  const failed = w.rl(["storage", "clean"], { cwd: w.a, ok: false });
   assert.match(failed.stderr, /protected metadata or credentials/);
   assert.ok(fs.existsSync(dependency) && fs.existsSync(output));
   assert.equal(
@@ -304,7 +312,7 @@ test("cleanup never follows a replaced staging directory during removal or rollb
     "git",
     `const fs=require('node:fs'),path=require('node:path');const args=process.argv.slice(2);if(args.includes('--cached')&&args.at(-1)==='.next'){const count=fs.existsSync(process.env.CLEAN_COUNT)?Number(fs.readFileSync(process.env.CLEAN_COUNT,'utf8'))+1:1;fs.writeFileSync(process.env.CLEAN_COUNT,String(count));if(count===3){const holding=fs.readdirSync(process.cwd()).find(name=>name.startsWith('.rl-clean-'));if(holding){fs.renameSync(holding,'retained-staging');fs.symlinkSync(process.env.CLEAN_NEIGHBOR,holding);}}}const result=require('node:child_process').spawnSync(process.env.CLEAN_REAL_GIT,args,{stdio:'inherit'});process.exit(result.status??1);`,
   );
-  const failed = w.rl(["clean"], { cwd: w.a, ok: false });
+  const failed = w.rl(["storage", "clean"], { cwd: w.a, ok: false });
   assert.match(failed.stderr, /staging directory changed|Staging path changed/);
   assert.ok(fs.existsSync(neighbor));
   assert.equal(fs.statSync(neighbor).size, 128);

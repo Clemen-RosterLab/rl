@@ -125,7 +125,10 @@ test("unadopted worktrees get PR detection by branch, including PR target compar
     ],
   });
   w.rl([]);
-  assert.match(rows(w)[0], /\sopen\s+\+1 \/ -0\s+release/);
+  assert.match(
+    rows(w).find((row) => row.startsWith("display-name\t"))!,
+    /\sopen\s+\+1 \/ -0\s+release/,
+  );
   assert.ok(!fs.existsSync(path.join(root, ".codex")));
   w.env.SELECT_NAME = "display-name";
   w.rl([]);

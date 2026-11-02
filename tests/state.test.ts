@@ -63,7 +63,7 @@ test("hooks reject mismatches, fuzzy session IDs and association with another in
 test("manual registration and failed agent preserve usage timestamp and exit status", (t) => {
   const w = new Workspace(t),
     sid = randomUUID();
-  w.rl(["session", "add", "claude", sid], { cwd: w.a });
+  w.rl(["agent", "save", "claude", sid], { cwd: w.a });
   const before = w.status().sessions.claude;
   w.env.AGENT_EXIT = "17";
   assert.equal(w.rl(["resume", "claude"], { cwd: w.a, ok: false }).status, 17);
@@ -71,11 +71,11 @@ test("manual registration and failed agent preserve usage timestamp and exit sta
 });
 test("shared context reaches both agents and remains isolated from other instances", (t) => {
   const w = new Workspace(t);
-  w.rl(["context", "set", "-"], {
+  w.rl(["notes", "set", "context", "-"], {
     cwd: w.a,
     input: "Fixed shifts domain rules\n",
   });
-  w.rl(["progress", "set", "-"], {
+  w.rl(["notes", "set", "progress", "-"], {
     cwd: w.a,
     input: "Done: parser. Next: UI.\n",
   });
@@ -86,7 +86,7 @@ test("shared context reaches both agents and remains isolated from other instanc
     assert.match(text, /Next: UI/);
   }
   assert.doesNotMatch(
-    w.rl(["context", "show"], { cwd: w.b }).stdout,
+    w.rl(["notes", "show", "context"], { cwd: w.b }).stdout,
     /Fixed shifts/,
   );
   assert.equal(
@@ -122,7 +122,7 @@ test("subagents and new agents receive latest documentation without registering 
   for (const agent of ["codex", "claude"]) {
     const sid = randomUUID();
     w.hook(agent, sid);
-    w.rl(["progress", "append", "-"], {
+    w.rl(["notes", "append", "progress", "-"], {
       cwd: w.a,
       input: `Completed ${agent} adapter. Remaining: review.`,
     });
@@ -156,10 +156,13 @@ test("concurrent documentation append processes retain each update exactly once"
     );
   await Promise.all(
     updates.map((input) =>
-      w.commandAsync([CLI, "progress", "append", "-"], { cwd: w.a, input }),
+      w.commandAsync([CLI, "notes", "append", "progress", "-"], {
+        cwd: w.a,
+        input,
+      }),
     ),
   );
-  const text = w.rl(["progress", "show"], { cwd: w.a }).stdout;
+  const text = w.rl(["notes", "show", "progress"], { cwd: w.a }).stdout;
   for (const update of updates) assert.equal(text.split(update).length - 1, 1);
   assert.equal(text.split("### Update ").length - 1, 10);
 });
@@ -171,14 +174,14 @@ test("adoption is idempotent and preserves unrelated hooks and settings", (t) =>
   const custom = { hooks: [{ type: "command", command: "echo unrelated" }] };
   config.hooks.SessionStart.unshift(custom);
   write(target, JSON.stringify(config));
-  w.rl(["adopt"], { cwd: w.a });
+  w.rl(["setup", "adopt"], { cwd: w.a });
   const once = read(target);
-  w.rl(["adopt"], { cwd: w.a });
+  w.rl(["setup", "adopt"], { cwd: w.a });
   assert.equal(read(target), once);
   assert.deepEqual(readJson(target).permissions, { allow: ["Read"] });
   assert.deepEqual(readJson(target).hooks.SessionStart[0], custom);
   write(target, "{broken");
-  w.rl(["adopt"], { cwd: w.a, ok: false });
+  w.rl(["setup", "adopt"], { cwd: w.a, ok: false });
   assert.equal(read(target), "{broken");
 });
 test("adoption preserves preexisting work, saved notes and session ownership", (t) => {
@@ -187,19 +190,19 @@ test("adoption preserves preexisting work, saved notes and session ownership", (
   w.git(w.repo, "worktree", "add", "-q", "-b", "old-task", old);
   write(path.join(old, "draft.txt"), "unfinished");
   const head = w.git(old, "rev-parse", "HEAD");
-  w.rl(["adopt"], { cwd: old });
-  w.rl(["context", "set", "-"], {
+  w.rl(["setup", "adopt"], { cwd: old });
+  w.rl(["notes", "set", "context", "-"], {
     cwd: old,
     input: "Existing domain knowledge",
   });
   const sid = randomUUID();
   w.hook("codex", sid, { cwd: old });
-  w.rl(["adopt"], { cwd: old });
+  w.rl(["setup", "adopt"], { cwd: old });
   assert.equal(read(path.join(old, "draft.txt")), "unfinished");
   assert.equal(w.git(old, "rev-parse", "HEAD"), head);
   assert.equal(w.status(old).sessions.codex[0].id, sid);
   assert.equal(
-    w.rl(["context", "show"], { cwd: old }).stdout,
+    w.rl(["notes", "show", "context"], { cwd: old }).stdout,
     "Existing domain knowledge",
   );
 });
@@ -209,7 +212,7 @@ test("branch changes cannot silently retarget an instance", (t) => {
   for (const command of [
     ["status", "--workspace"],
     ["resume", "codex"],
-    ["adopt"],
+    ["setup", "adopt"],
   ])
     w.rl(command, { cwd: w.a, ok: false });
   assert.ok(!fs.existsSync(w.log));
@@ -218,7 +221,7 @@ test("copied hooks rebind and generated files remain ignored", (t) => {
   const w = new Workspace(t),
     target = path.join(w.b, ".codex/hooks.json");
   write(target, read(path.join(w.a, ".codex/hooks.json")));
-  w.rl(["adopt"], { cwd: w.b });
+  w.rl(["setup", "adopt"], { cwd: w.b });
   assert.equal(readJson(target).hooks.SessionStart.length, 1);
   w.hook("codex", randomUUID(), { cwd: w.b });
   assert.deepEqual(w.status().sessions.codex, []);
@@ -232,7 +235,7 @@ test("hook installation refuses symlinked configuration", (t) => {
   write(destination, "{}");
   fs.unlinkSync(target);
   fs.symlinkSync(destination, target);
-  w.rl(["adopt"], { cwd: w.a, ok: false });
+  w.rl(["setup", "adopt"], { cwd: w.a, ok: false });
   assert.equal(read(destination), "{}");
 });
 test("corrupt metadata fails closed", (t) => {
@@ -240,7 +243,7 @@ test("corrupt metadata fails closed", (t) => {
     file = path.join(w.status().stateDirectory, "instance.json");
   write(file, "{invalid");
   w.rl(["resume", "codex"], { cwd: w.a, ok: false });
-  w.rl(["adopt"], { cwd: w.a, ok: false });
+  w.rl(["setup", "adopt"], { cwd: w.a, ok: false });
   assert.equal(read(file), "{invalid");
   assert.ok(!fs.existsSync(w.log));
 });
@@ -248,7 +251,7 @@ test("deletion retains history and recreation starts with a distinct identity", 
   const w = new Workspace(t),
     root = w.managed("task");
   w.hook("codex", randomUUID(), { cwd: root });
-  w.rl(["context", "set", "-"], {
+  w.rl(["notes", "set", "context", "-"], {
     cwd: root,
     input: "Keep these domain notes",
   });

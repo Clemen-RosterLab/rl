@@ -1,5 +1,6 @@
 import { fileURLToPath } from "node:url";
 import { Readable } from "node:stream";
+import path from "node:path";
 import { args, arity, message, required } from "./common.js";
 import { activityView } from "./activity.js";
 import { contextText, Store } from "./store.js";
@@ -12,6 +13,7 @@ import {
   automationContext,
   callWorkflowTool,
   WORKFLOW_TOOLS,
+  workflowToolSchema,
 } from "./session-workflows.js";
 
 import {
@@ -305,20 +307,7 @@ export async function serveMcp(store: Store): Promise<number> {
               ...WORKFLOW_TOOLS.map((tool) => ({
                 name: tool.name,
                 description: tool.description,
-                inputSchema: {
-                  type: "object",
-                  properties: {
-                    agent: { type: "string", enum: ["codex", "claude"] },
-                    sessionId: {
-                      type: "string",
-                      description:
-                        "Current parent conversation ID. Claude requires a UUID; Codex also accepts observed thr_ IDs and may inherit it.",
-                    },
-                    ...tool.properties,
-                  },
-                  required: tool.required,
-                  additionalProperties: false,
-                },
+                inputSchema: workflowToolSchema(tool),
                 annotations: {
                   readOnlyHint: tool.readOnly,
                   destructiveHint: false,
@@ -378,9 +367,22 @@ export async function serveMcp(store: Store): Promise<number> {
 }
 
 export async function main(argv: string[]): Promise<number> {
-  const { values, positionals } = args(argv, ["repo", "state-dir"], []);
-  arity(positionals, 0);
-  return serveMcp(
-    new Store(required(values, "repo"), required(values, "state-dir")),
+  const { values, positionals } = args(
+    argv,
+    ["repo", "state-dir", "workspace"],
+    [],
   );
+  arity(positionals, 0);
+  const store = new Store(
+    required(values, "repo"),
+    required(values, "state-dir"),
+  );
+  if (values.workspace !== undefined) {
+    const workspace = required(values, "workspace");
+    if (!path.isAbsolute(workspace))
+      throw new Error("Expected an absolute MCP workspace path");
+    const [, instance] = store.current(workspace);
+    process.chdir(instance.worktree);
+  }
+  return serveMcp(store);
 }

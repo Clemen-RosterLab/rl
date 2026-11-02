@@ -19,7 +19,7 @@ test("MCP saves a session visible in CLI status and resume and rejects invalid o
   const w = new Workspace(t),
     id = randomUUID();
   const call = (arguments_: Record<string, unknown>, cwd = w.a) => {
-    const result = w.rl(["mcp"], {
+    const result = w.rl(["agent", "mcp"], {
       cwd,
       input:
         [
@@ -161,7 +161,7 @@ test("MCP negotiates, lists tools and shares locked append/read with CLI", (t) =
   assert.equal(replies[6].error.code, -32602);
   assert.equal(replies[7].error.code, -32700);
   assert.match(
-    w.rl(["progress", "show"], { cwd: w.a }).stdout,
+    w.rl(["notes", "show", "progress"], { cwd: w.a }).stdout,
     /MCP milestone/,
   );
 });
@@ -209,7 +209,7 @@ test("MCP rejects malformed envelopes and use before initialization without muta
     [-32602, -32600, -32602],
   );
   assert.doesNotMatch(
-    w.rl(["progress", "show"], { cwd: w.a }).stdout,
+    w.rl(["notes", "show", "progress"], { cwd: w.a }).stdout,
     /must not write/,
   );
 });

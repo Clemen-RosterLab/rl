@@ -39,8 +39,6 @@ const COMMAND_OPTIONS: Record<string, string[]> = {
   exec: ["workspace"],
   setup: ["workspace", "dry-run"],
   switch: ["create", "base", "no-fetch", "setup", "agent", "output-path"],
-  new: ["base", "no-fetch", "setup", "output-path"],
-  open: ["branch", "base", "no-fetch", "setup", "output-path"],
 };
 
 async function createWorkspace(
@@ -50,7 +48,6 @@ async function createWorkspace(
   noFetch: boolean,
   options: {
     reuseExisting?: boolean;
-    directoryName?: string;
     requireBranch?: boolean;
   } = {},
 ): Promise<WorkspaceTarget & { created: boolean }> {
@@ -68,8 +65,7 @@ async function createWorkspace(
     path.join(context.store.root, CREATE_LOCK),
     LOCK_FILE,
     async () => {
-      const directoryName = options.directoryName ?? name;
-      const destination = path.resolve(context.managedDir, directoryName);
+      const destination = path.resolve(context.managedDir, name);
       if (
         !inside(destination, context.managedDir) ||
         canonical(destination) !== destination
@@ -88,7 +84,7 @@ async function createWorkspace(
         const [root, branch] = context.store.worktree(registered.worktree);
         if (branch !== name)
           throw new Error("Workspace branch changed during selection; retry");
-        return { path: root, name: directoryName, branch, created: false };
+        return { path: root, name, branch, created: false };
       }
       if (fs.existsSync(destination))
         throw new Error(`Workspace path already exists: ${destination}`);
@@ -143,7 +139,7 @@ async function createWorkspace(
       git(context.repo, "worktree", "add", ...creationArgs);
       return {
         path: destination,
-        name: directoryName,
+        name,
         branch: name,
         created: true,
       };
@@ -156,7 +152,7 @@ export async function main(argv: string[]): Promise<number> {
   const forwarded = separator < 0 ? [] : argv.slice(separator + 1);
   const { values, positionals } = args(
     separator < 0 ? argv : argv.slice(0, separator),
-    [...contextOptions, "base", "branch", "workspace", "agent", "output-path"],
+    [...contextOptions, "base", "workspace", "agent", "output-path"],
     ["create", "no-fetch", "setup", "dry-run"],
     { create: "c", base: "b" },
   );
@@ -167,12 +163,8 @@ export async function main(argv: string[]): Promise<number> {
   for (const option of Object.keys(values))
     if (!contextOptions.includes(option) && !allowedOptions.includes(option))
       throw new Error(`--${option} is not supported by rl ${command}`);
-  if (
-    command === "switch" &&
-    !values.create &&
-    (values.base || values["no-fetch"])
-  )
-    throw new Error("--base and --no-fetch require --create with rl switch");
+  if (command === "switch" && !values.create && values.base)
+    throw new Error("--base requires --create with rl switch");
   const selector =
     typeof values.workspace === "string" ? values.workspace : undefined;
   if (
@@ -202,7 +194,7 @@ export async function main(argv: string[]): Promise<number> {
         flag: "wx",
       });
       console.log(file);
-    } else throw new Error("Usage: rl config show|init");
+    } else throw new Error("Usage: rl setup show|init");
     return 0;
   }
   if (command === "exec") {
@@ -237,44 +229,38 @@ export async function main(argv: string[]): Promise<number> {
       });
     });
   }
-  if (!["switch", "new", "open"].includes(command))
-    throw new Error("Unknown workspace workflow command");
-  arity(names, command === "open" ? 0 : 1);
-  const selectedBranch =
-    values.branch ?? (command === "open" ? values.base : undefined);
-  if (command === "open" && typeof selectedBranch !== "string")
-    throw new Error("Usage: rl open --branch <branch>");
+  arity(names, 1);
   const agent = typeof values.agent === "string" ? values.agent : undefined;
   if (agent && !SUPPORTED_AGENTS.has(agent))
     throw new Error("Agent must be codex or claude");
   const base =
-    command !== "open" && typeof values.base === "string"
-      ? values.base
-      : context.defaultBase;
-  const creating = !!values.create || command === "new" || command === "open";
-  const branch =
-    typeof selectedBranch === "string"
-      ? selectedBranch.replace(/^origin\//, "")
-      : names[0];
-  const target = creating
-    ? await createWorkspace(
+    typeof values.base === "string" ? values.base : context.defaultBase;
+  let target: WorkspaceTarget & { created?: boolean };
+  if (values.create) {
+    target = await createWorkspace(
+      context,
+      names[0],
+      base,
+      !!values["no-fetch"],
+    );
+  } else {
+    try {
+      target = resolveWorkspace(context, names[0]);
+    } catch (error) {
+      if (
+        !(error instanceof Error) ||
+        !error.message.startsWith("Workspace not found:")
+      )
+        throw error;
+      target = await createWorkspace(
         context,
-        branch,
+        names[0].replace(/^origin\//, ""),
         base,
         !!values["no-fetch"],
-        command === "switch"
-          ? {}
-          : {
-              reuseExisting: true,
-              ...(command === "open"
-                ? {
-                    directoryName: branch.replaceAll("/", "-"),
-                    requireBranch: true,
-                  }
-                : {}),
-            },
-      )
-    : resolveWorkspace(context, names[0]);
+        { reuseExisting: true, requireBranch: true },
+      );
+    }
+  }
   await context.store.adopt(target.path, base);
   if (values.setup) {
     const code = await locked(

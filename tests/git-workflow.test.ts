@@ -125,19 +125,14 @@ function github(w: Workspace, fork = false) {
   });
   w.stub(
     "gh",
-    `const args=process.argv.slice(2); if(args[0]==='repo') console.log(JSON.stringify({nameWithOwner:'example/project',url:'https://github.com/example/project'})); else if(args[1]==='checks') {console.log('[{"name":"test","bucket":"pending"}]');process.exit(8);} else console.log(process.env.GH_PR);`,
+    `const args=process.argv.slice(2); if(args[0]==='repo') console.log(JSON.stringify({nameWithOwner:'example/project',url:'https://github.com/example/project'})); else console.log(process.env.GH_PR);`,
   );
 }
 
-test("PR checks propagate pending exit and fork checkout cannot collide with local head", (t) => {
+test("fork checkout cannot collide with local head", (t) => {
   const w = new Workspace(t);
   github(w, true);
   const before = w.git(w.a, "rev-parse", "HEAD");
-  assert.match(
-    workflow(w, ["pr", "checks", "--json"], { ok: false }, "pr-workflow")
-      .stdout,
-    /pending/,
-  );
   assert.match(
     workflow(
       w,

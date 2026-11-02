@@ -6,31 +6,41 @@ Create a workspace, start an agent, and keep task notes and sessions together.
 Switch projects, prepare local dependencies, check PRs, and merge finished work
 without losing your place.
 
-Requires macOS or Linux, Git, zsh, and Node.js 22+. Bash users can use the Bash
-integration. Install `fzf` for pickers, `gh` for PR commands, and whichever agent
-you use.
+Requires macOS or Linux and Node.js 22+. Global npm installation sets up Git,
+zsh, fzf, GitHub CLI and integration for your zsh or bash terminal.
 
 ## Install
 
 Install from npm:
 
 ```sh
-npm install --global rl-workspaces
+npm install --global rl-workspaces --foreground-scripts
 ```
 
 See Development below to build and try unpublished changes.
 
-Add one line to your shell configuration, then open a new terminal:
+The installer installs missing tools through your package manager, preserves
+your shell settings, and registers one RL integration block. Open a new terminal
+after installation; bare `rl` can then select a workspace and change directory.
+For the terminal that ran the install, use the activation command printed by the
+installer, or:
 
 ```sh
-eval "$(command rl setup shell zsh)"   # ~/.zshrc
+eval "$(command rl setup shell zsh)"
 # or
-eval "$(command rl setup shell bash)"  # ~/.bashrc
+eval "$(command rl setup shell bash)"
 ```
 
-Shell integration lets `rl` change your terminal's directory. Direct executable
-calls print the selected path. The integration loads the current runtime on
-each call, so an npm upgrade does not leave you using old commands.
+This activates the setup already registered for future terminals. Shell
+integration is what lets `rl` change the calling terminal's directory; an
+executable by itself can only print the selected path. The integration loads
+the current runtime on each call, including after npm upgrades.
+
+Tool installation needs Homebrew on macOS, or Homebrew/APT/DNF/Yum/Pacman/APK
+on Linux, with permission to install packages. A failed setup reports the command
+to finish in your terminal. If lifecycle scripts were disabled, run
+`rl setup install` to complete everything. `rl setup dependencies --check`
+checks tools without changing them. GitHub PR commands require `gh auth login`.
 
 ## Get started
 
@@ -81,13 +91,17 @@ under `rl agent`, cleanup under `rl storage`, and project/shell setup under
 | `rl delete` | Remove workspaces |
 | `rl storage` | Inspect disk usage and clean generated files |
 
-`rl help switch` also documents the specialized `new`, `open`, and `path`
-helpers. `rl help exec` describes running an arbitrary command in a workspace.
+`rl switch <branch>` opens an existing checkout or creates a managed workspace
+for an existing local or origin branch. Remote branches are tracked automatically.
+`rl switch -c <branch>` creates a feature workspace from the configured base and
+refuses an already checked-out branch. Both use nested branch names as directory
+paths. Switching installs hooks and preserves existing notes. A checkout that RL
+adopts outside its usual worktree folder also appears in the open picker and can
+be selected by directory name or branch. Unadopted outside checkouts stay hidden;
+the delete picker remains restricted to the managed worktree folder.
 
-Switching installs hooks and preserves existing notes. Creation validates names
-and refuses path escapes or an already checked-out branch. `switch -c` requires a
-new checkout; `new` and `open` can reopen an existing checkout. `open` flattens
-slashes in directory names; `new` and `switch -c` retain nested names.
+`rl help path` documents printing workspace paths, and `rl help exec` describes
+running a command with a workspace's configured environment.
 
 Pickers show cached PR state, commits ahead/behind the base, and recent use.
 The `COMMITS + / −` column counts commits ahead/behind, rather than changed lines.
@@ -210,7 +224,6 @@ rl pr                     # open this branch's PR in your browser
 rl pr sync                # save this branch's PR state
 rl pr show                # readable saved snapshot with the full PR link
 rl pr show --json         # saved metadata for scripts
-rl pr checks [--json]     # query checks and preserve gh's exit status
 rl pr checkout 123        # new managed pr-123 workspace
 rl pr checkout 123 --name review/login
 rl pr update --base test   # select your RL session PRs behind test, then update them
@@ -224,7 +237,8 @@ refresh output. `rl pr show` works offline. `rl pr` uses the saved URL when
 available; if the browser cannot open, that link remains in its output. With no
 saved PR, it looks up the current branch through `gh pr view --web`.
 
-Opening, refreshing, checks, and checkout require authenticated `gh`. Checkout verifies the origin repository,
+Opening, refreshing, and checkout require authenticated `gh`. Use `gh pr checks`
+to inspect CI results. Checkout verifies the origin repository,
 PR identity, and fetched commit before creating a workspace. Fork PR checkout
 is currently rejected. It does not change your current branch, publish, or merge
 a PR. Failed refreshes retain the previous snapshot.
@@ -336,7 +350,7 @@ used matching session directly.
 `rl continue` still resumes the exact session saved in its task handoff.
 
 Run Codex normally in an adopted RL workspace, including in the Codex app.
-`rl status`, `rl list`, `rl instances`, `rl agent sessions`, and `rl resume` / `rl resume codex`
+`rl status`, `rl list`, `rl agent sessions`, and `rl resume` / `rl resume codex`
 automatically discover and save matching sessions through Codex's
 [`thread/list` API](https://learn.chatgpt.com/docs/app-server#list-threads-with-pagination--filters).
 Discovery filters by the exact workspace directory, excludes subagents and
@@ -386,6 +400,14 @@ without creating configuration files. Your current Codex or Claude session
 creates and controls its native children. RL supplies their editable roles,
 handoff rules, review policy and durable run records. RL never launches a
 provider CLI, model API or check process for a workflow.
+
+Use your normal agent session in the workspace. RL's hooks advertise discovery
+automatically; a special launcher or pasted workflow prompt is unnecessary.
+An agent can run `rl workflow context --json` through its ordinary shell tool.
+The response includes active definitions plus `protocol.tools`: each operation's
+input schema, CLI command, positional/flag mappings and JSON stdin requirements.
+The same schemas are advertised through MCP, so an agent can use either connection.
+Native subagent support still comes from the current session's host.
 
 The default team starts together and stays available for the task:
 
@@ -600,27 +622,30 @@ the server does not inherit it. Claude requires an explicit UUID.
 Append tools take `{"text":"..."}`. They share the same locked document updates
 as the CLI and expose no arbitrary command, deletion, or filesystem tool.
 
-In the adopted workspace, add an entry to its trusted `.codex/config.toml`:
+From an adopted RL workspace, connect your current agent with:
 
-```toml
-[mcp_servers.rl]
-command = "rl"
-args = ["agent", "mcp"]
+```sh
+rl setup mcp
 ```
 
-For Claude, merge this entry into the workspace's `.mcp.json`:
+This configures both `.codex/config.toml` and `.mcp.json` in the current checkout.
+Pass `codex` or `claude` to select one client, or `--dry-run` to preview changes.
+Setup preserves other servers and settings, including Codex comments. It updates
+RL-managed entries on later runs and leaves a conflicting manually configured
+`rl` entry for you to resolve. Both files are validated before writing either.
 
-```json
-{
-  "mcpServers": {
-    "rl": { "type": "stdio", "command": "rl", "args": ["agent", "mcp"] }
-  }
-}
-```
+The client starts the installed Node and RL entry point directly. The server is
+bound to this checkout, repository and RL state directory, even when the client
+starts it elsewhere or has no `rl` executable on PATH. Entries contain local
+installation/workspace paths: run setup in each checkout and rerun after moving
+Node or RL. Setup changes only this workspace's configuration.
 
-The client must launch the server in this workspace with `rl` on PATH.
-With custom state settings, pass the same `RL_STATE_DIR` in the server environment.
-Review project trust/server approval normally. Configuration follows the official
+Reload the client and review its normal project trust/MCP approval. The server
+supplies discovery, consultations and rated reviews to your existing session;
+the host supplies native agent creation and messaging. CLI discovery remains
+available without an MCP connection. The stdio server can also be launched with
+`rl agent mcp`, or `rl agent mcp --workspace <absolute-path>` when the repository
+has been selected explicitly. Configuration follows the official
 [Codex MCP guide](https://learn.chatgpt.com/docs/extend/mcp?surface=cli) and
 [Claude MCP guide](https://code.claude.com/docs/en/mcp).
 RL does not modify global client settings or relax agent sandbox permissions.
@@ -696,22 +721,6 @@ Environment variables can also come from trusted zsh configuration selected by
 `RL_CONFIG`, defaulting to `~/.config/rl/config.zsh`. See
 [config.example.zsh](config.example.zsh). Registration supplies repository/base
 settings; `rl help` and individual `--help` show command options.
-
-## Compatibility aliases
-
-Existing commands keep their behavior. They are omitted from the main help to
-keep one primary spelling for each operation:
-
-| Previous command | Primary command |
-| --- | --- |
-| `rl merge` | `rl git merge` |
-| `rl context/progress show/set/append/path` | `rl notes show/set/append/path context/progress` |
-| `rl summary` | `rl notes summary` |
-| `rl session list/save/add` | `rl agent sessions/save` |
-| `rl handoff`, `rl mcp` | `rl agent handoff`, `rl agent mcp` |
-| `rl clean` | `rl storage clean` |
-| `rl config init/show`, `rl adopt`, `rl init` | `rl setup init/show`, `rl setup adopt`, `rl setup shell` |
-| `rl status --list`, `rl status --all` | `rl list`, `rl list --all` |
 
 ## Development
 

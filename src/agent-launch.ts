@@ -89,7 +89,9 @@ export async function main(argv: string[]): Promise<number> {
       values.prompt !== undefined ||
       (values.stdout && values.output !== undefined)
     )
-      throw new Error("Usage: rl handoff [agent] [--stdout | --output path]");
+      throw new Error(
+        "Usage: rl agent handoff [agent] [--stdout | --output path]",
+      );
     const text = await handoff(context.store, name, target.path);
     if (typeof values.output === "string")
       fs.writeFileSync(values.output, text, { flag: "wx", mode: 0o600 });

@@ -28,7 +28,7 @@ export async function resumeSessions(
     });
   if (!choices.length)
     throw new Error(
-      `No ${kind ? `${kind} ` : ""}session recorded for ${data.id}. Use 'rl session save' to save a session first`,
+      `No ${kind ? `${kind} ` : ""}session recorded for ${data.id}. Use 'rl agent save' to save a session first`,
     );
   let selected = choices[0];
   if (choices.length > 1 && !options.latest) {
@@ -104,7 +104,7 @@ export async function resumeAgent(
           );
     if (!item)
       throw new Error(
-        `No ${kind} session recorded for ${data.id}. Use 'rl session save ${kind}${kind === "claude" ? " <UUID>" : ""}'`,
+        `No ${kind} session recorded for ${data.id}. Use 'rl agent save ${kind}${kind === "claude" ? " <UUID>" : ""}'`,
       );
     return [file, data, sessionId(item.id)] as const;
   });

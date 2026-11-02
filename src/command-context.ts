@@ -76,7 +76,7 @@ export function resolveWorkspace(
     const [root, branch] = context.store.worktree(context.repo);
     return { path: root, name: "@", branch };
   }
-  const choices = candidates(context.repo, context.managedDir);
+  const choices = candidates(context.repo, context.managedDir, context.store);
   const matches = choices.filter(
     (item) =>
       item.name === selector ||

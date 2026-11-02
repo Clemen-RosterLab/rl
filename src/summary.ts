@@ -142,7 +142,7 @@ function render(
     );
   } else
     parts.push(
-      `The configured comparison base ${inline(comparison)} could not be resolved. Committed work was omitted; run \`rl summary --base <branch-or-commit>\` to include it.`,
+      `The configured comparison base ${inline(comparison)} could not be resolved. Committed work was omitted; run \`rl notes summary --base <branch-or-commit>\` to include it.`,
     );
   parts.push(
     "## Uncommitted work",

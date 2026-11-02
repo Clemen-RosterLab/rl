@@ -321,7 +321,7 @@ function suggestions(
   const result: string[] = [];
   if (estimatedBytes)
     result.push(
-      `Run rl clean --dry-run to preview ${size(estimatedBytes)} of configured generated files.`,
+      `Run rl storage clean --dry-run to preview ${size(estimatedBytes)} of configured generated files.`,
     );
   else if (usage.dependenciesBytes || usage.buildsBytes)
     result.push(
@@ -351,7 +351,7 @@ export async function main(argv: string[]): Promise<number> {
     (command === "clean" && values["older-than"] !== undefined)
   )
     throw new Error(
-      "Usage: rl storage [--json] [--older-than 14d] | rl clean [--dry-run] [--json] (current workspace only)",
+      "Usage: rl storage [--json] [--older-than 14d] | rl storage clean [--dry-run] [--json] (current workspace only)",
     );
   const context = commandContext(values);
   // Resolve from the caller's cwd before any scan, lock creation, or mutation.

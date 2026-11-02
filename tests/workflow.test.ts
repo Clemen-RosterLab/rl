@@ -22,7 +22,9 @@ test("unconfigured creation and registration default to origin/test even when ma
   assert.notEqual(testBase, w.git(w.repo, "rev-parse", "develop"));
   assert.notEqual(testBase, w.git(w.repo, "rev-parse", "main"));
 
-  const created = w.rl(["new", "default-test", "--no-fetch"]).stdout.trim();
+  const created = w
+    .rl(["switch", "-c", "default-test", "--no-fetch"])
+    .stdout.trim();
   assert.equal(w.git(created, "rev-parse", "HEAD"), testBase);
   assert.equal(w.status(created).baseBranch, "origin/test");
   const direct = w
@@ -56,7 +58,7 @@ test("unconfigured creation and registration default to origin/test even when ma
   // Use the legacy route to check that an explicit environment setting still works.
   w.rl(["repo", "remove", "example"]);
   const explicit = w
-    .rl(["new", "explicit-develop", "--no-fetch"])
+    .rl(["switch", "-c", "explicit-develop", "--no-fetch"])
     .stdout.trim();
   assert.equal(
     w.git(explicit, "rev-parse", "HEAD"),
@@ -82,9 +84,11 @@ test("creation fetches the latest default and explicit remote bases before branc
   assert.notEqual(latest, initial);
   assert.equal(w.git(w.repo, "rev-parse", "origin/test"), initial);
 
-  const offline = w.rl(["new", "offline-base", "--no-fetch"]).stdout.trim();
+  const offline = w
+    .rl(["switch", "-c", "offline-base", "--no-fetch"])
+    .stdout.trim();
   assert.equal(w.git(offline, "rev-parse", "HEAD"), initial);
-  const fresh = w.rl(["new", "fresh-base"]).stdout.trim();
+  const fresh = w.rl(["switch", "-c", "fresh-base"]).stdout.trim();
   assert.equal(w.git(fresh, "rev-parse", "HEAD"), latest);
   assert.equal(w.status(fresh).baseBranch, "origin/test");
   assert.equal(w.git(w.repo, "rev-parse", "test"), initial);
@@ -93,7 +97,7 @@ test("creation fetches the latest default and explicit remote bases before branc
   w.git(writer, "commit", "-q", "--allow-empty", "-m", "Remote custom base");
   w.git(writer, "push", "-q", "origin", "release/next");
   const custom = w
-    .rl(["new", "custom-fresh-base", "--base", "origin/release/next"])
+    .rl(["switch", "-c", "custom-fresh-base", "--base", "origin/release/next"])
     .stdout.trim();
   assert.equal(
     w.git(custom, "rev-parse", "HEAD"),
@@ -107,7 +111,7 @@ test("creation fetches the latest default and explicit remote bases before branc
     "origin",
     path.join(w.root, "missing-origin.git"),
   );
-  const failed = w.rl(["new", "failed-fetch"], { ok: false });
+  const failed = w.rl(["switch", "-c", "failed-fetch"], { ok: false });
   assert.match(failed.stderr, /Fetch failed/);
   assert.ok(
     !fs.existsSync(path.join(w.root, "worktrees/example/failed-fetch")),
@@ -163,11 +167,7 @@ test("switch creates, resolves nested names, opens branches, and preserves argv 
   w.rl(["switch", "../escape", "-c", "--no-fetch"], { ok: false });
   w.rl(["switch", "feature/new", "-c", "--no-fetch"], { ok: false });
   assert.equal(
-    w.rl(["new", "feature/new", "--no-fetch"]).stdout.trim(),
-    created,
-  );
-  assert.equal(
-    w.rl(["open", "-b", "feature/new", "--no-fetch"]).stdout.trim(),
+    w.rl(["switch", "feature/new", "--no-fetch"]).stdout.trim(),
     created,
   );
   assert.equal(
@@ -193,13 +193,46 @@ test("switch creates, resolves nested names, opens branches, and preserves argv 
   w.git(w.repo, "remote", "add", "origin", w.repo);
   w.git(w.repo, "update-ref", "refs/remotes/origin/remote-work", "HEAD");
   const remoteWorkspace = w
-    .rl(["open", "-b", "remote-work", "--no-fetch"])
+    .rl(["switch", "remote-work", "--no-fetch"])
     .stdout.trim();
   assert.equal(
     w.git(remoteWorkspace, "rev-parse", "--abbrev-ref", "@{upstream}"),
     "origin/remote-work",
   );
   assert.equal(w.status(remoteWorkspace).baseBranch, "origin/develop");
+});
+
+test("switch opens existing branches and rejects typos without creating feature branches", (t) => {
+  const w = new Workspace(t);
+  w.git(w.repo, "branch", "feature/existing", "develop");
+  const existing = w
+    .rl(["switch", "feature/existing", "--no-fetch"])
+    .stdout.trim();
+  assert.equal(
+    existing,
+    path.join(w.root, "worktrees/example/feature/existing"),
+  );
+  assert.equal(w.git(existing, "branch", "--show-current"), "feature/existing");
+  assert.equal(w.rl(["switch", "feature/existing"]).stdout.trim(), existing);
+  const missing = w.rl(["switch", "feature/typo", "--no-fetch"], { ok: false });
+  assert.match(missing.stderr, /Branch does not exist locally or on origin/);
+  assert.equal(
+    w.git(
+      w.repo,
+      "for-each-ref",
+      "--format=%(refname)",
+      "refs/heads/feature/typo",
+    ),
+    "",
+  );
+  assert.ok(
+    !fs.existsSync(path.join(w.root, "worktrees/example/feature/typo")),
+  );
+  w.rl(["switch", "feature/existing", "--base", "develop"], { ok: false });
+  assert.match(
+    w.rl(["switch", "../escape", "--no-fetch"], { ok: false }).stderr,
+    /Invalid workspace name/,
+  );
 });
 
 test("setup explicitly copies ignored files independently, skips existing files, and supplies deterministic environment", (t) => {
@@ -286,22 +319,22 @@ test("copy rejects escape, symlinks, tracked files and unsafe later entries befo
 
 test("config validation and hook failures are reported without silently continuing", (t) => {
   const w = new Workspace(t);
-  w.rl(["config", "init"]);
-  assert.deepEqual(JSON.parse(w.rl(["config", "show"]).stdout), {
+  w.rl(["setup", "init"]);
+  assert.deepEqual(JSON.parse(w.rl(["setup", "show"]).stdout), {
     copy: [],
     clean: [],
     env: {},
     onCreate: [],
     onOpen: [],
   });
-  w.rl(["config", "init"], { ok: false });
+  w.rl(["setup", "init"], { ok: false });
   for (const config of [
     { onCreate: ["echo unsafe"] },
     { env: { RL_PORT: "1" } },
     { unexpected: true },
   ]) {
     configure(w, config);
-    w.rl(["config", "show"], { ok: false });
+    w.rl(["setup", "show"], { ok: false });
   }
   configure(w, {
     onCreate: [[process.execPath, "-e", "process.exit(23)"]],
@@ -316,7 +349,7 @@ test("zsh and bash integration switch directories, remember previous workspace, 
   for (const shell of ["zsh", "bash"]) {
     w.managed(`remove-${shell}`);
     const script =
-      `eval "$("$RL_TEST_CLI" init ${shell})"\nrl switch shell-test\n[[ "$PWD" == "$RL_TEST_WORKSPACE" ]] || exit 10\nrl switch @\n[[ "$PWD" == "$RL_REPO_ROOT" ]] || exit 11\nrl switch -\n[[ "$PWD" == "$RL_TEST_WORKSPACE" ]] || exit 12\n` +
+      `eval "$("$RL_TEST_CLI" setup shell ${shell})"\nrl switch shell-test\n[[ "$PWD" == "$RL_TEST_WORKSPACE" ]] || exit 10\nrl switch @\n[[ "$PWD" == "$RL_REPO_ROOT" ]] || exit 11\nrl switch -\n[[ "$PWD" == "$RL_TEST_WORKSPACE" ]] || exit 12\n` +
       (shell === "zsh"
         ? `_rl_main() { return 88; }\nrl path @\n`
         : "rl path @\n") +
@@ -362,7 +395,7 @@ test("project environment cannot inject executable loaders into exec or either a
   ]) {
     configure(w, { env: { [key]: value } });
     const commands = [
-      ["config", "show"],
+      ["setup", "show"],
       ["exec", "--", process.execPath, "-e", "process.exit(0)"],
       ...["codex", "claude"].flatMap((agent) => [
         ["agent", "start", agent],

@@ -31,7 +31,7 @@ const topics: Record<string, Topic> = {
     options: [
       "-c, --create          Create a new branch workspace",
       "-b, --base <ref>      Creation base (default: origin/test unless configured)",
-      "--no-fetch           Use cached refs when creating",
+      "--no-fetch           Use cached refs when opening or creating",
       "--setup              Run configured project setup",
       "--agent codex|claude  Start an agent after switching",
       "-- <agent args>      Forward options to the selected agent",
@@ -40,13 +40,13 @@ const topics: Record<string, Topic> = {
       "Use rl checkout [repository] to switch repositories in your shell.",
       "@ opens the main checkout; - returns to the previous workspace.",
       "Shell integration changes your terminal's directory.",
-      "Related creation helpers: new reopens existing workspaces; open requires an existing branch.",
+      "An existing branch without a checkout gets a managed workspace; origin branches are tracked.",
     ],
     examples: [
       "rl switch feature/login",
       "rl switch feature/login -c --base origin/test",
     ],
-    related: ["new", "open", "path"],
+    related: ["path"],
   },
   list: {
     group: "Workspaces",
@@ -74,9 +74,9 @@ const topics: Record<string, Topic> = {
     notes: [
       "Shows repository selection, checkout path, base, workspaces and saved session counts.",
       "--workspace includes Git changes, PR, sessions, task handoff and latest workflow.",
-      "Use rl list for workspace overviews; status --list and --all remain supported.",
+      "Use rl list for workspace overviews and --include-deleted for archived records.",
     ],
-    related: ["list", "instances"],
+    related: ["list"],
   },
   delete: {
     group: "Workspaces",
@@ -132,6 +132,9 @@ const topics: Record<string, Topic> = {
     description: "Configure native agent roles and saved sessions",
     usage: "rl agent <command>",
     related: ["resume", "workflow", "policy"],
+    notes: [
+      "Existing agent sessions discover their workflow with rl workflow context --json. A special launcher or MCP connection is not required.",
+    ],
   },
   "agent start": {
     description: "Start an interactive agent",
@@ -194,8 +197,11 @@ const topics: Record<string, Topic> = {
   },
   "agent mcp": {
     description: "Serve workspace context and notes through MCP",
-    usage: "rl agent mcp",
-    notes: ["Uses stdio. Start the server in the adopted workspace."],
+    usage: "rl agent mcp [--workspace <absolute-path>]",
+    notes: [
+      "Uses stdio. Start the server in the adopted workspace, or bind one explicitly with --workspace.",
+    ],
+    related: ["setup mcp"],
   },
   workflow: {
     group: "Agents and tasks",
@@ -253,6 +259,9 @@ const topics: Record<string, Topic> = {
   "workflow context": {
     description: "Discover profiles, policies, workflows and trigger rules",
     usage: "rl workflow context [--json]",
+    notes: [
+      "For an existing agent session: --json includes profiles, policies, workflows, and protocol.tools with every CLI command and input schema. Use your normal shell tool; MCP and rl agent start are optional.",
+    ],
   },
   "workflow pending": {
     description: "Read queued workflows for the parent session",
@@ -423,10 +432,6 @@ const topics: Record<string, Topic> = {
     description: "Refresh the saved PR snapshot",
     usage: "rl pr sync [number|URL] [--json]",
   },
-  "pr checks": {
-    description: "Show GitHub check results",
-    usage: "rl pr checks [--json]",
-  },
   "pr checkout": {
     description: "Create a workspace for a PR",
     usage: "rl pr checkout <number> [--name <branch>]",
@@ -540,6 +545,34 @@ const topics: Record<string, Topic> = {
     usage: "rl setup adopt [--extended-hooks]",
     notes: ["Preserves existing hooks. Review Codex hook trust with /hooks."],
   },
+  "setup mcp": {
+    description: "Connect this workspace's RL MCP server to your agent",
+    usage: "rl setup mcp [codex|claude] [--dry-run] [--json]",
+    notes: [
+      "Configures both clients by default: .codex/config.toml and .mcp.json in this adopted workspace.",
+      "Preserves other settings and servers. Existing unmanaged entries named rl require manual resolution.",
+      "Launches the installed Node/RL directly, with this workspace and its RL state bound explicitly. Rerun after moving the installation.",
+      "Reload your client and review its normal project trust/MCP approval. Your existing session creates native subagents.",
+    ],
+  },
+  "setup dependencies": {
+    description: "Install or check Git, zsh, fzf and GitHub CLI",
+    usage: "rl setup dependencies [--check | --dry-run] [--json]",
+    notes: [
+      "npm installation installs missing tools through an existing package manager. This command repairs skipped or failed dependency setup.",
+      "Uses Homebrew on macOS, and Homebrew, APT, DNF, Yum, Pacman or APK on Linux. Administrator access may be required on Linux.",
+      "Runs directly with Node, so it also works before zsh or a repository is available.",
+    ],
+  },
+  "setup install": {
+    description: "Complete or repair RL installation and shell integration",
+    usage: "rl setup install [--shell zsh|bash]",
+    notes: [
+      "Global npm installation runs this automatically: missing Git, zsh, fzf and gh are installed, then your shell startup file is updated.",
+      "Preserves your settings and updates one RL-owned block. New terminals load RL automatically; reload the installing terminal once.",
+      "Use this command after an install with lifecycle scripts disabled, or to repair setup.",
+    ],
+  },
   "setup shell": {
     description: "Print shell integration",
     usage: "rl setup shell <zsh|bash>",
@@ -554,16 +587,6 @@ const topics: Record<string, Topic> = {
       "--repair reinstalls this workspace's RL hooks.",
     ],
   },
-  new: {
-    description: "Create or reopen a branch workspace",
-    usage: "rl new <branch> [--base <ref>] [--no-fetch] [--setup]",
-    related: ["switch"],
-  },
-  open: {
-    description: "Open an existing local or origin branch",
-    usage: "rl open --branch <branch> [--setup] [--no-fetch]",
-    related: ["switch"],
-  },
   path: {
     description: "Print a workspace path",
     usage: "rl path [name|branch|@]",
@@ -574,57 +597,8 @@ const topics: Record<string, Topic> = {
     usage: "rl exec [--workspace <name>] -- <command> [args...]",
     related: ["setup run"],
   },
-  instances: {
-    description: "Inspect active and archived instance records",
-    usage: "rl instances",
-    related: ["status", "list"],
-  },
 };
 
-const aliases: [string[], string[]][] = [
-  [["merge"], ["git", "merge"]],
-  [["clean"], ["storage", "clean"]],
-  [["summary"], ["notes", "summary"]],
-  [["handoff"], ["agent", "handoff"]],
-  [["mcp"], ["agent", "mcp"]],
-  [
-    ["session", "list"],
-    ["agent", "sessions"],
-  ],
-  [
-    ["session", "save"],
-    ["agent", "save"],
-  ],
-  [
-    ["session", "add"],
-    ["agent", "save"],
-  ],
-  [["session"], ["agent"]],
-  [
-    ["config", "init"],
-    ["setup", "init"],
-  ],
-  [
-    ["config", "show"],
-    ["setup", "show"],
-  ],
-  [["config"], ["setup"]],
-  [["adopt"], ["setup", "adopt"]],
-  [["init"], ["setup", "shell"]],
-];
-function canonical(words: string[]): string[] {
-  if (
-    words[0] === "status" &&
-    words.some((word) => word === "--all" || word === "--list")
-  )
-    return ["list", ...words.slice(1)];
-  if (["context", "progress"].includes(words[0]))
-    return ["notes", words[1] ?? "show", words[0], ...words.slice(2)];
-  const alias = aliases.find(([from]) =>
-    from.every((word, i) => words[i] === word),
-  );
-  return alias ? [...alias[1], ...words.slice(alias[0].length)] : words;
-}
 const children = (name: string) =>
   Object.entries(topics).filter(
     ([key]) =>
@@ -664,12 +638,8 @@ function match(words: string[]): string | undefined {
 }
 export function topicHelp(words: string[]): string {
   if (!words.length) return mainHelp();
-  const normalized = canonical(words),
-    name = match(normalized);
-  if (
-    !name ||
-    (children(name).length && normalized.length > name.split(" ").length)
-  )
+  const name = match(words);
+  if (!name || (children(name).length && words.length > name.split(" ").length))
     throw new Error(`Unknown help topic: ${safe(words.join(" "))}`);
   const topic = topics[name];
   const lines = [topic.description, "", `Usage: ${topic.usage}`];
@@ -721,30 +691,42 @@ export function invocation(module: string, argv: string[]): string[] {
   while (argv[index]?.startsWith("--") && CONTEXT.has(argv[index].slice(2)))
     index += 2;
   const rest = argv.slice(index);
-  const prefix: Record<string, string[]> = {
-    delete: ["delete"],
-    summary: ["summary"],
-    mcp: ["mcp"],
-    picker: [],
-  };
-  const words = Object.hasOwn(prefix, module)
-    ? [...prefix[module], ...rest]
-    : module === "agent" && rest[0] !== "handoff"
-      ? ["agent", ...rest]
-      : rest;
+  if (module === "summary") return ["notes", "summary", ...rest];
+  if (module === "mcp") return ["agent", "mcp", ...rest];
+  if (module === "mcp-setup") return ["setup", "mcp", ...rest];
+  if (module === "delete") return ["delete", ...rest];
+  if (module === "picker") return [];
+  if (module === "agent") return ["agent", ...rest];
+  if (module === "git") return ["git", ...rest];
+  if (module === "storage")
+    return rest[0] === "clean" ? ["storage", ...rest] : rest;
+  if (module === "workflow" && rest[0] === "config")
+    return ["setup", ...rest.slice(1)];
+  if (module === "state") {
+    if (rest[0] === "session")
+      return [
+        "agent",
+        rest[1] === "list" ? "sessions" : "save",
+        ...rest.slice(2),
+      ];
+    if (rest[0] === "adopt") return ["setup", ...rest];
+    if (["context", "progress"].includes(rest[0]))
+      return ["notes", rest[1] ?? "show", rest[0], ...rest.slice(2)];
+  }
+  if (
+    module === "repos" &&
+    rest[0] === "status" &&
+    rest.some((word) => word === "--all" || word === "--list")
+  )
+    return ["list", ...rest.slice(1)];
   const defaults: Record<string, string> = {
     state: "status",
     repos: "repo",
     workflow: "switch",
-    git: "git",
-    agent: "agent",
     automation: "workflow",
-    storage: "storage",
     "pr-update": "pr",
   };
-  return canonical(
-    words.length ? words : defaults[module] ? [defaults[module]] : [],
-  );
+  return rest.length ? rest : defaults[module] ? [defaults[module]] : [];
 }
 export function usageHint(
   module: string,

@@ -22,25 +22,25 @@ git -C "$RL_REPO_ROOT" push -q -u origin test
 git -C "$RL_REPO_ROOT" push -q origin test:feature/remote
 git -C "$RL_REPO_ROOT" branch develop test
 cd "$scratch"
-"$root/bin/rl" new task
+"$root/bin/rl" switch -c task
 [[ -d "$RL_WORKTREE_DIR/example/task" ]]
 [[ $(git -C "$RL_WORKTREE_DIR/example/task" branch --show-current) == task ]]
-"$root/bin/rl" open -b task
-"$root/bin/rl" open --branch origin/feature/remote
-[[ $(git -C "$RL_WORKTREE_DIR/example/feature-remote" rev-parse --abbrev-ref '@{upstream}') == origin/feature/remote ]]
-"$root/bin/rl" new custom-base -b develop
+"$root/bin/rl" switch task
+"$root/bin/rl" switch origin/feature/remote
+[[ $(git -C "$RL_WORKTREE_DIR/example/feature/remote" rev-parse --abbrev-ref '@{upstream}') == origin/feature/remote ]]
+"$root/bin/rl" switch -c custom-base -b develop
 git -C "$RL_REPO_ROOT" branch reusable develop
-"$root/bin/rl" new reusable
+"$root/bin/rl" switch reusable
 git -C "$RL_REPO_ROOT" branch elsewhere develop
 git -C "$RL_REPO_ROOT" worktree add -q "$scratch/elsewhere" elsewhere
-"$root/bin/rl" new elsewhere
-if "$root/bin/rl" new ../escape; then exit 1; fi
+"$root/bin/rl" switch elsewhere
+if "$root/bin/rl" switch -c ../escape; then exit 1; fi
 if "$root/bin/rl" delete ../escape; then exit 1; fi
-if "$root/bin/rl" new missing -b nonexistent; then exit 1; fi
+if "$root/bin/rl" switch -c missing -b nonexistent; then exit 1; fi
 if "$root/bin/rl" unknown; then exit 1; fi
-print dirty > "$RL_WORKTREE_DIR/example/feature-remote/untracked"
-"$root/bin/rl" delete --force feature-remote
-[[ ! -d "$RL_WORKTREE_DIR/example/feature-remote" ]]
+print dirty > "$RL_WORKTREE_DIR/example/feature/remote/untracked"
+"$root/bin/rl" delete --force feature/remote
+[[ ! -d "$RL_WORKTREE_DIR/example/feature/remote" ]]
 if git -C "$RL_REPO_ROOT" show-ref --verify --quiet refs/heads/feature/remote; then exit 1; fi
 [[ -n $(git -C "$RL_REPO_ROOT" ls-remote origin refs/heads/feature/remote) ]]
 
@@ -48,8 +48,8 @@ if git -C "$RL_REPO_ROOT" show-ref --verify --quiet refs/heads/feature/remote; t
 RL_INSTALL_DIR="$scratch/installed bin" "$root/install.sh"
 RL_INSTALL_DIR="$scratch/installed bin" "$root/install.sh"
 "$scratch/installed bin/rl" help
-eval "$("$scratch/installed bin/rl" init zsh)"
-rl open -b task
+eval "$("$scratch/installed bin/rl" setup shell zsh)"
+rl switch task
 [[ "$PWD" == "$RL_WORKTREE_DIR/example/task" ]]
 
 # Deterministic fzf substitute exercises selection and cancellation.
@@ -69,6 +69,6 @@ cd "$scratch"
 
 # File configuration and environment precedence.
 print 'RL_DEFAULT_BASE=nonexistent' > "$RL_CONFIG"
-if "$root/bin/rl" new config-failure; then exit 1; fi
-RL_DEFAULT_BASE=develop "$root/bin/rl" new config-override
+if "$root/bin/rl" switch -c config-failure; then exit 1; fi
+RL_DEFAULT_BASE=develop "$root/bin/rl" switch -c config-override
 print 'All smoke checks passed.'

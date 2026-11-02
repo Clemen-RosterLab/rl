@@ -32,7 +32,7 @@ export async function handleHook(
     );
     if (data.key !== key)
       throw new Error(
-        "Hook belongs to a different RL instance; run 'rl adopt' to repair it",
+        "Hook belongs to a different RL instance; run 'rl setup adopt' to repair it",
       );
     try {
       const event = adapter.parse(payload);

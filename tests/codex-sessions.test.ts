@@ -78,10 +78,11 @@ test("ordinary Codex sessions are discovered, persisted, shown in overview and r
     before,
   );
   assert.equal(
-    JSON.parse(w.rl(["session", "list", "codex"], { cwd: w.a }).stdout).length,
+    JSON.parse(w.rl(["agent", "sessions", "codex"], { cwd: w.a }).stdout)
+      .length,
     2,
   );
-  const table = w.rl(["status", "--list"], { cwd: w.a }).stdout;
+  const table = w.rl(["list"], { cwd: w.a }).stdout;
   assert.match(table, /CODEX\s+CLAUDE/);
   assert.match(
     table.split("\n").find((line) => line.includes("feature/a")) ?? "",
@@ -165,7 +166,7 @@ test("discovery preserves established ownership and newer hook timestamps", (t) 
 test("missing, failing and malformed Codex discovery preserves saved status", (t) => {
   const w = new Workspace(t),
     id = randomUUID();
-  w.rl(["session", "add", "codex", id], { cwd: w.a });
+  w.rl(["agent", "save", "codex", id], { cwd: w.a });
   for (const code of [
     "process.exit(1)",
     "console.log('{bad')",
@@ -190,26 +191,26 @@ test("save uses the current Codex thread UUID and remains idempotent without hoo
   const nested = path.join(w.a, "nested");
   fs.mkdirSync(nested);
   const saved = JSON.parse(
-    w.rl(["session", "save", "--json"], { cwd: nested }).stdout,
+    w.rl(["agent", "save", "--json"], { cwd: nested }).stdout,
   );
   assert.deepEqual(saved, {
     agent: "codex",
     sessionId: id,
     instance: "feature/a",
   });
-  w.rl(["session", "save", "codex"], { cwd: w.a });
+  w.rl(["agent", "save", "codex"], { cwd: w.a });
   assert.equal(w.status().sessions.codex.length, 1);
   w.rl(["resume", "codex"], { cwd: w.a });
   assert.deepEqual(w.calls()[0].argv.slice(1), ["resume", id]);
-  w.rl(["session", "save", "codex"], { cwd: w.b, ok: false });
+  w.rl(["agent", "save", "codex"], { cwd: w.b, ok: false });
   assert.deepEqual(w.status(w.b).sessions.codex, []);
   delete w.env.CODEX_THREAD_ID;
   delete w.env.CODEX_SESSION_ID;
-  w.rl(["session", "save"], { cwd: w.a, ok: false });
-  w.rl(["session", "save", "claude"], { cwd: w.a, ok: false });
+  w.rl(["agent", "save"], { cwd: w.a, ok: false });
+  w.rl(["agent", "save", "claude"], { cwd: w.a, ok: false });
   w.env.CODEX_THREAD_ID = "--last";
-  w.rl(["session", "save"], { cwd: w.a, ok: false });
-  w.rl(["session", "save", "codex", randomUUID()], { cwd: w.a });
+  w.rl(["agent", "save"], { cwd: w.a, ok: false });
+  w.rl(["agent", "save", "codex", randomUUID()], { cwd: w.a });
   w.git(w.a, "checkout", "-q", "-b", "changed");
-  w.rl(["session", "save", "codex", randomUUID()], { cwd: w.a, ok: false });
+  w.rl(["agent", "save", "codex", randomUUID()], { cwd: w.a, ok: false });
 });

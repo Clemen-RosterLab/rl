@@ -341,7 +341,7 @@ export function automationContext(root: string): string {
     .digest("hex");
   return [
     `RL native agent configuration detected (${fingerprint}; source: ${hasAutomation(root) ? "workspace configuration" : "built-in defaults"}; default workflow: ${defaultWorkflow(config)}). You are the coordinator of this session's own native subagents.`,
-    "Discover profiles, workflow dependencies, trigger rules and policies with rl_workflow_context (MCP), or 'rl workflow context --json'. At planning milestones report the configured event with rl_workflow_event. Tool and before-finish hooks also queue matching requests. Read pending requests with rl_workflow_pending.",
+    "Use RL from this existing session; no special agent launcher or user-pasted workflow prompt is required. Run 'rl workflow context --json' to discover the active profiles, workflows, policies and the complete protocol.tools CLI commands and input schemas. Use the CLI through your normal shell tools; an MCP connection is optional. If MCP tools are connected, the same operation names and schemas apply. Follow the active configuration automatically for applicable tasks. At planning milestones report the configured event with rl_workflow_event. Tool and before-finish hooks also queue matching requests. Read pending requests with rl_workflow_pending.",
     "For coding tasks, report task_planned before implementation. A collaborative workflow starts all writer, reviewer and DRY native peers in parallel: claim all three roles, spawn them using your native tools, bind their handles with rl_workflow_bind, then relay messages or let peers use their own inbox. The writer submits checkpoints, the reviewer returns policy-based ratings, and DRY answers both peers. Keep all three peers available; do not replace them with sequential one-shot passes. Use collaboration tools for handoffs before final stage reports. Semantic new-function and duplication obligations require explicit declarations and consultation responses; RL cannot read private reasoning.",
     "For each request: rl_workflow_start creates a run tied to YOUR parent session; rl_workflow_claim atomically returns a ready step and its instructions. Spawn that step with YOUR native subagent tool, then submit its evidence with rl_workflow_report. Run command steps yourself and report actual output. RL never starts Codex, Claude, or check processes for a workflow. Do not substitute a separate CLI or API agent. Respect current permissions, workspace boundaries, explicit user instructions and native delegation availability. If delegation is unavailable, dismiss the request with the concrete reason and tell the user; do not claim it ran.",
     "Supply agent (codex or claude) and this parent conversation's full sessionId to workflow tools. UUIDs and observed Codex thr_ IDs are supported for workflow coordination; only verified UUIDs enter resumable history. CLI equivalents: 'rl workflow pending', 'rl workflow run --request <requestId>', 'rl workflow claim <run> --step <step>', 'rl workflow report <run> --file <report.json>', with --agent and --session. Profiles describe roles; their provider field is a legacy preference, never permission to start another provider. Unsupported native model/reasoning preferences must be reported, not silently substituted. Policies own scoring; return evidence without assigning yourself a score.",
@@ -453,6 +453,82 @@ export const WORKFLOW_TOOLS: {
   ...COLLABORATION_TOOLS,
 ];
 
+export function workflowToolSchema(tool: (typeof WORKFLOW_TOOLS)[number]) {
+  return {
+    type: "object",
+    properties: {
+      agent: { type: "string", enum: ["codex", "claude"] },
+      sessionId: {
+        type: "string",
+        description:
+          "Current parent conversation ID. Claude requires a UUID; Codex also accepts observed thr_ IDs and may inherit it.",
+      },
+      ...tool.properties,
+    },
+    required: tool.required,
+    additionalProperties: false,
+  };
+}
+
+function workflowProtocol() {
+  const identity = { agent: "--agent", sessionId: "--session" };
+  return {
+    version: 1,
+    coordinator: "current-session",
+    requiresMcp: false,
+    requiresRlLauncher: false,
+    requiresNativeSubagents: true,
+    discovery: "rl workflow context --json",
+    instruction:
+      "Use your current session's native subagent and messaging tools. RL supplies roles and coordination state. CLI operations below use the same inputSchema as MCP; tools with stdin: json accept the entire input object via --file -. These are coordination commands, never instructions to start a second provider process.",
+    tools: WORKFLOW_TOOLS.map((tool) => {
+      const action = tool.name.slice("rl_workflow_".length);
+      const file = !["context", "pending", "start", "claim", "inbox"].includes(
+        action,
+      );
+      const flags =
+        action === "start"
+          ? {
+              ...identity,
+              base: "--base",
+              prompt: "--prompt",
+              requestId: "--request",
+            }
+          : {
+              ...identity,
+              ...(action === "claim" || action === "inbox"
+                ? { step: "--step" }
+                : {}),
+              ...(action === "inbox" ? { claim: "--claim" } : {}),
+            };
+      return {
+        name: tool.name,
+        description: tool.description,
+        inputSchema: workflowToolSchema(tool),
+        cli: {
+          command: [
+            "rl",
+            "workflow",
+            action === "start" ? "run" : action,
+            ...(file ? ["--file", "-"] : []),
+            "--json",
+          ],
+          stdin: file ? "json" : "none",
+          positionals: file
+            ? []
+            : action === "start"
+              ? ["workflow"]
+              : action === "claim" || action === "inbox"
+                ? ["run"]
+                : [],
+          flags: file ? {} : flags,
+          output: "json",
+        },
+      };
+    }),
+  };
+}
+
 export async function callWorkflowTool(
   store: Store,
   name: string,
@@ -475,6 +551,7 @@ export async function callWorkflowTool(
       source: hasAutomation(data.worktree) ? "workspace" : "built-in",
       ...readAutomation(data.worktree),
       instructions: automationContext(data.worktree),
+      protocol: workflowProtocol(),
     };
   }
   const parent = owner(input);

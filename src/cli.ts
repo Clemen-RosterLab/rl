@@ -10,6 +10,7 @@ import { main as git } from "./git-workflow.js";
 import { main as pr } from "./pr-workflow.js";
 import { main as agent } from "./agent-launch.js";
 import { main as mcp } from "./mcp.js";
+import { main as mcpSetup } from "./mcp-setup.js";
 import { main as task } from "./task.js";
 import { main as storage } from "./storage.js";
 import { main as prUpdate } from "./pr-update.js";
@@ -25,6 +26,7 @@ const commands = {
   pr,
   agent,
   mcp,
+  "mcp-setup": mcpSetup,
   task,
   storage,
   "pr-update": prUpdate,

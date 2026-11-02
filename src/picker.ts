@@ -31,21 +31,44 @@ export interface Candidate {
   branch: string;
   locked: boolean;
 }
-export function candidates(repo: string, base: string): Candidate[] {
-  return worktrees(repo)
+export function candidates(
+  repo: string,
+  base: string,
+  store?: Store,
+): Candidate[] {
+  const adopted = new Map(
+    store
+      ?.records()
+      .filter(([, data]) => data.status === "active")
+      .map(([, data]) => [data.worktree, data.branch]),
+  );
+  const records = worktrees(repo)
     .slice(1)
     .flatMap((record) => {
       const root = canonical(record.worktree);
-      if (root === repo || !inside(root, base)) return [];
+      const managed = inside(root, base);
+      const branch = (record.branch ?? "").replace(/^refs\/heads\//, "");
+      if (root === repo || (!managed && adopted.get(root) !== branch))
+        return [];
       return [
         {
-          name: path.relative(base, root),
+          name: managed ? path.relative(base, root) : path.basename(root),
           path: root,
-          branch: (record.branch ?? "").replace(/^refs\/heads\//, ""),
+          branch,
           locked: "locked" in record,
         },
       ];
     });
+  // Preserve existing managed names. Outside checkouts use their directory
+  // name unless it collides, in which case their absolute path is unambiguous.
+  const used = new Set(
+    records.filter((item) => inside(item.path, base)).map((item) => item.name),
+  );
+  for (const item of records.filter((item) => !inside(item.path, base))) {
+    if (used.has(item.name)) item.name = item.path;
+    used.add(item.name);
+  }
+  return records;
 }
 export function prState(data?: Pick<Instance, "pr">): string {
   if (!data?.pr) return "none";
@@ -168,7 +191,9 @@ export async function select(
 ): Promise<Candidate[]> {
   if (!items.length) {
     console.error(
-      "No managed worktrees to " + (multiple ? "delete." : "open."),
+      multiple
+        ? "No managed worktrees to delete."
+        : "No RL workspaces yet. Create one with rl switch <name> --create.",
     );
     return [];
   }
@@ -232,7 +257,7 @@ export async function main(argv: string[]): Promise<number> {
   );
   const selected = await select(
     store,
-    candidates(store.repo, canonical(required(values, "base-dir"))),
+    candidates(store.repo, canonical(required(values, "base-dir")), store),
     required(values, "default-base"),
     false,
   );
