@@ -19,6 +19,7 @@ export interface Options {
   cwd?: string;
   input?: string;
   ok?: boolean;
+  timeoutMs?: number;
 }
 export function sessionPicker(w: Workspace): string {
   const capture = path.join(w.root, "session-picker.json");
@@ -112,7 +113,7 @@ export class Workspace {
       input: options.input,
       encoding: "utf8",
       maxBuffer: 16 * 1024 * 1024,
-      timeout: 30000,
+      timeout: options.timeoutMs ?? 30000,
     });
     if (result.error) throw result.error;
     if (options.ok === false)

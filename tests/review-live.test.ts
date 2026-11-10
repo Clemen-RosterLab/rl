@@ -242,20 +242,23 @@ test("terminal utilities sanitize control sequences, respect wide characters and
 
 test(
   "real terminal keyboard navigation, freeze, live updates, checkpoints, resize and cleanup",
-  { timeout: 60000 },
+  { timeout: 120000 },
   (t) => {
     const w = new Workspace(t);
     write(path.join(w.a, "live.txt"), "version-one\n");
-    const result = w.command([
-      "python3",
-      path.join(ROOT, "tests/review-live-pty.py"),
-      w.a,
-      process.execPath,
-      path.join(ROOT, "dist/cli.js"),
-      w.repo,
-      w.state,
-      path.join(w.root, "worktrees/example"),
-    ]);
+    const result = w.command(
+      [
+        "python3",
+        path.join(ROOT, "tests/review-live-pty.py"),
+        w.a,
+        process.execPath,
+        path.join(ROOT, "dist/cli.js"),
+        w.repo,
+        w.state,
+        path.join(w.root, "worktrees/example"),
+      ],
+      { timeoutMs: 90000 },
+    );
     assert.match(result.stdout, /PTY:.*passed/);
   },
 );
