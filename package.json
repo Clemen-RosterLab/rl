@@ -1,6 +1,6 @@
 {
   "name": "rl-workspaces",
-  "version": "0.7.0",
+  "version": "0.8.0",
   "description": "Manage Git worktrees, project notes, and Codex or Claude sessions from your terminal",
   "license": "MIT",
   "bin": {
