@@ -51,7 +51,16 @@ test("npm tarball ships built JavaScript and bundled runtime dependencies, with 
     "command-context",
     "git-workflow",
     "pr-workflow",
+    "sync",
+    "clean",
+    "review",
+    "review-git",
+    "review-store",
+    "review-analysis",
+    "review-feedback",
+    "review-terminal",
     "agent-launch",
+    "agent-agy",
     "mcp",
     "mcp-setup",
     "bootstrap",
@@ -77,6 +86,15 @@ test("npm tarball ships built JavaScript and bundled runtime dependencies, with 
   assert.equal(manifest.license, "MIT");
   assert.deepEqual(manifest.bin, { rl: "bin/rl" });
   assert.equal(manifest.engines.node, ">=22");
+  assert.ok(
+    !Object.hasOwn(manifest.dependencies, manifest.name),
+    "RL must not install an older copy of itself as a dependency",
+  );
+  assert.deepEqual(
+    Object.keys(manifest.dependencies).sort(),
+    [...manifest.bundleDependencies].sort(),
+    "Every runtime dependency must be bundled for an offline installation",
+  );
   assert.equal(manifest.scripts.postinstall, "node dist/install.js");
   for (const script of ["install", "preinstall"])
     assert.ok(!(script in manifest.scripts));
@@ -120,7 +138,7 @@ test("offline npm install, relocation and reinstall preserve hooks, sessions and
   );
   assert.match(
     w.command([cli, "resume", "--help"]).stdout,
-    /rl resume \[codex\|claude\]/,
+    /rl resume \[codex\|claude\|agy\]/,
   );
   w.command([cli, "setup", "adopt"], { cwd: w.a });
   assert.equal(
@@ -221,6 +239,71 @@ test("offline npm install, relocation and reinstall preserve hooks, sessions and
   install();
   w.hook("claude", randomUUID());
   assert.equal(read(config), before);
+
+  // Exercise the full human review loop from the relocated, reinstalled package.
+  const reviewFile = path.join(w.a, "installed-feature.ts");
+  write(reviewFile, "export const version = 1;\n");
+  const reviewed = JSON.parse(
+    w.command(
+      [
+        cli,
+        "review",
+        "feature/a",
+        "--base",
+        "develop",
+        "--summary",
+        "--no-ai",
+        "--json",
+      ],
+      { cwd: w.repo },
+    ).stdout,
+  );
+  assert.ok(
+    reviewed.evidence.files.some(
+      (file: { path: string }) => file.path === "installed-feature.ts",
+    ),
+  );
+  assert.equal(reviewed.analysis, null);
+  const checkpoint = JSON.parse(
+    w.command([cli, "review", "feature/a", "--checkpoint", "--json"], {
+      cwd: w.repo,
+    }).stdout,
+  );
+  write(reviewFile, "export const version = 2;\n");
+  const corrections = w.command(
+    [cli, "review", "feature/a", "--since", checkpoint.id],
+    { cwd: w.repo },
+  ).stdout;
+  assert.match(corrections, /-export const version = 1/);
+  assert.match(corrections, /\+export const version = 2/);
+  const feedback = JSON.parse(
+    w.command(
+      [
+        cli,
+        "feedback",
+        "feature/a",
+        "--message",
+        "Add a regression test for this correction.",
+        "--json",
+      ],
+      { cwd: w.repo },
+    ).stdout,
+  );
+  assert.equal(feedback.status, "saved");
+  const savedFeedback = JSON.parse(
+    w.command([cli, "feedback", "feature/a", "--list", "--json"], {
+      cwd: w.repo,
+    }).stdout,
+  );
+  assert.equal(savedFeedback.at(-1).id, feedback.id);
+  const agySession = randomUUID();
+  w.command([cli, "agent", "save", "agy", agySession], { cwd: w.a });
+  w.command([cli, "resume", "agy", "--latest"], { cwd: w.a });
+  assert.deepEqual(w.calls().at(-1).argv.slice(1), [
+    "--conversation",
+    agySession,
+  ]);
+  assert.equal(w.calls().at(-1).cwd, w.a);
 });
 
 test("global npm installation configures a fresh user's shell and bare rl changes directory on its first startup", (t) => {
@@ -274,4 +357,63 @@ test("global npm installation configures a fresh user's shell and bare rl change
     ],
     { cwd: w.repo },
   );
+});
+
+test("global npm installation retains a usable repair command when system tool installation fails", (t) => {
+  const w = new Workspace(t),
+    archive = pack(w);
+  const home = path.join(w.root, "incomplete setup home"),
+    prefix = path.join(w.root, "incomplete npm prefix");
+  fs.mkdirSync(home);
+  const preload = path.join(w.root, "incomplete-home.cjs");
+  write(
+    preload,
+    `require('node:os').homedir = () => ${JSON.stringify(home)}; require('node:module').syncBuiltinESMExports();`,
+  );
+  w.env.NODE_OPTIONS =
+    `${w.env.NODE_OPTIONS ?? ""} --require ${JSON.stringify(preload)}`.trim();
+  w.env.SHELL = "/bin/zsh";
+  delete w.env.ZDOTDIR;
+  fs.symlinkSync("/bin/zsh", path.join(w.bin, "zsh"));
+  w.stub("fzf", "process.exit(1)");
+  w.stub("gh", "console.log('gh 1.0')");
+  w.stub(
+    "brew",
+    "console.error('Simulated package manager failure');process.exit(1)",
+  );
+  const installed = w.command([
+    "npm",
+    "install",
+    "--global",
+    "--prefix",
+    prefix,
+    "--cache",
+    path.join(w.root, "cache"),
+    "--offline",
+    "--no-audit",
+    "--no-fund",
+    "--foreground-scripts",
+    "--allow-scripts=rl-workspaces",
+    archive,
+  ]);
+  assert.match(installed.stdout + installed.stderr, /setup is incomplete/);
+  const repair = (installed.stdout + installed.stderr).match(
+    /^  (.+ setup install)$/m,
+  )?.[1];
+  assert.ok(
+    repair,
+    "Setup must print a repair command that works without rl on PATH",
+  );
+  const cli = path.join(prefix, "bin/rl");
+  assert.equal(
+    w.command([cli, "--version"]).stdout.trim(),
+    readJson(path.join(ROOT, "package.json")).version,
+  );
+  assert.ok(!fs.existsSync(path.join(home, ".zshrc")));
+  const failed = w.command(["/bin/sh", "-c", repair], { ok: false });
+  assert.match(failed.stderr, /Could not install RL tools/);
+  assert.ok(!fs.existsSync(path.join(home, ".zshrc")));
+  w.stub("fzf", "console.log('fzf 1.0')");
+  w.command(["/bin/sh", "-c", repair]);
+  assert.match(read(path.join(home, ".zshrc")), /rl shell integration/);
 });

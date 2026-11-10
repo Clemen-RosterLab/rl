@@ -6,14 +6,17 @@ import { agentAdapter } from "./agent-registry.js";
 import { recordActivity } from "./activity.js";
 import { git, json, message, now, object } from "./common.js";
 import { contextText, Store } from "./store.js";
+import { boundAntigravityPeer } from "./agent-runner.js";
 
 export async function handleHook(
   store: Store,
   key: string,
   name: string,
+  nativeEvent?: string,
 ): Promise<number> {
   const adapter = agentAdapter(name);
-  const payload: unknown = JSON.parse(fs.readFileSync(0, "utf8"));
+  const raw: unknown = JSON.parse(fs.readFileSync(0, "utf8"));
+  const payload = adapter.hookInput ? adapter.hookInput(raw, nativeEvent) : raw;
   if (
     !object(payload) ||
     typeof payload.cwd !== "string" ||
@@ -36,6 +39,37 @@ export async function handleHook(
       );
     try {
       const event = adapter.parse(payload);
+      const peer =
+        adapter.name === "agy"
+          ? boundAntigravityPeer(file, data, event.sessionId)
+          : undefined;
+      if (peer) {
+        event.childId = event.sessionId;
+        event.resumable = false;
+        // SessionStart can arrive before the parent has received and bound the
+        // new handle. Reclassify only when the persisted binding proves it.
+        if (data.sessions.agy)
+          data.sessions.agy = data.sessions.agy.filter(
+            (session) => session.id !== event.sessionId,
+          );
+        for (const activity of data.activity?.agy ?? [])
+          if (activity.sessionId === event.sessionId) {
+            activity.childId = event.childId;
+            activity.resumable = false;
+          }
+      }
+      const sharedContext = () =>
+        peer
+          ? [
+              `You are the bound native RL peer ${peer.stage.id}, not a workflow coordinator. Do not create workflows or delegate. Run status: ${peer.run.status}.`,
+              `Parent identity: agent=agy, sessionId=${peer.run.owner!.sessionId}. Use this parent identity for RL collaboration tools, with run=${peer.run.id}, step=${peer.stage.id}, claim=${peer.stage.claim}. Follow the parent and your assigned role.`,
+              peer.stage.agent
+                ? peer.run.config.agents[peer.stage.agent].instructions
+                : "",
+              `Shared context (excerpt):\n${store.readDocument(file, "context").slice(0, 12000)}`,
+              `Recorded progress claims (excerpt):\n${store.readDocument(file, "progress").slice(0, 12000)}`,
+            ].join("\n\n")
+          : contextText(file, data);
       // Workflow workers are ephemeral. Supply task context without turning a
       // review pass into a saved conversation or changing the user's last-used
       // session. Other native/managed hooks remain under the CLI's own policy.
@@ -46,7 +80,7 @@ export async function handleHook(
           "child.started",
           "turn.started",
         ].includes(event.type)
-          ? contextText(file, data)
+          ? sharedContext()
           : undefined;
         const response = adapter.response(event, context);
         if (response !== undefined) json(response);
@@ -62,7 +96,7 @@ export async function handleHook(
           "turn.started",
         ].includes(event.type)
       ) {
-        const text = contextText(file, data);
+        const text = sharedContext();
         const digest = createHash("sha256").update(text);
         // Changes beyond the injected excerpt must also trigger a refresh.
         for (const name of ["context.md", "progress.md"])
@@ -103,7 +137,7 @@ export async function handleHook(
         const coordination =
           !!tool &&
           (tool.includes("rl_workflow_") ||
-            (tool === "Bash" &&
+            (["Bash", "run_command"].includes(tool) &&
               [input.command, input.cmd].some(
                 (value) =>
                   typeof value === "string" &&
@@ -135,7 +169,15 @@ export async function handleHook(
           addPath(match[1]);
         const edit =
           !!tool &&
-          ["Edit", "Write", "MultiEdit", "apply_patch"].includes(tool);
+          [
+            "Edit",
+            "Write",
+            "MultiEdit",
+            "apply_patch",
+            "write_to_file",
+            "replace_file_content",
+            "multi_replace_file_content",
+          ].includes(tool);
         const milestone =
           event.type === "session.started"
             ? "session_start"
@@ -174,17 +216,21 @@ export async function handleHook(
         context +=
           "\nYou are a native child. Follow your assigned role; do not create workflows or spawn further agents.";
       const response =
-        event.type === "tool.before" && notification
-          ? {
-              hookSpecificOutput: {
-                hookEventName: event.nativeEvent,
-                permissionDecision: "deny",
-                permissionDecisionReason: notification,
-              },
-            }
-          : event.type === "turn.stopped" && notification
-            ? { decision: "block", reason: notification }
-            : adapter.response(event, context);
+        notification &&
+        adapter.blockResponse &&
+        ["tool.before", "turn.stopped"].includes(event.type)
+          ? adapter.blockResponse(event, notification)
+          : event.type === "tool.before" && notification
+            ? {
+                hookSpecificOutput: {
+                  hookEventName: event.nativeEvent,
+                  permissionDecision: "deny",
+                  permissionDecisionReason: notification,
+                },
+              }
+            : event.type === "turn.stopped" && notification
+              ? { decision: "block", reason: notification }
+              : adapter.response(event, context);
       if (response !== undefined) json(response);
       return 0;
     } catch (error) {

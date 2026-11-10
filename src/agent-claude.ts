@@ -11,7 +11,12 @@ export const claude: AgentAdapter = {
   events: { ...lifecycleEvents },
   extraEvents: { StopFailure: "turn.failed", Notification: "notification" },
   observedId: sessionId,
-  resumeArgs: (id) => ["claude", "--resume", sessionId(id)],
+  resumeArgs: (id, prompt) => [
+    "claude",
+    "--resume",
+    sessionId(id),
+    ...(prompt === undefined ? [] : [prompt]),
+  ],
   startArgs: (argv) => ["claude", ...argv],
   runArgs: (prompt, argv) => ["claude", "--print", ...argv, "--", prompt],
   parse(payload) {

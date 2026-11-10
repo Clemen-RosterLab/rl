@@ -1,4 +1,5 @@
 import { automationContext } from "./session-workflows.js";
+import { pendingReviewFeedback } from "./review-store.js";
 import { adapters } from "./agent-registry.js";
 import { Agent } from "./agents.js";
 import { Tracking, validateTracking } from "./activity.js";
@@ -40,13 +41,15 @@ export interface Instance extends Tracking {
   id: string;
   repository: string;
   branch: string;
+  startingCommit?: string;
+  reviewBaseCommit?: string;
   worktree: string;
   status: "active" | "deleted";
   createdAt: string;
   updatedAt: string;
   deletedAt?: string;
   lastAccessedAt?: string;
-  sessions: Record<Agent, Session[]>;
+  sessions: Record<"codex" | "claude", Session[]> & { agy?: Session[] };
   pr: (Record<string, unknown> & { url: string }) | null;
   hookCommands?: Record<Agent, string>;
   extendedHooks?: boolean;
@@ -219,9 +222,17 @@ export class Store {
         )
           throw new Error();
         validateTracking(data);
+        for (const field of ["startingCommit", "reviewBaseCommit"])
+          if (
+            data[field] !== undefined &&
+            (typeof data[field] !== "string" ||
+              !/^[a-f0-9]{40,64}$/.test(data[field] as string))
+          )
+            throw new Error("Invalid creation baseline");
         if (data.task !== undefined) validateTask(data.task);
-        for (const agent of ["codex", "claude"]) {
+        for (const agent of ["codex", "claude", "agy"]) {
           const sessions = data.sessions[agent];
+          if (agent === "agy" && sessions === undefined) continue;
           if (!Array.isArray(sessions)) throw new Error();
           const seen = new Set();
           for (const item of sessions) {
@@ -298,6 +309,7 @@ export class Store {
     cwd: string,
     baseBranch?: string,
     extendedHooks?: boolean,
+    creation?: { startingCommit: string; reviewBaseCommit?: string },
   ): Promise<RecordEntry> {
     const [root, branch] = this.worktree(cwd);
     if (this.stateDir === root || inside(this.stateDir, root))
@@ -333,6 +345,18 @@ export class Store {
       };
       if (extendedHooks !== undefined) data.extendedHooks = extendedHooks;
       if (baseBranch) data.baseBranch = baseBranch;
+      if (creation) {
+        data.startingCommit = creation.startingCommit;
+        if (creation.reviewBaseCommit) {
+          data.reviewBaseCommit = creation.reviewBaseCommit;
+          git(
+            root,
+            "update-ref",
+            `refs/rl/review-baselines/${key}`,
+            creation.reviewBaseCommit,
+          );
+        }
+      }
       // Discovery also covers worktrees without instance records. Carry their
       // snapshot into the newly adopted instance without another network lookup.
       try {
@@ -360,7 +384,7 @@ export class Store {
     for (const [otherFile, other] of this.records())
       if (
         otherFile !== file &&
-        (other.sessions[agent].some((s) => s.id === id) ||
+        (other.sessions[agent]?.some((s) => s.id === id) ||
           other.activity?.[agent]?.some((s) => s.sessionId === id))
       )
         throw new Error(
@@ -387,9 +411,10 @@ export class Store {
   ): void {
     const sid = sessionId(id);
     this.assertSessionOwner(file, agent, sid);
-    const item = data.sessions[agent].find((s) => s.id === sid);
+    const sessions = (data.sessions[agent] ??= []);
+    const item = sessions.find((s) => s.id === sid);
     if (!item)
-      data.sessions[agent].push({
+      sessions.push({
         id: sid,
         createdAt: stamp,
         lastUsedAt: stamp,
@@ -402,6 +427,7 @@ export function hookCommand(
   store: Store,
   data: Instance,
   agent: Agent,
+  event?: string,
 ): string {
   return (
     [
@@ -414,6 +440,7 @@ export function hookCommand(
       "hook",
       data.key,
       agent,
+      ...(agent === "agy" && event ? [event] : []),
     ]
       .map(shellQuote)
       .join(" ") + " # rl-session-hook"
@@ -431,7 +458,34 @@ function installHooks(store: Store, file: string, data: Instance): void {
         `Refusing to install workspace hooks through a symlink: ${target}`,
       );
     const config = fs.existsSync(target) ? readJson(target) : {};
-    const hooks = (config.hooks ??= {});
+    const namespace = adapter.hookNamespace ?? "hooks";
+    if (adapter.hookNamespace && config[namespace] !== undefined) {
+      const existing = config[namespace];
+      if (
+        !object(existing) ||
+        !Object.values(existing).some(
+          (groups) =>
+            Array.isArray(groups) &&
+            groups.some(
+              (group) =>
+                object(group) &&
+                ((typeof group.command === "string" &&
+                  group.command.endsWith(" # rl-session-hook")) ||
+                  (Array.isArray(group.hooks) &&
+                    group.hooks.some(
+                      (handler) =>
+                        object(handler) &&
+                        typeof handler.command === "string" &&
+                        handler.command.endsWith(" # rl-session-hook"),
+                    ))),
+            ),
+        )
+      )
+        throw new Error(
+          `The existing ${namespace} hook in ${target} is not managed by RL`,
+        );
+    }
+    const hooks = (config[namespace] ??= {});
     if (!object(hooks)) throw new Error(`Invalid hooks object in ${target}`);
     commands[agent] = hookCommand(store, data, agent);
     for (const event of Object.keys({
@@ -441,6 +495,22 @@ function installHooks(store: Store, file: string, data: Instance): void {
       const groups = hooks[event] ?? [];
       if (!Array.isArray(groups))
         throw new Error(`Invalid ${event} hooks in ${target}`);
+      if (adapter.directHookEvents?.includes(event)) {
+        const kept = groups.filter((handler) => {
+          if (!object(handler) || typeof handler.command !== "string")
+            throw new Error(`Invalid ${event} handler in ${target}`);
+          return !handler.command.endsWith(" # rl-session-hook");
+        });
+        hooks[event] = [
+          ...kept,
+          {
+            type: "command",
+            command: hookCommand(store, data, agent, event),
+            timeout: HOOK_TIMEOUT_SECONDS,
+          },
+        ];
+        continue;
+      }
       const kept: Record<string, unknown>[] = [];
       for (const group of groups) {
         if (!object(group) || !Array.isArray(group.hooks))
@@ -460,7 +530,7 @@ function installHooks(store: Store, file: string, data: Instance): void {
         hooks: [
           {
             type: "command",
-            command: commands[agent],
+            command: hookCommand(store, data, agent, event),
             timeout:
               event === "Interrupt" ||
               (agent === "codex" && event === "SessionEnd")
@@ -484,9 +554,12 @@ function installHooks(store: Store, file: string, data: Instance): void {
     git(data.worktree, "rev-parse", "--git-path", "info/exclude"),
   );
   const text = fs.existsSync(exclude) ? fs.readFileSync(exclude, "utf8") : "";
-  const missing = ["/.codex/hooks.json", "/.claude/settings.local.json"].filter(
-    (entry) => !text.split(/\r?\n/).includes(entry),
-  );
+  const missing = [
+    "/.codex/hooks.json",
+    "/.claude/settings.local.json",
+    "/.agents/hooks.json",
+    "/.agents/mcp_config.json",
+  ].filter((entry) => !text.split(/\r?\n/).includes(entry));
   if (missing.length)
     atomicWrite(
       exclude,
@@ -510,6 +583,11 @@ export function contextText(file: string, data: Instance): string {
   );
   const automation = automationContext(data.worktree);
   if (automation) sections.push(automation);
+  sections.push(
+    "Human review is separate from automated workflow ratings. When implementation is ready, explicitly mark this source snapshot with rl review --ready. Human approval and review-complete checkpoints require the user's explicit approval; an AI rating is not that approval.",
+  );
+  const reviewFeedback = pendingReviewFeedback(file);
+  if (reviewFeedback) sections.push(reviewFeedback);
   const latest = data.task?.handoffs.at(-1);
   if (latest)
     sections.push(

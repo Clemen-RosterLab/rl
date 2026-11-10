@@ -44,7 +44,7 @@ export function statusText(
     color ? `\x1b[${code}m${value}\x1b[0m` : value;
   const muted = (value: string) => paint(value, 90);
   const row = (label: string, value: string) =>
-    `  ${muted(label.padEnd(10))}${value}`;
+    `  ${muted(label.padEnd(Math.max(10, label.length + 1)))}${value}`;
   const files = (count: number, state: string, code: number) =>
     count ? paint(`${count} ${state} file${count === 1 ? "" : "s"}`, code) : "";
   const changes = [
@@ -124,7 +124,13 @@ export function statusText(
     );
   }
   lines.push("", `  ${paint("Sessions", 1)}`);
-  for (const agent of ["codex", "claude"] as const) {
+  for (const agent of ["codex", "claude", "agy"] as const) {
+    if (
+      agent === "agy" &&
+      !data.sessions.agy?.length &&
+      !data.activity?.agy?.length
+    )
+      continue;
     const activity = activityView(data.activity?.[agent]).filter(
       (item) => !item.childId,
     );
@@ -141,8 +147,12 @@ export function statusText(
       .filter(Boolean);
     lines.push(
       row(
-        agent === "codex" ? "Codex" : "Claude",
-        `${data.sessions[agent].length} saved${states.length ? ` · ${states.join(" · ")}` : ""}`,
+        agent === "codex"
+          ? "Codex"
+          : agent === "agy"
+            ? "Antigravity"
+            : "Claude",
+        `${data.sessions[agent]?.length ?? 0} saved${states.length ? ` · ${states.join(" · ")}` : ""}`,
       ),
     );
   }

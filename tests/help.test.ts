@@ -12,8 +12,8 @@ test("main help lists each command once with details reserved for command help",
     (match) => match[1],
   );
   assert.equal(new Set(names).size, names.length);
-  assert.equal(names.length, 19);
-  assert.ok(output.split("\n").length < 40);
+  assert.equal(names.length, 23);
+  assert.ok(output.split("\n").length < 45);
   assert.ok(!output.includes("--") && !output.includes("[--"));
   assert.ok(
     ["git", "notes", "storage", "agent", "setup"].every((name) =>
@@ -31,7 +31,6 @@ test("main help lists each command once with details reserved for command help",
       "summary",
       "session",
       "handoff",
-      "clean",
       "config",
       "init",
       "new",
@@ -118,7 +117,6 @@ test("removed commands and compatibility aliases are unavailable", (t) => {
     "open",
     "instances",
     "merge",
-    "clean",
     "summary",
     "handoff",
     "mcp",

@@ -1,7 +1,8 @@
 import path from "node:path";
 import { object, sessionId } from "./common.js";
 
-export type Agent = "codex" | "claude";
+export const AGENTS = ["codex", "claude", "agy"] as const;
+export type Agent = (typeof AGENTS)[number];
 export type EventType =
   | "session.started"
   | "context.restored"
@@ -26,10 +27,14 @@ export interface AgentEvent {
 export interface AgentAdapter {
   name: Agent;
   configPath: string;
+  hookNamespace?: string;
+  directHookEvents?: readonly string[];
+  hookInput?(payload: unknown, event?: string): unknown;
+  blockResponse?(event: AgentEvent, reason: string): unknown;
   events: Readonly<Record<string, EventType>>;
   extraEvents: Readonly<Record<string, EventType>>;
   observedId(value: unknown): string;
-  resumeArgs(id: string): string[];
+  resumeArgs(id: string, prompt?: string): string[];
   startArgs(argv: string[]): string[];
   runArgs(prompt: string, argv: string[]): string[];
   parse(payload: unknown): AgentEvent;

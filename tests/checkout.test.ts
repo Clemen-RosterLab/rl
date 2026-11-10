@@ -36,6 +36,8 @@ function picker(w: Workspace) {
     "fzf",
     `
 const fs = require('node:fs');
+// fzf versions before 0.34 (including distro-provided 0.29) reject adaptive heights.
+if (process.argv.some(arg => /^--height=~/.test(arg))) {console.error('height must be a non-negative integer');process.exit(2);}
 const input = fs.readFileSync(0, 'utf8');
 fs.writeFileSync(process.env.CHECKOUT_CAPTURE, input);
 if (process.env.CHECKOUT_EXIT) process.exit(Number(process.env.CHECKOUT_EXIT));

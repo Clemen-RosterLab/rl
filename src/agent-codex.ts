@@ -17,7 +17,12 @@ export const codex: AgentAdapter = {
       return value;
     return sessionId(value);
   },
-  resumeArgs: (id) => ["codex", "resume", sessionId(id)],
+  resumeArgs: (id, prompt) => [
+    "codex",
+    "resume",
+    sessionId(id),
+    ...(prompt === undefined ? [] : [prompt]),
+  ],
   startArgs: (argv) => ["codex", ...argv],
   runArgs: (prompt, argv) => ["codex", "exec", ...argv, "--", prompt],
   parse(payload) {

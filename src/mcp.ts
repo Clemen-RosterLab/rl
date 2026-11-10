@@ -42,7 +42,7 @@ const TOOLS = [
   {
     name: "rl_session_save",
     description:
-      "Save a session for this workspace so it appears in status and can be resumed. agent defaults to codex. Supply sessionId with the full UUID of the current conversation; if omitted, Codex IDs are read from this server's environment when available. Claude requires sessionId.",
+      "Save a session for this workspace so it appears in status and can be resumed. agent defaults to codex. Supply sessionId with the full UUID of the current conversation; if omitted, Codex IDs are read from this server's environment when available. Claude and Antigravity require sessionId.",
     append: false,
   },
   {
@@ -138,7 +138,7 @@ async function callTool(
     switch (name) {
       case "rl_session_save": {
         if (input.agent !== undefined && typeof input.agent !== "string")
-          throw new Error("agent must be codex or claude");
+          throw new Error("agent must be codex, claude or agy");
         const agent = agentAdapter(input.agent ?? "codex").name;
         const sid = currentSessionId(agent, input.sessionId);
         store.recordSession(file, data, agent, sid);
@@ -154,6 +154,9 @@ async function callTool(
           activity: {
             codex: activityView(data.activity?.codex),
             claude: activityView(data.activity?.claude),
+            ...(data.activity?.agy
+              ? { agy: activityView(data.activity.agy) }
+              : {}),
           },
         });
       case "rl_context":
@@ -258,7 +261,10 @@ export async function serveMcp(store: Store): Promise<number> {
                               },
                             ]),
                           ),
-                          agent: { type: "string", enum: ["codex", "claude"] },
+                          agent: {
+                            type: "string",
+                            enum: ["codex", "claude", "agy"],
+                          },
                           sessionId: {
                             type: "string",
                             description:
@@ -269,7 +275,7 @@ export async function serveMcp(store: Store): Promise<number> {
                         ? {
                             agent: {
                               type: "string",
-                              enum: ["codex", "claude"],
+                              enum: ["codex", "claude", "agy"],
                             },
                             sessionId: {
                               type: "string",

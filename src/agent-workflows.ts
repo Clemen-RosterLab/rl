@@ -135,8 +135,13 @@ export async function main(argv: string[]): Promise<number> {
   if (namespace === "workflow" && action === "init") {
     arity(rest, 0);
     const provider = values.provider ?? "inherit";
-    if (provider !== "inherit" && provider !== "codex" && provider !== "claude")
-      throw new Error("Provider must be inherit, codex or claude");
+    if (
+      provider !== "inherit" &&
+      provider !== "codex" &&
+      provider !== "claude" &&
+      provider !== "agy"
+    )
+      throw new Error("Provider must be inherit, codex, claude or agy");
     await context.store.locked(() => initAutomation(data.worktree, provider));
     await context.store.adopt(data.worktree);
     const paths = Object.values(CONFIG_FILES).map((file) =>

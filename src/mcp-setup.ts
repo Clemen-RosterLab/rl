@@ -19,7 +19,7 @@ import { parseJsonObject } from "./json.js";
 const BEGIN = "# BEGIN RL MCP - managed by rl setup mcp";
 const END = "# END RL MCP";
 const MARKER = "RL_MCP_MANAGED";
-type Client = "codex" | "claude";
+type Client = "codex" | "claude" | "agy";
 interface Update {
   client: Client;
   file: string;
@@ -83,23 +83,38 @@ function serverEntry(
   };
 }
 
-function claudeConfig(
+function jsonConfig(
   before: string | undefined,
   command: string,
   argv: string[],
   file: string,
+  client: Client = "claude",
+  name = "rl",
 ): string {
   const config = before === undefined ? {} : parseJsonObject(before);
   if (config.mcpServers !== undefined && !object(config.mcpServers))
     throw new Error(`Expected an mcpServers object in ${file}`);
   const servers = object(config.mcpServers) ? config.mcpServers : {};
   const entry = {
-    ...serverEntry(servers.rl, command, argv, file),
-    type: "stdio",
+    ...serverEntry(servers[name], command, argv, file),
+    ...(client === "claude" ? { type: "stdio" } : {}),
   };
+  // Antigravity shares running servers by name. A workspace-specific name
+  // prevents another workspace's already-running RL server from winning.
+  const kept = Object.fromEntries(
+    Object.entries(servers).filter(
+      ([key, value]) =>
+        client !== "agy" ||
+        key === name ||
+        !(key === "rl" || key.startsWith("rl-")) ||
+        !object(value) ||
+        !object(value.env) ||
+        value.env[MARKER] !== "1",
+    ),
+  );
   return (
     JSON.stringify(
-      { ...config, mcpServers: { ...servers, rl: entry } },
+      { ...config, mcpServers: { ...kept, [name]: entry } },
       null,
       2,
     ) + "\n"
@@ -172,9 +187,14 @@ export async function main(argv: string[]): Promise<number> {
   ]);
   arity(positionals, 0, 1);
   const selected = positionals[0];
-  if (selected !== undefined && selected !== "codex" && selected !== "claude")
+  if (
+    selected !== undefined &&
+    selected !== "codex" &&
+    selected !== "claude" &&
+    selected !== "agy"
+  )
     throw new Error(
-      "Expected codex or claude, or omit the client to configure both",
+      "Expected codex, claude or agy; omit the client to configure Codex and Claude",
     );
   const context = commandContext(values);
   const [, active] = context.store.current();
@@ -198,12 +218,23 @@ export async function main(argv: string[]): Promise<number> {
     const plans: Update[] = clients.map((client) => {
       const { file, text } = readConfig(
         workspace,
-        client === "codex" ? ".codex/config.toml" : ".mcp.json",
+        client === "codex"
+          ? ".codex/config.toml"
+          : client === "agy"
+            ? ".agents/mcp_config.json"
+            : ".mcp.json",
       );
       const after =
         client === "codex"
           ? codexConfig(text, command, serverArgs, workspace, file)
-          : claudeConfig(text, command, serverArgs, file);
+          : jsonConfig(
+              text,
+              command,
+              serverArgs,
+              file,
+              client,
+              client === "agy" ? `rl-${active.key}` : "rl",
+            );
       return {
         client,
         file,

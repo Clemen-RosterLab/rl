@@ -178,8 +178,10 @@ export async function main(argv: string[]): Promise<number> {
     return doctor(store, rest[0], !!values.json);
   }
   if (command === "hook") {
-    arity(rest, 2);
-    return handleHook(store, rest[0], rest[1]);
+    arity(rest, 2, 3);
+    if (rest.length === 3 && rest[1] !== "agy")
+      throw new Error("Only agy hooks accept an explicit native event");
+    return handleHook(store, rest[0], rest[1], rest[2]);
   }
   if (command === "pr" && rest[0] === "sync") {
     arity(rest, 1, 2);
@@ -221,6 +223,9 @@ export async function main(argv: string[]): Promise<number> {
         activity: {
           codex: activityView(data.activity?.codex),
           claude: activityView(data.activity?.claude),
+          ...(data.activity?.agy
+            ? { agy: activityView(data.activity.agy) }
+            : {}),
         },
         stateDirectory: path.dirname(file),
         gitStatus: branchStatus(store.repo, data),
@@ -244,7 +249,7 @@ export async function main(argv: string[]): Promise<number> {
         console.log(`Associated ${kind} session ${rest[2]} with ${data.id}`);
       } else if (rest[0] === "list") {
         arity(rest, 1, 2);
-        json(rest[1] ? data.sessions[agent(rest[1])] : data.sessions);
+        json(rest[1] ? (data.sessions[agent(rest[1])] ?? []) : data.sessions);
       } else
         throw new Error(
           "Usage: rl agent sessions [agent] | save [agent] [UUID]",

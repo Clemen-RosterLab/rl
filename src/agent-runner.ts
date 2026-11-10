@@ -15,7 +15,7 @@ import {
   type Evaluation,
   type ReviewResult,
 } from "./review-policy.js";
-import type { Store } from "./store.js";
+import type { Store, Instance } from "./store.js";
 import { agentAdapter } from "./agent-registry.js";
 import {
   collaborationAssessment,
@@ -53,7 +53,7 @@ export interface Stage extends WorkflowStep {
 export interface WorkflowRun {
   version: 1;
   execution?: "native";
-  owner?: { agent: "codex" | "claude"; sessionId: string };
+  owner?: { agent: "codex" | "claude" | "agy"; sessionId: string };
   requestId?: string;
   id: string;
   key: string;
@@ -262,10 +262,10 @@ function load(directory: string): WorkflowRun {
   if (raw.execution === "native") {
     if (
       !object(raw.owner) ||
-      !["codex", "claude"].includes(String(raw.owner.agent))
+      !["codex", "claude", "agy"].includes(String(raw.owner.agent))
     )
       throw new Error("Invalid workflow parent");
-    agentAdapter(raw.owner.agent as "codex" | "claude").observedId(
+    agentAdapter(raw.owner.agent as "codex" | "claude" | "agy").observedId(
       raw.owner.sessionId,
     );
     if (raw.requestId !== undefined) sessionId(raw.requestId);
@@ -362,6 +362,47 @@ export function readRun(
   )
     throw new Error("Workflow run belongs to a different RL workspace");
   return { run, directory };
+}
+
+/** Resolve only explicit native bindings in this instance, never inferred peers. */
+export function boundAntigravityPeer(
+  instanceFile: string,
+  data: Instance,
+  conversation: string,
+) {
+  const parent = path.dirname(
+    runDirectory(instanceFile, "00000000-0000-0000-0000-000000000000"),
+  );
+  if (!fs.existsSync(parent)) return undefined;
+  for (const id of fs
+    .readdirSync(parent)
+    .filter((id) => /^[a-f0-9-]{36}$/.test(id))) {
+    const directory = runDirectory(instanceFile, id);
+    const candidate = readJsonObject(path.join(directory, "run.json"));
+    if (
+      !object(candidate.owner) ||
+      candidate.owner.agent !== "agy" ||
+      candidate.owner.sessionId === conversation ||
+      !Array.isArray(candidate.stages) ||
+      !candidate.stages.some(
+        (stage) => object(stage) && stage.childId === conversation,
+      )
+    )
+      continue;
+    const run = load(directory);
+    if (
+      run.key !== data.key ||
+      run.workspace !== data.worktree ||
+      run.branch !== data.branch ||
+      run.execution !== "native"
+    )
+      throw new Error(
+        "Native peer binding belongs to a different RL workspace",
+      );
+    const stage = run.stages.find((stage) => stage.childId === conversation)!;
+    return { run, stage };
+  }
+  return undefined;
 }
 export async function controlRun(
   store: Store,

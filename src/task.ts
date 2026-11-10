@@ -42,7 +42,7 @@ export async function pauseTask(
     throw new Error("Unexpected task handoff argument");
   const notes = handoffNotes(input);
   if (input.agent !== undefined && typeof input.agent !== "string")
-    throw new Error("agent must be codex or claude");
+    throw new Error("agent must be codex, claude or agy");
   const agent = agentAdapter(input.agent ?? "codex").name;
   const sid = currentSessionId(agent, input.sessionId);
   return store.locked(() => {
@@ -119,7 +119,7 @@ export async function continueTask(
       const [file, data] = selectTask(context, options.workspace);
       const handoff = data.task!.handoffs.at(-1)!;
       if (
-        !data.sessions[handoff.agent].some(
+        !data.sessions[handoff.agent]?.some(
           (item) => item.id === handoff.sessionId,
         )
       )

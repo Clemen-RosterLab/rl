@@ -5,6 +5,7 @@ import { activityView, STALE_AFTER_MS } from "./activity.js";
 import { execute, isSymlink, json, message } from "./common.js";
 import { hookCommand, Store } from "./store.js";
 import { isJsonObject, readJsonObject } from "./json.js";
+import { findExecutable } from "./dependencies.js";
 
 const PROBE_TIMEOUT_MS = 2000;
 const MAX_VERSION_LENGTH = 200;
@@ -17,7 +18,13 @@ export async function doctor(
   const [file, data] = store.current();
   const selectedAdapters = selected
     ? [agentAdapter(selected)]
-    : Object.values(adapters);
+    : Object.values(adapters).filter(
+        (adapter) =>
+          adapter.name !== "agy" ||
+          findExecutable("agy") ||
+          data.sessions.agy?.length ||
+          data.activity?.agy?.length,
+      );
   const agents = await Promise.all(
     selectedAdapters.map(async (adapter) => {
       const configPath = path.join(data.worktree, adapter.configPath);
@@ -45,13 +52,22 @@ export async function doctor(
         if (isSymlink(configPath) || isSymlink(path.dirname(configPath)))
           throw new Error("Hook configuration is a symlink");
         const config = readJsonObject(configPath);
-        if (!isJsonObject(config.hooks))
-          throw new Error("Missing hooks object");
-        const command = hookCommand(store, data, adapter.name);
-        const hooks = config.hooks;
+        const hooks = config[adapter.hookNamespace ?? "hooks"];
+        if (!isJsonObject(hooks)) throw new Error("Missing hooks object");
+        if (hooks.enabled === false)
+          throw new Error("RL hooks are explicitly disabled");
         installedEvents = expectedEvents.filter((event) => {
+          const command = hookCommand(store, data, adapter.name, event);
           const groups = hooks[event];
           if (!Array.isArray(groups)) return false;
+          if (adapter.directHookEvents?.includes(event))
+            return groups.some(
+              (handler) =>
+                isJsonObject(handler) &&
+                handler.type === "command" &&
+                handler.command === command &&
+                handler.async !== true,
+            );
           return groups.some(
             (group) =>
               isJsonObject(group) &&
@@ -80,12 +96,15 @@ export async function doctor(
         launchVerified = false;
       try {
         const result = await execute(
-          [adapter.name, "--version"],
+          [adapter.name, adapter.name === "agy" ? "--help" : "--version"],
           data.worktree,
           { timeoutMs: PROBE_TIMEOUT_MS },
         );
         cliAvailable = result.code === 0;
-        version = result.stdout.trim().slice(0, MAX_VERSION_LENGTH) || null;
+        version =
+          adapter.name === "agy"
+            ? null
+            : result.stdout.trim().slice(0, MAX_VERSION_LENGTH) || null;
         if (!cliAvailable) cliError = "Version probe failed or timed out";
         if (cliAvailable) {
           const help = await execute(
@@ -99,7 +118,10 @@ export async function doctor(
             help.code === 0 &&
             (adapter.name === "codex"
               ? /codex exec/.test(help.stdout) && /PROMPT/.test(help.stdout)
-              : /--print/.test(help.stdout) && /--resume/.test(help.stdout));
+              : /--print/.test(help.stdout) &&
+                (adapter.name === "agy"
+                  ? /--conversation/.test(help.stdout)
+                  : /--resume/.test(help.stdout)));
         }
       } catch (error) {
         cliError = message(error);

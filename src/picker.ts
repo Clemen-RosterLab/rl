@@ -187,13 +187,15 @@ export async function select(
   store: Store,
   items: Candidate[],
   defaultBase: string,
-  multiple: boolean,
+  multiple: boolean | "clean",
 ): Promise<Candidate[]> {
   if (!items.length) {
     console.error(
-      multiple
-        ? "No managed worktrees to delete."
-        : "No RL workspaces yet. Create one with rl switch <name> --create.",
+      multiple === "clean"
+        ? "No RL worktrees to clean."
+        : multiple
+          ? "No managed worktrees to delete."
+          : "No RL workspaces yet. Create one with rl switch <name> --create.",
     );
     return [];
   }
@@ -203,9 +205,11 @@ export async function select(
   );
   const rows = pickerRows(store, items, defaultBase, prs);
   const header =
-    (multiple
-      ? "Tab select · Ctrl-A all · Enter delete · Esc cancel\nDeletes uncommitted work and local branches."
-      : "Enter open · Esc cancel") +
+    (multiple === "clean"
+      ? "Tab select · Ctrl-A all · Enter clean · Esc cancel\nRemoves generated files; keeps worktrees, source, notes and sessions."
+      : multiple
+        ? "Tab select · Ctrl-A all · Enter delete · Esc cancel\nDeletes uncommitted work and local branches."
+        : "Enter open · Esc cancel") +
     "\nPR auto · * stale · commits ahead / behind base\n\n" +
     rows[0].header;
   const options = [
@@ -213,7 +217,12 @@ export async function select(
     "--ansi",
     "--delimiter=\t",
     "--with-nth=2..",
-    "--prompt=" + (multiple ? "Delete › " : "Workspace › "),
+    "--prompt=" +
+      (multiple === "clean"
+        ? "Clean › "
+        : multiple
+          ? "Delete › "
+          : "Workspace › "),
     "--height=70%",
     "--border=rounded",
     "--info=inline",

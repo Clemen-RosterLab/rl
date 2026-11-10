@@ -32,7 +32,7 @@ import {
 const CREATE_LOCK = ".workspace-create";
 const SETUP_LOCK = ".workspace-setup";
 const LOCK_FILE = ".lock";
-const SUPPORTED_AGENTS = new Set(["codex", "claude"]);
+const SUPPORTED_AGENTS = new Set(["codex", "claude", "agy"]);
 const COMMAND_OPTIONS: Record<string, string[]> = {
   path: [],
   config: [],
@@ -50,7 +50,13 @@ async function createWorkspace(
     reuseExisting?: boolean;
     requireBranch?: boolean;
   } = {},
-): Promise<WorkspaceTarget & { created: boolean }> {
+): Promise<
+  WorkspaceTarget & {
+    created: boolean;
+    startingCommit?: string;
+    reviewBaseCommit?: string;
+  }
+> {
   if (
     name.startsWith("-") ||
     name.startsWith("@") ||
@@ -142,6 +148,12 @@ async function createWorkspace(
         name,
         branch: name,
         created: true,
+        startingCommit: exists
+          ? git(destination, "rev-parse", "HEAD")
+          : resolved!.oid,
+        ...(!exists && !options.requireBranch
+          ? { reviewBaseCommit: resolved!.oid }
+          : {}),
       };
     },
   );
@@ -232,10 +244,14 @@ export async function main(argv: string[]): Promise<number> {
   arity(names, 1);
   const agent = typeof values.agent === "string" ? values.agent : undefined;
   if (agent && !SUPPORTED_AGENTS.has(agent))
-    throw new Error("Agent must be codex or claude");
+    throw new Error("Agent must be codex, claude or agy");
   const base =
     typeof values.base === "string" ? values.base : context.defaultBase;
-  let target: WorkspaceTarget & { created?: boolean };
+  let target: WorkspaceTarget & {
+    created?: boolean;
+    startingCommit?: string;
+    reviewBaseCommit?: string;
+  };
   if (values.create) {
     target = await createWorkspace(
       context,
@@ -261,7 +277,17 @@ export async function main(argv: string[]): Promise<number> {
       );
     }
   }
-  await context.store.adopt(target.path, base);
+  await context.store.adopt(
+    target.path,
+    base,
+    undefined,
+    target.startingCommit
+      ? {
+          startingCommit: target.startingCommit,
+          reviewBaseCommit: target.reviewBaseCommit,
+        }
+      : undefined,
+  );
   if (values.setup) {
     const code = await locked(
       path.join(context.store.root, SETUP_LOCK),

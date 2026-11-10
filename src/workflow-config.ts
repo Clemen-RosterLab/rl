@@ -6,7 +6,13 @@ import { isJsonObject, readJsonObject } from "./json.js";
 import { validateCleanupPath } from "./cleanup-path.js";
 
 export const WORKFLOW_FILE = ".rl/workflows.json";
-const RESERVED_DIRECTORIES = new Set([".git", ".rl", ".codex", ".claude"]);
+const RESERVED_DIRECTORIES = new Set([
+  ".git",
+  ".rl",
+  ".codex",
+  ".claude",
+  ".agents",
+]);
 const ENV_NAME = /^[A-Za-z_][A-Za-z0-9_]*$/;
 const ENV_PREFIX = /^(APP_|PUBLIC_|VITE_|NEXT_PUBLIC_|REACT_APP_)/;
 const ENV_NAMES = new Set(["PORT", "NODE_ENV", "DATABASE_URL", "REDIS_URL"]);
@@ -28,7 +34,10 @@ export const EMPTY_WORKFLOW: WorkflowConfig = {
   onOpen: [],
 };
 
-export function readWorkflowConfig(repo: string): WorkflowConfig {
+export function readWorkflowConfig(
+  repo: string,
+  fallbackClean: string[] = [],
+): WorkflowConfig {
   const file = path.join(repo, WORKFLOW_FILE);
   if (
     fs
@@ -37,7 +46,7 @@ export function readWorkflowConfig(repo: string): WorkflowConfig {
     fs.lstatSync(file, { throwIfNoEntry: false })?.isSymbolicLink()
   )
     throw new Error("Workflow configuration must not be a symlink");
-  if (!fs.existsSync(file)) return { ...EMPTY_WORKFLOW };
+  if (!fs.existsSync(file)) return { ...EMPTY_WORKFLOW, clean: fallbackClean };
   const data = readJsonObject(file);
   for (const key of Object.keys(data))
     if (!CONFIG_KEYS.has(key))
@@ -67,7 +76,7 @@ export function readWorkflowConfig(repo: string): WorkflowConfig {
       env[key] = value;
     }
   }
-  const cleanup = data.clean ?? [];
+  const cleanup = Object.hasOwn(data, "clean") ? data.clean : fallbackClean;
   if (!Array.isArray(cleanup))
     throw new Error(
       "Workflow clean must be an array of relative directory paths",

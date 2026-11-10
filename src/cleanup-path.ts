@@ -8,6 +8,7 @@ export function protectedCleanupName(name: string): boolean {
       ".rl",
       ".codex",
       ".claude",
+      ".agents",
       ".ssh",
       ".aws",
       ".azure",

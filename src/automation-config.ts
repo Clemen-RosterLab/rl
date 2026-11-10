@@ -131,9 +131,11 @@ export function validateAutomation(
         );
         if (
           item.provider !== undefined &&
-          !["inherit", "codex", "claude"].includes(String(item.provider))
+          !["inherit", "codex", "claude", "agy"].includes(String(item.provider))
         )
-          throw new Error("Agent provider must be inherit, codex or claude");
+          throw new Error(
+            "Agent provider must be inherit, codex, claude or agy",
+          );
         nonempty(item.description);
         nonempty(item.instructions);
         if (
@@ -149,9 +151,11 @@ export function validateAutomation(
         if (
           item.reasoning !== undefined &&
           !(
-            item.provider !== "claude"
-              ? ["low", "medium", "high", "xhigh"]
-              : ["low", "medium", "high", "max"]
+            item.provider === "agy"
+              ? ["low", "medium", "high", "xhigh", "max"]
+              : item.provider !== "claude"
+                ? ["low", "medium", "high", "xhigh"]
+                : ["low", "medium", "high", "max"]
           ).includes(String(item.reasoning))
         )
           throw new Error("Unsupported reasoning setting for this provider");

@@ -195,6 +195,12 @@ class Registry {
         repo,
         line: `${repo.name}\t${cell(repo.name, nameWidth)}  ${dim(cell(repo.base, baseWidth))}  ${dim(cell(repo.root.startsWith(home + path.sep) ? "~" + repo.root.slice(home.length) : repo.root, pathWidth))}`,
       }));
+      // Numeric heights also work with distro fzf versions before 0.34, which
+      // reject adaptive (~) heights. Leave room for the header and controls.
+      const height = Math.max(
+        8,
+        Math.min(repos.length + 7, Math.floor((process.stderr.rows || 24) / 2)),
+      );
       const result = await execute(
         [
           "fzf",
@@ -202,8 +208,7 @@ class Registry {
           "--prompt=Repository › ",
           "--delimiter=\t",
           "--with-nth=2..",
-          "--height=~50%",
-          "--min-height=8",
+          `--height=${height}`,
           "--border=rounded",
           "--info=inline",
           "--reverse",
@@ -477,6 +482,7 @@ async function repositoryRows(
   };
 }
 function display(rows: Row[]): void {
+  const hasAgy = rows.some((row) => row.sessions?.agy?.length);
   const table = [
     [
       "REPOSITORY",
@@ -489,6 +495,7 @@ function display(rows: Row[]): void {
       "PR (cached)",
       "CODEX",
       "CLAUDE",
+      ...(hasAgy ? ["AGY"] : []),
       "TASK",
     ],
   ];
@@ -527,6 +534,7 @@ function display(rows: Row[]): void {
       row.pr ? `#${row.pr.number} ${row.pr.state}` : "-",
       String(row.sessions?.codex.length ?? 0),
       String(row.sessions?.claude.length ?? 0),
+      ...(hasAgy ? [String(row.sessions?.agy?.length ?? 0)] : []),
       row.task?.state ?? "-",
     ]);
   }
@@ -618,6 +626,14 @@ async function repositoryStatus(
         (n, row) => n + (row.sessions?.claude.length ?? 0),
         0,
       ),
+      ...(result.rows.some((row) => row.sessions?.agy?.length)
+        ? {
+            agy: result.rows.reduce(
+              (n, row) => n + (row.sessions?.agy?.length ?? 0),
+              0,
+            ),
+          }
+        : {}),
     },
     fetched: fetch,
     errors: result.errors,
@@ -649,7 +665,7 @@ async function repositoryStatus(
         ),
         row(
           "Sessions",
-          `${status.sessions.codex} Codex · ${status.sessions.claude} Claude saved`,
+          `${status.sessions.codex} Codex · ${status.sessions.claude} Claude${status.sessions.agy ? ` · ${status.sessions.agy} Antigravity` : ""} saved`,
         ),
         row("Default", data.default ?? "legacy configuration"),
         "",

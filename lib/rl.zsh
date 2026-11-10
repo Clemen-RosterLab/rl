@@ -79,7 +79,7 @@ _rl_main() {
     shift
   fi
   case "$1" in
-    new|open|instances|merge|clean|summary|handoff|mcp|session|context|progress|config|adopt|init)
+    new|open|instances|merge|summary|handoff|mcp|session|context|progress|config|adopt|init)
       print -u2 -r -- "Unknown command: $1"
       print -u2 'Run rl help for available commands.'
       return 1 ;;
@@ -100,7 +100,6 @@ _rl_main() {
     agent:save) argv=(session save "${@:3}") ;;
     agent:handoff) argv=(handoff "${@:3}") ;;
     agent:mcp) argv=(mcp "${@:3}") ;;
-    storage:clean) argv=(clean "${@:3}") ;;
     setup:init|setup:show) argv=(config "$2" "${@:3}") ;;
     setup:adopt) argv=(adopt "${@:3}") ;;
     setup:mcp) argv=(mcp-setup "${@:3}") ;;
@@ -239,13 +238,32 @@ _rl_main() {
     return
   fi
   case "$command" in
+    review|feedback)
+      local review_command="$command"
+      shift
+      command node "${${functions_source[_rl_main]}:A:h:h}/dist/cli.js" "$review_command" \
+        --repo "$repo_root" --state-dir "$state_dir" --base-dir "$base_dir/$repo_name" \
+        --default-base "$default_base" "$@"
+      return ;;
+    clean)
+      shift
+      command node "${${functions_source[_rl_main]}:A:h:h}/dist/cli.js" clean \
+        --repo "$repo_root" --state-dir "$state_dir" --base-dir "$base_dir/$repo_name" \
+        --default-base "$default_base" "$@"
+      return ;;
+    sync)
+      shift
+      command node "${${functions_source[_rl_main]}:A:h:h}/dist/cli.js" sync \
+        --repo "$repo_root" --state-dir "$state_dir" --base-dir "$base_dir/$repo_name" \
+        --default-base "$default_base" "$@"
+      return ;;
     mcp-setup)
       shift
       command node "${${functions_source[_rl_main]}:A:h:h}/dist/cli.js" mcp-setup \
         --repo "$repo_root" --state-dir "$state_dir" --base-dir "$base_dir/$repo_name" \
         --default-base "$default_base" "$@"
       return ;;
-    storage|clean)
+    storage)
       command node "${${functions_source[_rl_main]}:A:h:h}/dist/cli.js" storage \
         --repo "$repo_root" --state-dir "$state_dir" --base-dir "$base_dir/$repo_name" \
         --default-base "$default_base" "$@"

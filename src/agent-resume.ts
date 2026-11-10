@@ -11,12 +11,12 @@ export async function resumeSessions(
   kind?: Agent,
   options: { latest?: boolean } = {},
 ): Promise<number> {
-  if (kind !== "claude") await syncCodexSessions(store);
+  if (!kind || kind === "codex") await syncCodexSessions(store);
   const [, data] = await store.locked(() => store.current());
-  const kinds: Agent[] = kind ? [kind] : ["codex", "claude"];
+  const kinds: Agent[] = kind ? [kind] : ["codex", "claude", "agy"];
   const choices = kinds
     .flatMap((agent) =>
-      data.sessions[agent].map((session) => ({ ...session, agent })),
+      (data.sessions[agent] ?? []).map((session) => ({ ...session, agent })),
     )
     .sort((a, b) => {
       const recent = timestamp(b.lastUsedAt) - timestamp(a.lastUsedAt);
@@ -93,7 +93,7 @@ export async function resumeAgent(
     const [file, data] = store.current(cwd);
     if (options.expectedKey && data.key !== options.expectedKey)
       throw new Error("Instance changed before agent launch");
-    const sessions = data.sessions[kind];
+    const sessions = data.sessions[kind] ?? [];
     const item =
       options.sessionId !== undefined
         ? sessions.find((item) => item.id === sessionId(options.sessionId))
@@ -110,8 +110,7 @@ export async function resumeAgent(
   });
   const stamp = now();
   console.error(`Resuming ${kind} session ${sid} for ${data.id}`);
-  const command = agentAdapter(kind).resumeArgs(sid);
-  if (options.prompt !== undefined) command.push(options.prompt);
+  const command = agentAdapter(kind).resumeArgs(sid, options.prompt);
   const result = await execute(command, data.worktree, {
     interactive: true,
     env: {

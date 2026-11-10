@@ -9,6 +9,7 @@ import { inspectDependencies, setupDependencies } from "./dependencies.js";
 const BEGIN = "# >>> rl shell integration >>>";
 const END = "# <<< rl shell integration <<<";
 const SHIM = "#!/bin/sh\n# Managed by RL installation\n";
+const PACKAGE_ROOT = fileURLToPath(new URL("..", import.meta.url));
 interface InstallHost {
   env?: NodeJS.ProcessEnv;
   home?: string;
@@ -48,6 +49,17 @@ function profileChange(
 
 function integration(text: string, block: string, shell: string): string {
   const lines = text.split(/\r?\n/);
+  const manual = new RegExp(
+    `^\\s*eval[ \\t]+"\\$\\((?:command[ \\t]+)?rl[ \\t]+(?:setup[ \\t]+shell|init)[ \\t]+${shell}\\)"[ \\t]*(#[^\\r\\n]*)?$`,
+  );
+  const migrate = (source: string[], replacement: string[] = []) =>
+    source.flatMap((line) => {
+      const match = manual.exec(line);
+      if (!match) return [line];
+      const migrated = [...(match[1] ? [match[1]] : []), ...replacement];
+      replacement = [];
+      return migrated;
+    });
   const starts = lines.flatMap((line, index) =>
     line === BEGIN ? [index] : [],
   );
@@ -57,22 +69,12 @@ function integration(text: string, block: string, shell: string): string {
       throw new Error(
         "Malformed RL shell integration block; preserve your settings and repair its markers before reinstalling",
       );
-    const prefix = lines.slice(0, starts[0]).join("\n");
-    const suffix = lines.slice(ends[0] + 1).join("\n");
+    const prefix = migrate(lines.slice(0, starts[0])).join("\n");
+    const suffix = migrate(lines.slice(ends[0] + 1)).join("\n");
     return (prefix ? prefix + "\n" : "") + block + "\n" + suffix;
   }
-  const existing = lines.findIndex((line) =>
-    [
-      `eval "$(rl setup shell ${shell})"`,
-      `eval "$(command rl setup shell ${shell})"`,
-      `eval "$(rl init ${shell})"`,
-      `eval "$(command rl init ${shell})"`,
-    ].includes(line.trim()),
-  );
-  if (existing >= 0) {
-    lines[existing] = block;
-    return lines.join("\n");
-  }
+  if (lines.some((line) => manual.test(line)))
+    return migrate(lines, [block]).join("\n");
   return (
     text + (text ? (text.endsWith("\n") ? "\n" : "\n\n") : "") + block + "\n"
   );
@@ -91,8 +93,7 @@ export function configureShell(host: InstallHost, requestedShell?: string) {
     throw new Error(
       `Automatic RL shell setup supports zsh and bash. Run 'rl setup install --shell zsh' or '--shell bash' for the shell you use.`,
     );
-  const root =
-    host.packageRoot ?? fileURLToPath(new URL("..", import.meta.url));
+  const root = host.packageRoot ?? PACKAGE_ROOT;
   const node = host.node ?? process.execPath;
   const executable = path.join(root, "bin/rl");
   const shimDirectory = path.join(home, ".local/share/rl/bin");
@@ -168,28 +169,44 @@ export async function installRl(
   if (positionals.length)
     throw new Error("Usage: rl setup install [--shell zsh|bash]");
   const env = host.env ?? process.env;
-  if (
-    env.npm_lifecycle_event === "postinstall" &&
-    env.npm_config_global !== "true"
-  ) {
+  const automatic = env.npm_lifecycle_event === "postinstall";
+  if (automatic && env.npm_config_global !== "true") {
     console.log(
       "RL checkout installed. Run 'rl setup install' to install system tools and register shell integration.",
     );
     return 0;
   }
-  const code = await setupDependencies([], host);
-  if (code) return code;
-  const configured = configureShell(host, values.shell);
-  console.log(
-    `RL shell integration installed in ${configured.profiles.join(", ")}.`,
-  );
-  console.log(
-    "New terminals can use rl directly. To activate directory switching in this terminal now, run:",
-  );
-  console.log(
-    `  eval "$(${shellQuote(configured.shim)} setup shell ${configured.shell})"`,
-  );
-  return 0;
+  try {
+    const code = await setupDependencies([], host);
+    if (code) {
+      if (!automatic) return code;
+      throw new Error("Required command-line tools are unavailable");
+    }
+    const configured = configureShell(host, values.shell);
+    console.log(
+      `RL shell integration installed in ${configured.profiles.join(", ")}.`,
+    );
+    console.log(
+      "New terminals can use rl directly. To activate directory switching in this terminal now, run:",
+    );
+    console.log(
+      `  eval "$(${shellQuote(configured.shim)} setup shell ${configured.shell})"`,
+    );
+    return 0;
+  } catch (error) {
+    if (!automatic) throw error;
+    console.error(
+      `RL was installed, but automatic setup is incomplete: ${error instanceof Error ? error.message : String(error)}.`,
+    );
+    console.error(
+      "Resolve the setup issue above, then run 'rl setup install'. The CLI remains installed so setup can be repaired.",
+    );
+    console.error("If rl is not on PATH yet, run:");
+    console.error(
+      `  ${shellQuote(host.node ?? process.execPath)} ${shellQuote(path.join(host.packageRoot ?? PACKAGE_ROOT, "bin/rl"))} setup install`,
+    );
+    return 0;
+  }
 }
 
 if (

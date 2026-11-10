@@ -13,7 +13,11 @@ import { main as mcp } from "./mcp.js";
 import { main as mcpSetup } from "./mcp-setup.js";
 import { main as task } from "./task.js";
 import { main as storage } from "./storage.js";
+import { main as clean } from "./clean.js";
 import { main as prUpdate } from "./pr-update.js";
+import { main as sync } from "./sync.js";
+import { main as review } from "./review.js";
+import { main as feedback } from "./review-feedback.js";
 import { main as agentWorkflows } from "./agent-workflows.js";
 const commands = {
   state,
@@ -29,7 +33,11 @@ const commands = {
   "mcp-setup": mcpSetup,
   task,
   storage,
+  clean,
   "pr-update": prUpdate,
+  sync,
+  review,
+  feedback,
   automation: agentWorkflows,
 };
 

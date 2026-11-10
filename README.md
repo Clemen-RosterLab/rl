@@ -1,6 +1,6 @@
 # rl
 
-Git workspaces for Codex and Claude Code.
+Git workspaces for Codex, Claude Code and Antigravity (`agy`).
 
 Create a workspace, start an agent, and keep task notes and sessions together.
 Switch projects, prepare local dependencies, check PRs, and merge finished work
@@ -42,12 +42,27 @@ to finish in your terminal. If lifecycle scripts were disabled, run
 `rl setup install` to complete everything. `rl setup dependencies --check`
 checks tools without changing them. GitHub PR commands require `gh auth login`.
 
+If automatic setup cannot finish, the CLI stays installed and reports what needs
+repairing. Resolve that issue and run `rl setup install` again. Agent commands
+also need your chosen Codex or Claude CLI installed and signed in.
+
+If npm reports `EACCES` or permission denied for its global directory, install
+into a directory you own:
+
+```sh
+npm install --global rl-workspaces --prefix "$HOME/.local" --foreground-scripts
+```
+
+Open a new terminal afterward, or use the absolute activation command printed
+by the installer for the current terminal.
+
 ## Get started
 
 ```sh
 rl repo add . --base origin/test
 rl switch feature/login -c --agent codex
 # or: rl switch feature/login -c --agent claude
+# or: rl switch feature/login -c --agent agy
 
 rl notes append progress implementation-notes.md
 rl list
@@ -88,8 +103,10 @@ under `rl agent`, cleanup under `rl storage`, and project/shell setup under
 | `rl switch` | Open or create a workspace |
 | `rl list` | List workspaces, optionally across repositories |
 | `rl status` | Inspect the selected repository (`--workspace` for workspace details) |
+| `rl sync` | Fetch and merge each active workspace's base into its branch |
 | `rl delete` | Remove workspaces |
-| `rl storage` | Inspect disk usage and clean generated files |
+| `rl storage` | Inspect workspace disk usage |
+| `rl clean` | Clean generated files from selected worktrees |
 
 `rl switch <branch>` opens an existing checkout or creates a managed workspace
 for an existing local or origin branch. Remote branches are tracked automatically.
@@ -109,6 +126,179 @@ The picker compares with its displayed base; the status overview compares with t
 displayed upstream. `CHANGES` reports changed files separately.
 PR discovery uses `gh`; `RL_PR_OFFLINE=1` disables it. Status is offline by default.
 `--fetch` explicitly refreshes tracking refs.
+
+## Sync workspace branches
+
+```sh
+rl sync                       # sync all active RL workspaces in this repository
+rl sync --dry-run             # fetch and preview; leave branches and working files unchanged
+rl sync feature/login other   # sync only these workspace names or branches
+```
+
+Sync fetches each configured remote once, then merges every workspace's saved
+base into that workspace's branch. If no base was saved, it uses the repository
+default. Unqualified bases such as `test` prefer the fetched `origin/test`;
+explicit local bases such as `refs/heads/parent-feature` stay local. Local stacked
+bases run before their dependent branches.
+
+Only active RL workspaces in the selected repository are included. The main
+checkout, archived instances and unadopted branches are excluded. Dirty, locked,
+missing and busy worktrees are skipped. A fetch failure stops all merges.
+Conflicting merges are aborted to leave that branch unchanged, and independent
+workspaces continue. The final summary lists updated, current, conflicted, skipped
+and failed branches; `--json` supplies structured results and conflicting files.
+Sync creates local merge commits when needed. Push the resulting branches when
+ready; `rl pr update` separately updates PR branches through GitHub.
+
+## Human review across worktrees
+
+```sh
+rl review                                # live three-panel review of the current worktree
+rl review --all                          # choose from the worktree review queue
+rl review --since HEAD~3                 # cumulative revision → HEAD comparison
+rl review --pr 9935                      # discover and inspect a GitHub PR
+rl review feature/login                  # inspect one worktree without switching directories
+rl review feature/login --base origin/test # choose a baseline for an older worktree
+rl review feature/login --diff           # complete feature diff, including committed changes
+rl review feature/login --summary --provider claude
+rl review feature/login --checkpoint --label "First pass"
+rl feedback feature/login --message "Reuse the existing helper and add a regression test." --resume
+rl review feature/login --since-last-review
+rl review feature/login --approve
+```
+
+The queue prioritises outstanding review work. It shows branch/source changes,
+review state, changes since the last checkpoint, cached PR state, and observed
+agent activity. Use `--filter all|needs-review|changed|clean|active|ready` to narrow
+it. `active` means recently observed working through hooks, not verified process
+liveness. A stopped agent turn is not assumed to mean a completed feature.
+Coding agents can explicitly mark the current source with `rl review --ready`;
+that readiness expires when its source or staged versions change.
+
+`rl review` stays in the current Ghostty or other ANSI terminal. It resolves the
+current Git checkout against the selected RL repository, without consulting a
+remembered agent directory. An explicit worktree name selects that instance.
+The responsive interface shows commits, file layers and a coloured unified diff.
+Below 90 columns, the focused panel takes the full width. Node's terminal APIs
+keep the CLI dependency-light; no React, browser, server or extra TUI executable
+is needed for single-worktree review.
+
+Use `1`/`2`/`3` and Tab/Shift-Tab to focus panels; `j`/`k` or arrows navigate;
+Enter advances focus and Escape goes back. PageUp/PageDown scroll by a page.
+In the diff, Left/Right scroll horizontally. `w` selects staged, unstaged and
+untracked layers; `p` compares the committed branch with its target merge-base;
+`r` accepts `FROM TO` revisions. Initial commits compare against the empty tree;
+merge commits compare with their first parent. The timeline includes the latest
+100 commits. `/` searches file paths in the files panel and text in the selected
+diff; `n`/`N` jump between matches. `o` opens the selected file and source line
+with `code --goto`; `?` shows help and `q` quits.
+
+Local directory events are debounced for 180 ms, with a 2.5-second Git/status
+polling fallback. Worktree-specific HEAD/index and shared refs are watched
+separately. Source watching uses Git-listed directories and skips dependencies
+and build caches. Git runs in a worker thread; immutable commit metadata and
+recent patches are cached, file patches load lazily and only changed terminal
+rows are drawn. Diff display is capped at 8 MiB per file with an explicit
+truncation notice. A live update keeps the selected commit/file and scroll where
+possible and increments the visible update counter.
+
+Press `f` to freeze the captured source/index trees. Temporary private
+`refs/rl/live-freeze` refs retain them across Git GC and are removed on unfreeze
+or normal exit. The entire displayed local
+state stays fixed while a NEW CHANGES indicator reports background updates;
+unfreezing loads the latest snapshot. Press `m` to retain the exact inspected
+target as a review checkpoint, then `s` to compare its source and index with the
+current snapshot. These live checkpoints are scoped to worktree and branch (and
+explicit PR number), retained under private `refs/rl/live-review` refs across Git
+GC, and stored in the existing repository state directory under `live-review`.
+They are separate from the legacy feature approval/checkpoint actions below.
+Missing checkpoints are errors; rewritten history compares the saved trees with
+an explicit notice. No branch checkout, staging, commit or file edit occurs.
+
+`gh` discovers PR metadata in the background. Authentication/network failures
+leave local review usable. PR metadata polls independently every 60 seconds;
+`--remote-interval <seconds>` changes this (minimum 10), and Ctrl-R refreshes
+both sources. Explicit `--pr` downloads missing commit objects into private
+`refs/rl/live-pr` refs, without changing HEAD, FETCH_HEAD or remote-tracking
+branches. Automatic discovery downloads nothing. Branch comparison uses the PR
+target when known, otherwise the configured RL default base; an unavailable
+base produces an error so a revision range can be chosen explicitly.
+
+`--all` uses RL's fzf worktree queue: Enter launches live review, Alt-S opens its
+summary, Alt-D its feature diff, Alt-F feedback, Alt-A approval, Alt-O VS Code,
+and Ctrl-R refreshes the queue. `--interactive` preserves legacy pickers for
+scripted input. Noninteractive `rl review` prints the queue; `--json` supplies
+structured records. `--since <revision> --json` and `--pr <number> --json` inspect
+the current worktree without a terminal. Existing workspace, session, workflow
+and GitHub PR commands remain independent.
+
+New feature branches created with `rl switch -c` store their starting commit and
+pin a fixed review baseline. Advancing or deleting the base branch does not
+silently move that baseline. Older/adopted worktrees show **Baseline required**
+until you explicitly choose `--base <ref>` or use the baseline action. The chosen
+reference's merge-base with HEAD is recorded. No shared ancestor is an error;
+rewritten history keeps the original baseline and displays a warning.
+
+Review snapshots capture HEAD, the staged index, conflict stages and working
+source, including relevant non-ignored untracked files. They use temporary Git
+indexes and Git tree objects, preserving your real index, working files, stash
+and branch history. Git attributes/clean filters apply as with ordinary Git
+staging. Captures are repeated to detect moving source. Snapshots with unresolved
+conflicts, unstable captures, or omitted source cannot be approved. Ignored files
+are not included; untracked credential/agent metadata, dependency trees and files
+above 16 MiB are explicitly excluded and reported, so an incomplete capture
+cannot become a complete review checkpoint. Track or ignore such paths explicitly
+before approval.
+Uncommitted submodule contents are refused with an actionable error: a parent
+Git tree can retain the submodule commit pointer, but not its nested working files.
+
+`--checkpoint` records the exact inspected source and staged versions; `--checkpoints`
+lists them. `--since-last-review` and `--since <checkpoint UUID>` compare immutable
+trees, including edits to uncommitted files, changed staging and untracked files.
+Approval is explicit, creates a checkpoint, and is valid only while its source
+fingerprint still matches. Further changes show **Changed since review**.
+AI analyses never create human approvals or advance checkpoints. All review
+state, analysis and feedback live beside the existing instance notes and
+sessions. Private `refs/rl/reviews`, `refs/rl/review-heads` and
+`refs/rl/review-baselines` and `refs/rl/review-snapshot-bases` retain their objects
+through Git GC. This local history is retained with RL state; ordinary branch
+pushes do not publish these refs.
+
+`--summary`, `--ai-review` and `--groups` use the editable RL `reviewer` profile
+and review policy. Override the profile with `--profile`, or the provider with
+`--provider codex|claude|agy`. Each analysis uses a fresh session, a bounded context
+from its saved Git trees, changed source and recorded notes. Summaries cover
+implementation, architecture, behaviour, tests and concerns. Source facts and
+agent-reported claims are labelled separately; this command does not run tests
+or claim that recorded validation still passes. Provider/credential errors fall
+back to manual evidence for summaries, and `--no-ai` invokes no model. Codex runs
+read-only; Claude analysis has built-in and MCP tools disabled; Antigravity uses
+plan mode and structured streaming output. No permission
+bypass flags are used.
+
+Logical groups reference validated Git file/hunk IDs, can overlap across files,
+and keep uncertain changes uncategorised. Their patches always come from Git.
+The complete feature diff remains available through Git's normal pager. An
+optional `--lazygit` opens the **live working-tree view**, which is not equivalent
+to the complete feature or checkpoint diff; missing Lazygit falls back to Git
+with an installation hint. `--open` uses VS Code's `code` command.
+
+Feedback is persisted before any agent launch. Use `--message`, `--file <path>`,
+`--file -` for stdin, or VISUAL/EDITOR in a terminal. Without a delivery action,
+it stays saved and appears in that worktree's normal agent hook/MCP context.
+`--resume` opens its coding session with the feedback available as a prompt;
+**opened** does not mean delivery was acknowledged. `--send` explicitly runs a
+noninteractive correction turn and reports **delivered** only after successful
+completion. Saved sessions are checked against the selected worktree; multiple
+sessions require a picker or explicit `--agent`/`--session`. A recently observed
+working session is not sent a competing turn. Failed attempts retain their text
+and error; use `rl feedback <worktree> --list` and `--retry <feedback UUID>` to
+resume or send later. Starting an agent and associating a session still uses the
+existing `rl agent start` and `rl agent save` commands.
+
+The implementation follows the official [Codex CLI reference](https://learn.chatgpt.com/docs/cli/reference),
+[Claude CLI reference](https://code.claude.com/docs/en/cli-reference), and
+[Git temporary-index](https://git-scm.com/docs/git-read-tree) mechanisms.
 
 ## Project setup
 
@@ -153,29 +343,41 @@ agent configuration, and permission variables cannot be overridden by the projec
 
 ## Storage and cleanup
 
-These commands operate only on the current adopted RL workspace, including when
-run from a directory inside it. They reject workspace selectors and cross-repository
-routing. They do not scan or clean sibling worktrees.
+`rl storage` measures the current adopted RL workspace. `rl clean` removes
+generated files from selected RL worktrees in the selected repository:
 
 ```sh
 rl storage                 # disk usage, largest paths, and cleanup suggestions
 rl storage --json          # structured usage report
-rl storage clean --dry-run         # preview configured generated directories and savings
-rl storage clean                  # remove those generated directories
+rl clean                   # multi-select worktrees: Tab to select, Ctrl-A for all
+rl clean --all             # clean every RL worktree in this repository
+rl clean one feature/two   # clean only these worktree names or branches
+rl clean --all --dry-run   # preview generated paths and estimated savings
 ```
 
-Add a `clean` array to `.rl/workflows.json` in the current workspace:
+By default, cleanup targets ignored dependency directories such as `node_modules`
+and `.venv`, plus known build, cache and temporary directories such as `.next`,
+`.turbo`, `.cache`, `dist` and `tmp`. Main checkouts and unadopted worktrees outside
+RL's managed directory are excluded. `--all` stays within one repository; select
+another explicitly with `rl --repo <alias> clean --all`.
+
+Override the defaults with a `clean` array in each worktree's `.rl/workflows.json`:
 
 ```json
 { "clean": ["node_modules", ".next", ".turbo"] }
 ```
 
-The default list is empty. Entries must be literal, ignored directory paths.
+An explicit empty array disables cleanup for that worktree. Entries must be
+literal, ignored directory paths. Nested artifact directories can be listed
+explicitly, for example `apps/web/.next`.
+
 Cleanup validates the complete plan before deleting anything and refuses tracked
 files, credentials such as `.env`, Git/agent/task metadata, and symlink targets.
 Links inside generated directories are unlinked without traversing their targets.
-Code changes, branches, notes, sessions, and task handoffs stay in place. Close
-development servers before cleaning their dependencies; use your project's install
+Code changes, branches, notes, sessions, and task handoffs stay in place. Results
+include each worktree and an estimated total; `--json` provides structured output.
+Locked or unsafe targets are reported while other selected worktrees continue.
+Close development servers before cleaning their dependencies; use your project's install
 and build commands to regenerate them later.
 
 Storage reports approximate allocated sizes, deduplicating hard links within the
@@ -183,7 +385,8 @@ workspace. Cleanup estimates exclude hard-linked file data retained outside the
 selected directories; filesystem clones and snapshots can also reduce actual
 savings. Suggestions use the current workspace's last-access time (14 days by
 default, configurable with `--older-than 30d`) and its cached PR state. Nothing is
-deleted automatically.
+deleted automatically. The older `rl storage clean` command still operates only
+on the current adopted workspace and requires an explicit configured clean list.
 
 ## Finish a feature
 
@@ -323,6 +526,7 @@ the saved handoffs, and `rl list` adds a TASK column showing `paused` or `active
 ```sh
 rl agent start codex -- --model <model>
 rl agent start claude
+rl agent start agy
 rl agent run codex --prompt "Review the change" -- --json
 rl agent run claude --prompt "Review the change"
 rl agent handoff claude --output handoff.md
@@ -338,12 +542,12 @@ rl doctor --repair
 
 Both launch modes preserve agent options after `--`, use the selected workspace,
 and return the agent's exit status. Headless mode uses `codex exec` or
-`claude --print`. RL leaves permissions and authentication to the agent.
+`claude --print` or `agy --print`. RL leaves permissions and authentication to the agent.
 
 `rl resume` lists saved Codex and Claude sessions for the current RL workspace.
 If multiple sessions match, an `fzf` picker shows the agent, full session UUID,
 last-used time, and start time, with the most recently used first. If exactly
-one session matches, it resumes automatically. An optional `codex` or `claude`
+one session matches, it resumes automatically. An optional `codex`, `claude` or `agy`
 argument filters the choices. Escape cancels without launching an agent.
 Use `--latest` (or `-l` / `--l`) to skip the picker and resume the most recently
 used matching session directly.
@@ -370,13 +574,30 @@ Hooks supply shared context/progress at session start, after compaction, and to
 subagents. Prompt submission refreshes changed notes. Codex hooks must be reviewed
 and trusted with `/hooks` before they run; session discovery works independently.
 
-| Integration | Codex | Claude Code |
-| --- | --- | --- |
-| Interactive / headless launch | `codex` / `codex exec` | `claude` / `claude --print` |
-| Resume | `codex resume <UUID>` | `claude --resume <UUID>` |
-| Project hooks | `.codex/hooks.json` | `.claude/settings.local.json` |
-| Shared lifecycle | SessionStart, UserPromptSubmit, Stop, SessionEnd, SubagentStart, SubagentStop | Same |
-| Optional extended hooks | Interrupt | StopFailure, Notification |
+| Integration | Codex | Claude Code | Antigravity |
+| --- | --- | --- | --- |
+| Interactive / headless launch | `codex` / `codex exec` | `claude` / `claude --print` | `agy` / `agy --print` |
+| Resume | `codex resume <UUID>` | `claude --resume <UUID>` | `agy --conversation <UUID>` |
+| Project hooks | `.codex/hooks.json` | `.claude/settings.local.json` | `.agents/hooks.json` |
+| Lifecycle | SessionStart, UserPromptSubmit, Stop, SessionEnd, SubagentStart, SubagentStop | Same | SessionStart, PreInvocation, PreToolUse, PostToolUse, Stop |
+| Optional extended hooks | Interrupt | StopFailure, Notification | None |
+
+For Antigravity, run `rl setup adopt` once in an existing worktree, then start
+`agy` normally or use `rl agent start agy`. Its native hooks save conversation
+UUIDs automatically, so `rl resume agy` uses the same picker and `--latest`
+option as the other providers. An explicit `rl agent save agy <UUID>` also works.
+`rl doctor agy` checks its installed hooks and CLI help. Multi-root Antigravity
+hook payloads are refused because they cannot identify one owning RL worktree.
+Foreground stops with background work still running remain observed working.
+When using the native writer/reviewer/DRY workflow, bind each peer's actual
+Antigravity conversation UUID before implementation. RL uses the saved binding
+to keep peers separate from the parent session and prevent recursive workflows.
+
+Antigravity uses its documented named hook definitions, camelCase input and
+`injectSteps`/decision responses; RL preserves unrelated definitions. Feedback
+can resume with `--prompt-interactive`, or send one structured streaming turn to
+the saved conversation. Successful delivery requires a successful result for
+that exact conversation, rather than merely a zero process exit code.
 
 Run `rl setup adopt --extended-hooks` only with agent versions supporting those events.
 Adoption preserves unrelated hooks/settings and excludes generated files locally.
@@ -396,7 +617,7 @@ and [Claude hooks](https://code.claude.com/docs/en/hooks) contracts.
 ## Session-driven agent workflows
 
 An adopted workspace has a built-in `writer-reviewer-dry` workflow immediately,
-without creating configuration files. Your current Codex or Claude session
+without creating configuration files. Your current Codex, Claude or Antigravity session
 creates and controls its native children. RL supplies their editable roles,
 handoff rules, review policy and durable run records. RL never launches a
 provider CLI, model API or check process for a workflow.
@@ -618,7 +839,7 @@ the session and task checkpoint. `rl_status` includes task state and handoff his
 `rl_session_save` accepts `{"agent":"codex","sessionId":"<UUID>"}`;
 `agent` defaults to Codex. If `sessionId` is omitted, it uses the MCP server's
 Codex environment when available. Clients should pass their current UUID when
-the server does not inherit it. Claude requires an explicit UUID.
+the server does not inherit it. Claude and Antigravity require an explicit UUID.
 Append tools take `{"text":"..."}`. They share the same locked document updates
 as the CLI and expose no arbitrary command, deletion, or filesystem tool.
 
@@ -630,6 +851,10 @@ rl setup mcp
 
 This configures both `.codex/config.toml` and `.mcp.json` in the current checkout.
 Pass `codex` or `claude` to select one client, or `--dry-run` to preview changes.
+Use `rl setup mcp agy` for Antigravity's workspace-local `.agents/mcp_config.json`.
+Its managed server name includes the RL instance UUID, preventing a server
+already running for another worktree from taking precedence. Reconfiguring a
+copied file replaces obsolete RL-managed entries while preserving other servers.
 Setup preserves other servers and settings, including Codex comments. It updates
 RL-managed entries on later runs and leaves a conflicting manually configured
 `rl` entry for you to resolve. Both files are validated before writing either.
@@ -648,6 +873,9 @@ available without an MCP connection. The stdio server can also be launched with
 has been selected explicitly. Configuration follows the official
 [Codex MCP guide](https://learn.chatgpt.com/docs/extend/mcp?surface=cli) and
 [Claude MCP guide](https://code.claude.com/docs/en/mcp).
+Antigravity integration follows its official [hooks](https://antigravity.google/docs/hooks?tab=cli),
+[MCP](https://antigravity.google/docs/mcp?tab=cli), and
+[headless CLI](https://antigravity.google/docs/cli/headless) contracts.
 RL does not modify global client settings or relax agent sandbox permissions.
 
 ## Notes and reports
@@ -739,7 +967,8 @@ Strict TypeScript modules share Store, Git execution, workspace resolution, and
 agent adapters. Tests use isolated temporary repositories, representative hook
 payloads, stub agents/GitHub, and a real offline tarball installation. They do
 not modify your global install or launch paid sessions. `npm test` includes
-package and shell smoke checks. No npm install script runs application setup.
+package and shell smoke checks. Local `npm ci` leaves system tools and shell
+settings untouched; project dependency installation is explicit with `rl setup run`.
 
 Issues and pull requests are welcome. Include reproduction steps and validation.
 Licensed under [MIT](LICENSE).

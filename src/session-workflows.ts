@@ -79,7 +79,7 @@ function requests(file: string): Request[] {
       typeof item.event !== "string" ||
       typeof item.fingerprint !== "string" ||
       typeof item.createdAt !== "string" ||
-      !["codex", "claude"].includes(String(item.agent)) ||
+      !["codex", "claude", "agy"].includes(String(item.agent)) ||
       typeof item.sessionId !== "string" ||
       (item.runId !== undefined && typeof item.runId !== "string") ||
       (item.dismissed !== undefined && typeof item.dismissed !== "string") ||
@@ -119,8 +119,8 @@ const sameOwner = (a: Owner, b: Owner) =>
   a.agent === b.agent && a.sessionId === b.sessionId;
 function owner(input: Record<string, unknown>): Owner {
   const agent = input.agent === undefined ? "codex" : input.agent;
-  if (agent !== "codex" && agent !== "claude")
-    throw new Error("agent must be codex or claude");
+  if (agent !== "codex" && agent !== "claude" && agent !== "agy")
+    throw new Error("agent must be codex, claude or agy");
   const id =
     input.sessionId !== undefined
       ? input.sessionId
@@ -343,8 +343,9 @@ export function automationContext(root: string): string {
     `RL native agent configuration detected (${fingerprint}; source: ${hasAutomation(root) ? "workspace configuration" : "built-in defaults"}; default workflow: ${defaultWorkflow(config)}). You are the coordinator of this session's own native subagents.`,
     "Use RL from this existing session; no special agent launcher or user-pasted workflow prompt is required. Run 'rl workflow context --json' to discover the active profiles, workflows, policies and the complete protocol.tools CLI commands and input schemas. Use the CLI through your normal shell tools; an MCP connection is optional. If MCP tools are connected, the same operation names and schemas apply. Follow the active configuration automatically for applicable tasks. At planning milestones report the configured event with rl_workflow_event. Tool and before-finish hooks also queue matching requests. Read pending requests with rl_workflow_pending.",
     "For coding tasks, report task_planned before implementation. A collaborative workflow starts all writer, reviewer and DRY native peers in parallel: claim all three roles, spawn them using your native tools, bind their handles with rl_workflow_bind, then relay messages or let peers use their own inbox. The writer submits checkpoints, the reviewer returns policy-based ratings, and DRY answers both peers. Keep all three peers available; do not replace them with sequential one-shot passes. Use collaboration tools for handoffs before final stage reports. Semantic new-function and duplication obligations require explicit declarations and consultation responses; RL cannot read private reasoning.",
-    "For each request: rl_workflow_start creates a run tied to YOUR parent session; rl_workflow_claim atomically returns a ready step and its instructions. Spawn that step with YOUR native subagent tool, then submit its evidence with rl_workflow_report. Run command steps yourself and report actual output. RL never starts Codex, Claude, or check processes for a workflow. Do not substitute a separate CLI or API agent. Respect current permissions, workspace boundaries, explicit user instructions and native delegation availability. If delegation is unavailable, dismiss the request with the concrete reason and tell the user; do not claim it ran.",
-    "Supply agent (codex or claude) and this parent conversation's full sessionId to workflow tools. UUIDs and observed Codex thr_ IDs are supported for workflow coordination; only verified UUIDs enter resumable history. CLI equivalents: 'rl workflow pending', 'rl workflow run --request <requestId>', 'rl workflow claim <run> --step <step>', 'rl workflow report <run> --file <report.json>', with --agent and --session. Profiles describe roles; their provider field is a legacy preference, never permission to start another provider. Unsupported native model/reasoning preferences must be reported, not silently substituted. Policies own scoring; return evidence without assigning yourself a score.",
+    "For Antigravity (agy), bind each peer's actual conversation UUID returned by your native subagent tool, not a friendly role name. Bind all peers before they begin implementation; native hooks use these bindings to keep peer activity separate from the parent and prevent recursive workflows.",
+    "For each request: rl_workflow_start creates a run tied to YOUR parent session; rl_workflow_claim atomically returns a ready step and its instructions. Spawn that step with YOUR native subagent tool, then submit its evidence with rl_workflow_report. Run command steps yourself and report actual output. RL never starts provider or check processes for a workflow. Do not substitute a separate CLI or API agent. Respect current permissions, workspace boundaries, explicit user instructions and native delegation availability. If delegation is unavailable, dismiss the request with the concrete reason and tell the user; do not claim it ran.",
+    "Supply agent (codex, claude or agy) and this parent conversation's full sessionId to workflow tools. UUIDs and observed Codex thr_ IDs are supported for workflow coordination; only verified UUIDs enter resumable history. CLI equivalents: 'rl workflow pending', 'rl workflow run --request <requestId>', 'rl workflow claim <run> --step <step>', 'rl workflow report <run> --file <report.json>', with --agent and --session. Profiles describe roles; their provider field is a legacy preference, never permission to start another provider. Unsupported native model/reasoning preferences must be reported, not silently substituted. Policies own scoring; return evidence without assigning yourself a score.",
     `Agents: ${Object.entries(config.agents)
       .map(([name, profile]) => `${name}: ${profile.description}`)
       .join("; ")}`,
@@ -457,11 +458,11 @@ export function workflowToolSchema(tool: (typeof WORKFLOW_TOOLS)[number]) {
   return {
     type: "object",
     properties: {
-      agent: { type: "string", enum: ["codex", "claude"] },
+      agent: { type: "string", enum: ["codex", "claude", "agy"] },
       sessionId: {
         type: "string",
         description:
-          "Current parent conversation ID. Claude requires a UUID; Codex also accepts observed thr_ IDs and may inherit it.",
+          "Current parent conversation ID. Claude and Antigravity require a UUID; Codex also accepts observed thr_ IDs and may inherit it.",
       },
       ...tool.properties,
     },

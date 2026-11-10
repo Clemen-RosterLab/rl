@@ -172,6 +172,44 @@ test("global npm setup preserves shell settings, writes a user-owned CLI shim, a
   assert.ok(!fs.existsSync(f.env.RL_INSTALL_TEST_LOG));
 });
 
+test("an incomplete automatic setup keeps the CLI installed while explicit repair still fails", (t) => {
+  const f = fixture(t);
+  const automatic = f.call("installRl", [], { platform: "darwin" });
+  assert.match(automatic.stderr, /setup is incomplete/);
+  assert.match(automatic.stderr, /rl setup install/);
+  assert.ok(!fs.existsSync(path.join(f.home, ".zshrc")));
+  f.env.npm_lifecycle_event = "";
+  f.call("installRl", [], { platform: "darwin" }, false);
+  for (const name of ["git", "zsh", "fzf", "gh"]) f.tool(name);
+  const profile = path.join(f.home, ".zshrc");
+  const before = "# >>> rl shell integration >>>\n# Keep these settings\n";
+  write(profile, before);
+  f.env.npm_lifecycle_event = "postinstall";
+  const blocked = f.call("installRl");
+  assert.match(blocked.stderr, /Malformed RL shell integration block/);
+  assert.equal(read(profile), before);
+  assert.ok(!fs.existsSync(path.join(f.home, ".local/share/rl/bin/rl")));
+});
+
+test("shell upgrades migrate commented and repeated legacy activation lines without losing user comments", (t) => {
+  const f = fixture(t);
+  const profile = path.join(f.home, ".zshrc");
+  write(
+    profile,
+    '# Before\neval "$(rl init zsh)" # RL setup\neval "$(command rl setup shell zsh)"\neval "$(echo unrelated)" # Keep this\n# After\n',
+  );
+  f.call("configureShell");
+  const after = read(profile);
+  assert.doesNotMatch(after, /rl init|\$\(command rl setup shell zsh\)/);
+  assert.equal(after.split("# >>> rl shell integration >>>").length, 2);
+  assert.match(after, /# RL setup/);
+  assert.match(after, /eval "\$\(echo unrelated\)" # Keep this/);
+  assert.match(after, /# Before/);
+  assert.match(after, /# After/);
+  f.call("configureShell");
+  assert.equal(read(profile), after);
+});
+
 test("shell setup respects existing bash login files and refuses configuration escapes or malformed managed blocks", (t) => {
   const f = fixture(t);
   write(path.join(f.home, ".profile"), "# Existing login settings\n");
@@ -228,6 +266,40 @@ test("a fresh zsh startup loads the installed integration and bare rl changes di
       "-i",
       "-c",
       '[[ $(whence -w rl) == "rl: function" ]] || exit 90; rl; [[ "$PWD" == "$EXPECTED_WORKTREE" ]] || exit 91',
+    ],
+    { cwd: w.repo },
+  );
+});
+
+test("a fresh bash startup can select a workspace and switch back to the previous checkout", (t) => {
+  const w = new Workspace(t);
+  const home = path.join(w.root, "fresh bash home");
+  fs.mkdirSync(home);
+  const target = w.managed("bash-task");
+  w.stub(
+    "fzf",
+    "const rows=require('node:fs').readFileSync(0,'utf8').split('\\n');console.log(rows.find(row=>row.startsWith('bash-task\\t')));",
+  );
+  const configured = spawnSync(
+    process.execPath,
+    [
+      "--input-type=module",
+      "-e",
+      `import {configureShell} from ${JSON.stringify(path.join(ROOT, "dist/install.js"))};configureShell({home:${JSON.stringify(home)},env:process.env,packageRoot:${JSON.stringify(ROOT)}},'bash');`,
+    ],
+    { env: w.env, encoding: "utf8", timeout: 15000 },
+  );
+  assert.equal(configured.status, 0, configured.stderr + configured.stdout);
+  w.env.EXPECTED_WORKTREE = target;
+  w.command(
+    [
+      "/bin/bash",
+      "--noprofile",
+      "--rcfile",
+      path.join(home, ".bashrc"),
+      "-i",
+      "-c",
+      '[[ $(type -t rl) == function ]] || exit 90; rl; [[ "$PWD" == "$EXPECTED_WORKTREE" ]] || exit 91; rl switch @; rl switch -; [[ "$PWD" == "$EXPECTED_WORKTREE" ]] || exit 92',
     ],
     { cwd: w.repo },
   );

@@ -81,7 +81,7 @@ test("dry run and client selection configure only the current workspace", (t) =>
   w.rl(["setup", "mcp", "claude", "--workspace", w.b], { cwd: w.a, ok: false });
   assert.ok(!fs.existsSync(files(w, w.b).claude));
   const bad = w.rl(["setup", "mcp", "unsupported"], { cwd: w.a, ok: false });
-  assert.match(bad.stderr, /Expected codex or claude/);
+  assert.match(bad.stderr, /Expected codex, claude or agy/);
   assert.match(bad.stderr, /Usage: rl setup mcp/);
 });
 

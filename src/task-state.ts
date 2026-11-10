@@ -65,7 +65,7 @@ export function validateTask(value: unknown): asserts value is TaskState {
   for (const item of value.handoffs) {
     if (
       !object(item) ||
-      !["codex", "claude"].includes(String(item.agent)) ||
+      !["codex", "claude", "agy"].includes(String(item.agent)) ||
       sessionId(item.id) !== item.id ||
       sessionId(item.sessionId) !== item.sessionId ||
       ids.has(item.id as string) ||

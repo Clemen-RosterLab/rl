@@ -105,7 +105,7 @@ export async function main(argv: string[]): Promise<number> {
     values.stdout
   )
     throw new Error(
-      "Usage: rl agent start <codex|claude> [-- args] | run <agent> --prompt text [-- args]",
+      "Usage: rl agent start <codex|claude|agy> [-- args] | run <agent> --prompt text [-- args]",
     );
   return launchAgent(context.store, name, extra, {
     mode: command,

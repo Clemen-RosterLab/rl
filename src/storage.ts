@@ -11,10 +11,15 @@ import {
   locked,
   message,
 } from "./common.js";
-import { commandContext, contextOptions } from "./command-context.js";
+import {
+  commandContext,
+  contextOptions,
+  type CommandContext,
+} from "./command-context.js";
 import { lastAccessed } from "./access.js";
 import { protectedCleanupName } from "./cleanup-path.js";
 import { containedPath, readWorkflowConfig } from "./workflow-config.js";
+import { worktrees } from "./repos.js";
 import {
   assertReady,
   GIT_WORKFLOW_DIRECTORY,
@@ -28,6 +33,9 @@ const BUILDS = new Set([
   ".nuxt",
   ".turbo",
   ".cache",
+  ".tmp",
+  "tmp",
+  "temp",
   "dist",
   "build",
   "coverage",
@@ -62,7 +70,7 @@ interface Target {
 }
 const visible = (value: string) =>
   stripVTControlCharacters(value).replace(/[\x00-\x1f\x7f-\x9f]/g, " ");
-function size(bytes: number): string {
+export function size(bytes: number): string {
   const units = ["B", "KiB", "MiB", "GiB", "TiB"];
   let i = 0;
   while (bytes >= 1024 && i < units.length - 1) {
@@ -337,13 +345,119 @@ function suggestions(
   return result;
 }
 
+/** Standard top-level artifacts are eligible only when ignored by this checkout. */
+function defaultCleanupPaths(workspace: string): string[] {
+  return [...BUILDS, ...DEPENDENCIES].filter((relative) => {
+    if (!fs.existsSync(path.join(workspace, relative))) return false;
+    try {
+      git(workspace, "check-ignore", "--no-index", "--", relative + "/");
+      return true;
+    } catch {
+      return false;
+    }
+  });
+}
+
+export interface CleanupReport {
+  workspace: { id: string; branch: string; path: string };
+  dryRun: boolean;
+  paths: string[];
+  estimatedBytes: number;
+  removedPaths: string[];
+}
+
+/** The caller holds GIT_WORKFLOW_LOCK for mutation. A preview writes nothing. */
+export function cleanWorkspace(
+  context: CommandContext,
+  requested: string,
+  dryRun: boolean,
+  useDefaults = false,
+): CleanupReport {
+  const [root, branch] = context.store.worktree(requested);
+  if (root !== requested)
+    throw new Error("Cleanup requires an RL worktree root");
+  const owned = () =>
+    context.store
+      .records()
+      .find(
+        ([, instance]) =>
+          instance.status === "active" && instance.worktree === root,
+      );
+  const original = owned();
+  if (!original && !inside(root, context.managedDir))
+    throw new Error("Cleanup target is not an RL worktree");
+  if (original && original[1].branch !== branch)
+    throw new Error(
+      `Instance owns branch ${original[1].branch}; current branch is ${branch}`,
+    );
+  const identity = fs.lstatSync(root);
+  const fallbackClean = useDefaults ? defaultCleanupPaths(root) : undefined;
+  const clean = readWorkflowConfig(root, fallbackClean).clean;
+  const recheck = () => {
+    const currentIdentity = fs.lstatSync(root);
+    if (
+      !currentIdentity.isDirectory() ||
+      currentIdentity.dev !== identity.dev ||
+      currentIdentity.ino !== identity.ino ||
+      canonical(root) !== root
+    )
+      throw new Error("Workspace directory changed during cleanup");
+    const current = owned();
+    if (current?.[1].key !== original?.[1].key)
+      throw new Error("RL workspace changed during cleanup");
+    if (context.store.worktree(root)[0] !== root)
+      throw new Error("Worktree identity changed during cleanup");
+    assertReady(root, false, branch);
+    if (
+      JSON.stringify(readWorkflowConfig(root, fallbackClean).clean) !==
+      JSON.stringify(clean)
+    )
+      throw new Error("Cleanup configuration changed; retry");
+  };
+  recheck();
+  const targets = plan(root, clean);
+  const registered = worktrees(context.repo);
+  if (
+    targets.some((target) =>
+      registered.some((other) => {
+        const otherRoot = canonical(other.worktree);
+        return otherRoot === target.path || inside(otherRoot, target.path);
+      }),
+    )
+  )
+    throw new Error("Cleanup contains another registered worktree");
+  const estimatedBytes = targets.length
+    ? measure(
+        targets.map((target) => ({
+          path: target.path,
+          relative: target.relative,
+        })),
+        clean,
+        true,
+      ).estimatedBytes
+    : 0;
+  const removedPaths =
+    !dryRun && targets.length ? remove(root, targets, recheck) : [];
+  return {
+    workspace: { id: original?.[1].id ?? branch, branch, path: root },
+    dryRun,
+    paths: targets.map((target) => target.relative),
+    estimatedBytes,
+    removedPaths,
+  };
+}
+
 export async function main(argv: string[]): Promise<number> {
   const { values, positionals } = args(
     argv,
     [...contextOptions, "older-than"],
     ["json", "dry-run"],
   );
-  const [command, ...rest] = positionals;
+  let [command, ...rest] = positionals;
+  if (command === "storage" && rest[0] === "clean") {
+    command = "clean";
+    rest = rest.slice(1);
+  }
   arity(rest, 0);
   if (
     !["storage", "clean"].includes(command) ||
@@ -355,8 +469,7 @@ export async function main(argv: string[]): Promise<number> {
     );
   const context = commandContext(values);
   // Resolve from the caller's cwd before any scan, lock creation, or mutation.
-  const [file, data] = context.store.current();
-  const workspaceIdentity = fs.lstatSync(data.worktree);
+  const [, data] = context.store.current();
   const clean = readWorkflowConfig(data.worktree).clean;
   const workspace = { id: data.id, branch: data.branch, path: data.worktree };
   const days = Number(String(values["older-than"] ?? "14d").replace(/d$/, ""));
@@ -420,64 +533,25 @@ export async function main(argv: string[]): Promise<number> {
     }
     return 0;
   }
-  const recheck = () => {
-    const currentIdentity = fs.lstatSync(data.worktree);
-    if (
-      !currentIdentity.isDirectory() ||
-      currentIdentity.dev !== workspaceIdentity.dev ||
-      currentIdentity.ino !== workspaceIdentity.ino ||
-      canonical(data.worktree) !== data.worktree
-    )
-      throw new Error("Current workspace directory changed during cleanup");
-    const [currentFile, current] = context.store.current();
-    if (currentFile !== file || current.key !== data.key)
-      throw new Error("Current RL workspace changed during cleanup");
-    assertReady(data.worktree, false, data.branch);
-  };
   const perform = () => {
-    recheck();
-    const currentClean = readWorkflowConfig(data.worktree).clean;
-    if (JSON.stringify(currentClean) !== JSON.stringify(clean))
-      throw new Error("Cleanup configuration changed; retry");
-    const targets = plan(data.worktree, clean);
-    const estimatedBytes = targets.length
-      ? measure(
-          targets.map((target) => ({
-            path: target.path,
-            relative: target.relative,
-          })),
-          clean,
-          true,
-        ).estimatedBytes
-      : 0;
-    const removedPaths =
-      !values["dry-run"] && targets.length
-        ? remove(data.worktree, targets, recheck)
-        : [];
-    const report = {
-      workspace,
-      dryRun: !!values["dry-run"],
-      paths: targets.map((target) => target.relative),
-      estimatedBytes,
-      removedPaths,
-    };
+    const report = cleanWorkspace(context, data.worktree, !!values["dry-run"]);
     if (values.json) json(report);
     else {
       console.log(
         `${values["dry-run"] ? "Cleanup preview" : "Cleanup"}: ${visible(data.id)}\n${visible(data.worktree)}`,
       );
-      for (const target of targets)
+      for (const relative of report.paths)
         console.log(
-          `  ${values["dry-run"] ? "Would remove" : "Removed"} ${visible(target.relative)} (${size(target.usage.allocatedBytes)})`,
+          `  ${values["dry-run"] ? "Would remove" : "Removed"} ${visible(relative)}`,
         );
       console.log(
-        `Estimated ${values["dry-run"] ? "space to free" : "cleanup size"}: ${size(estimatedBytes)}`,
+        `Estimated ${values["dry-run"] ? "space to free" : "cleanup size"}: ${size(report.estimatedBytes)}`,
       );
       if (!clean.length)
         console.log(
           'Configure "clean": ["node_modules", ".next", ".turbo"] in this workspace\'s .rl/workflows.json first.',
         );
-      else if (!targets.length)
+      else if (!report.paths.length)
         console.log("No configured generated directories exist.");
     }
     return 0;

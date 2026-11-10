@@ -33,7 +33,7 @@ const topics: Record<string, Topic> = {
       "-b, --base <ref>      Creation base (default: origin/test unless configured)",
       "--no-fetch           Use cached refs when opening or creating",
       "--setup              Run configured project setup",
-      "--agent codex|claude  Start an agent after switching",
+      "--agent codex|claude|agy  Start an agent after switching",
       "-- <agent args>      Forward options to the selected agent",
     ],
     notes: [
@@ -78,6 +78,28 @@ const topics: Record<string, Topic> = {
     ],
     related: ["list"],
   },
+  sync: {
+    group: "Workspaces",
+    description: "Fetch and merge each workspace's base into its branch",
+    usage: "rl sync [workspaces...] [--dry-run] [--json]",
+    options: [
+      "--dry-run   Fetch and preview without changing branches or working files",
+      "--json      Print structured results",
+    ],
+    notes: [
+      "Defaults to all active RL workspaces in the selected repository. Optionally select by name, branch or absolute path.",
+      "Uses each workspace's saved base, or the repository default. Unqualified bases prefer origin; explicit local refs stay local.",
+      "Fetches configured remotes first. Any fetch failure stops merges. Local stacked bases are synced before their children.",
+      "Skips dirty, locked, missing or busy worktrees. Conflicting merges are aborted so other branches can continue.",
+      "Merges locally and does not push. Reports a result for every selected workspace; exits nonzero for conflicts, failures or skips.",
+    ],
+    examples: [
+      "rl sync",
+      "rl sync --dry-run",
+      "rl sync feature/login feature/profile",
+    ],
+    related: ["switch", "pr update"],
+  },
   delete: {
     group: "Workspaces",
     description: "Remove workspaces",
@@ -92,9 +114,88 @@ const topics: Record<string, Topic> = {
       "Saved sessions, notes and task history are retained.",
     ],
   },
+  review: {
+    group: "Code and reviews",
+    description:
+      "Live Git/PR review in the current terminal, plus saved snapshots",
+    usage: "rl review [worktree] [action] [options]",
+    options: [
+      "--all                     Choose a worktree from the review queue",
+      "--pr <number>             Inspect a GitHub PR (gh; local fallback if unavailable)",
+      "--live                    Require the live terminal interface",
+      "--remote-interval <sec>   PR polling interval (default 60; minimum 10)",
+      "--summary                 AI implementation summary (manual fallback if unavailable)",
+      "--diff                    Complete feature diff against the fixed baseline",
+      "--base <ref>              Explicitly pin a legacy baseline (merge-base with HEAD)",
+      "--checkpoint              Save an inspected source/index checkpoint",
+      "--checkpoints             List saved checkpoints",
+      "--since-last-review       Compare with the latest checkpoint",
+      "--since <revision|UUID>   Revision → HEAD, or a legacy checkpoint UUID",
+      "--snapshot <UUID>         Inspect an immutable saved snapshot",
+      "--approve                 Approve the last inspected snapshot if still current",
+      "--ready                   Mark this snapshot ready for human review",
+      "--ai-review               Run an independent AI review",
+      "--groups                  Browse logical groups backed by Git file/hunk IDs",
+      "--provider codex|claude|agy    Select the AI provider",
+      "--profile <name>           Editable RL agent profile (default: reviewer)",
+      "--no-ai                   Use Git evidence without invoking a model",
+      "--worktree-diff            Uncommitted source and staged content only",
+      "--lazygit                 Optional live working-tree viewer (not feature-wide)",
+      "--open                    Open the worktree in VS Code",
+      "--filter <name>            all | needs-review | changed | clean | active | ready",
+      "--label <text>             Label a checkpoint or approval",
+      "--json                    Structured queue, snapshot or analysis output",
+      "--interactive             Open pickers even with redirected output",
+    ],
+    notes: [
+      "Default: live commits/files/diff for the current worktree. 1/2/3 focus; Tab cycles; j/k navigate; w working; p branch; r range; f freeze; m mark; s since; / search; o VS Code; ? help; q quit.",
+      "Live review watches source, HEAD and index with polling fallback. Freeze retains immutable trees. Live m/s checkpoints are separate from legacy approval checkpoints.",
+      "Queue: Enter review, Alt-S summary, Alt-D diff, Alt-F feedback, Alt-A approve, Alt-O editor, Ctrl-R refresh, Esc quit.",
+      "New rl switch -c branches record a fixed baseline. Older worktrees require explicit --base; no feature baseline is guessed.",
+      "Temporary Git indexes capture committed, staged, unstaged and non-ignored untracked source without changing your real index or branch.",
+      "Omitted sensitive/oversized paths, conflicts and unstable snapshots block approval. AI analysis never approves code or proves tests passed.",
+      "Agent activity is last-observed hook activity, not process-liveness or task-completion proof. Review state lives beside existing notes and sessions.",
+    ],
+    examples: [
+      "rl review",
+      "rl review feature/login --base origin/test",
+      "rl review feature/login --diff",
+      "rl review feature/login --checkpoint",
+      "rl review feature/login --since-last-review",
+      "rl review feature/login --approve",
+    ],
+    related: ["feedback", "pr", "workflow"],
+  },
+  feedback: {
+    group: "Code and reviews",
+    description:
+      "Save corrections and route them to a worktree's coding session",
+    usage:
+      "rl feedback [worktree] [--message <text> | --file <path|->] [options]",
+    options: [
+      "--send          Run a noninteractive turn in a validated saved session",
+      "--resume        Open the coding conversation with feedback as its prompt",
+      "--agent <name>  Filter saved sessions to codex, claude or agy",
+      "--session UUID  Select a session associated with this worktree",
+      "--retry UUID    Retry saved feedback without losing it on failure",
+      "--list          Show saved feedback and delivery status",
+      "--json          Print structured results",
+    ],
+    notes: [
+      "Feedback is saved before launching an agent. Without --send/--resume it stays saved. Interactive input uses VISUAL/EDITOR.",
+      "Multiple sessions use a terminal picker, or require explicit noninteractive selection. Recently observed working sessions are not sent concurrent turns.",
+      "Opened means the conversation launched, not acknowledged delivery. Delivered requires a successful noninteractive turn; failures retain feedback and errors.",
+    ],
+    examples: [
+      "rl feedback feature/login --message 'Reuse the existing helper and add a regression test.'",
+      "rl feedback feature/login --file feedback.md --send --agent codex --session <UUID>",
+      "rl feedback feature/login --retry <UUID> --resume",
+    ],
+    related: ["review", "resume"],
+  },
   storage: {
     group: "Workspaces",
-    description: "Inspect disk usage and clean generated files",
+    description: "Inspect workspace disk usage",
     usage: "rl storage [--json] [--older-than <age>]",
     options: [
       "--json               Print structured output",
@@ -103,7 +204,30 @@ const topics: Record<string, Topic> = {
     notes: [
       "Measures only the current adopted workspace. Cleanup uses its configured clean paths.",
     ],
-    related: ["setup show"],
+    related: ["clean", "setup show"],
+  },
+  clean: {
+    group: "Workspaces",
+    description: "Clean generated files from selected worktrees",
+    usage: "rl clean [worktrees...] [--all] [--dry-run] [--json]",
+    options: [
+      "--all       Clean every RL worktree in the selected repository",
+      "--dry-run   Preview paths and estimated space without deleting files",
+      "--json      Print structured per-worktree results",
+    ],
+    notes: [
+      "Without names or --all, opens a multi-select picker. Tab selects; Ctrl-A selects all.",
+      "Accepts worktree names, branches or absolute paths. Main checkouts and unadopted outside worktrees are excluded.",
+      "Defaults to ignored dependency, build and cache directories such as node_modules, .venv, .next, .turbo and dist.",
+      "A worktree's explicit clean list in .rl/workflows.json overrides the defaults; an empty list disables cleanup.",
+      "Preserves source, Git metadata, credentials, notes and sessions. Locked or unsafe worktrees are reported while the others continue.",
+    ],
+    examples: [
+      "rl clean",
+      "rl clean --all --dry-run",
+      "rl clean feature/login feature/profile",
+    ],
+    related: ["storage", "delete"],
   },
   "storage clean": {
     description: "Remove configured generated directories",
@@ -117,7 +241,7 @@ const topics: Record<string, Topic> = {
   resume: {
     group: "Agents and tasks",
     description: "Resume a saved conversation",
-    usage: "rl resume [codex|claude] [--latest|-l|--l]",
+    usage: "rl resume [codex|claude|agy] [--latest|-l|--l]",
     options: [
       "--latest, -l, --l  Resume the most recently used matching session directly",
     ],
@@ -139,13 +263,13 @@ const topics: Record<string, Topic> = {
   "agent start": {
     description: "Start an interactive agent",
     usage:
-      "rl agent start <codex|claude> [--workspace <name>] [-- <agent args>]",
+      "rl agent start <codex|claude|agy> [--workspace <name>] [-- <agent args>]",
     examples: ["rl agent start codex -- --model <model>"],
   },
   "agent run": {
     description: "Run an agent non-interactively",
     usage:
-      "rl agent run <codex|claude> --prompt <text> [--workspace <name>] [-- <agent args>]",
+      "rl agent run <codex|claude|agy> --prompt <text> [--workspace <name>] [-- <agent args>]",
     notes: [
       "Returns the agent's exit status and preserves its native options.",
     ],
@@ -178,11 +302,11 @@ const topics: Record<string, Topic> = {
   },
   "agent sessions": {
     description: "List saved conversations",
-    usage: "rl agent sessions [codex|claude]",
+    usage: "rl agent sessions [codex|claude|agy]",
   },
   "agent save": {
     description: "Save the current or an explicit conversation",
-    usage: "rl agent save [codex|claude] [UUID] [--json]",
+    usage: "rl agent save [codex|claude|agy] [UUID] [--json]",
     notes: [
       "Defaults to the current Codex session ID. Claude requires an explicit UUID.",
     ],
@@ -190,7 +314,7 @@ const topics: Record<string, Topic> = {
   "agent handoff": {
     description: "Export shared task context",
     usage:
-      "rl agent handoff [codex|claude] [--workspace <name>] [--stdout | --output <file>]",
+      "rl agent handoff [codex|claude|agy] [--workspace <name>] [--stdout | --output <file>]",
     notes: [
       "Exports notes; agent conversations remain in their original sessions.",
     ],
@@ -215,7 +339,7 @@ const topics: Record<string, Topic> = {
   },
   "workflow init": {
     description: "Create editable profiles, policies and workflows",
-    usage: "rl workflow init [--provider inherit|codex|claude] [--json]",
+    usage: "rl workflow init [--provider inherit|codex|claude|agy] [--json]",
     notes: [
       "Creates .rl/agents.json, .rl/policies.json and .rl/agent-workflows.json.",
       "Existing configuration is never overwritten.",
@@ -238,7 +362,7 @@ const topics: Record<string, Topic> = {
       "--prompt <text>  Feature intent for the reviewers",
       "--dry-run        Preview scope and steps without launching agents",
       "--json           Print structured results",
-      "--agent codex|claude  Parent session provider",
+      "--agent codex|claude|agy  Parent session provider",
       "--session <UUID>     Parent conversation (inferred inside Codex)",
       "--request <UUID>     Start a queued workflow request instead of choosing a name",
     ],
@@ -265,57 +389,57 @@ const topics: Record<string, Topic> = {
   },
   "workflow pending": {
     description: "Read queued workflows for the parent session",
-    usage: "rl workflow pending [--agent codex|claude] [--session <UUID>]",
+    usage: "rl workflow pending [--agent codex|claude|agy] [--session <UUID>]",
   },
   "workflow event": {
     description: "Report a milestone and match workflow triggers",
     usage:
-      "rl workflow event --file <event.json|-> [--agent codex|claude] [--session <UUID>]",
+      "rl workflow event --file <event.json|-> [--agent codex|claude|agy] [--session <UUID>]",
   },
   "workflow claim": {
     description: "Claim a ready step for a native subagent",
     usage:
-      "rl workflow claim <run> [--step <name>] [--agent codex|claude] [--session <UUID>]",
+      "rl workflow claim <run> [--step <name>] [--agent codex|claude|agy] [--session <UUID>]",
   },
   "workflow report": {
     description: "Submit a claimed native agent's evidence or a check result",
     usage:
-      "rl workflow report <run> --file <report.json|-> [--agent codex|claude] [--session <UUID>]",
+      "rl workflow report <run> --file <report.json|-> [--agent codex|claude|agy] [--session <UUID>]",
   },
   "workflow dismiss": {
     description: "Dismiss an unavailable workflow with a reason",
     usage:
-      "rl workflow dismiss --file <dismissal.json|-> [--agent codex|claude] [--session <UUID>]",
+      "rl workflow dismiss --file <dismissal.json|-> [--agent codex|claude|agy] [--session <UUID>]",
   },
   "workflow bind": {
     description: "Bind a role to the native peer spawned by this session",
     usage:
-      "rl workflow bind <run> --file <binding.json|-> [--agent codex|claude] [--session <UUID>]",
+      "rl workflow bind <run> --file <binding.json|-> [--agent codex|claude|agy] [--session <UUID>]",
   },
   "workflow inbox": {
     description: "Read a peer's requests, review checkpoints and ratings",
     usage:
-      "rl workflow inbox <run> --step <step> --claim <token> [--agent codex|claude] [--session <UUID>]",
+      "rl workflow inbox <run> --step <step> --claim <token> [--agent codex|claude|agy] [--session <UUID>]",
   },
   "workflow consult": {
     description: "Ask an existing peer through a configured workflow route",
     usage:
-      "rl workflow consult <run> --file <consultation.json|-> [--agent codex|claude] [--session <UUID>]",
+      "rl workflow consult <run> --file <consultation.json|-> [--agent codex|claude|agy] [--session <UUID>]",
   },
   "workflow answer": {
     description: "Return reuse or duplication evidence to a requesting peer",
     usage:
-      "rl workflow answer <run> --file <answer.json|-> [--agent codex|claude] [--session <UUID>]",
+      "rl workflow answer <run> --file <answer.json|-> [--agent codex|claude|agy] [--session <UUID>]",
   },
   "workflow submit": {
     description: "Submit writer work to the existing reviewer",
     usage:
-      "rl workflow submit <run> --file <submission.json|-> [--agent codex|claude] [--session <UUID>]",
+      "rl workflow submit <run> --file <submission.json|-> [--agent codex|claude|agy] [--session <UUID>]",
   },
   "workflow review": {
     description: "Return a rating and evidence for a stable writer checkpoint",
     usage:
-      "rl workflow review <run> --file <review.json|-> [--agent codex|claude] [--session <UUID>]",
+      "rl workflow review <run> --file <review.json|-> [--agent codex|claude|agy] [--session <UUID>]",
   },
   "workflow status": {
     description: "Inspect a saved run",
@@ -339,7 +463,7 @@ const topics: Record<string, Topic> = {
   "workflow resume": {
     description: "Continue unfinished workflow stages",
     usage:
-      "rl workflow resume [UUID|latest] [--agent codex|claude] [--session <UUID>] [--json]",
+      "rl workflow resume [UUID|latest] [--agent codex|claude|agy] [--session <UUID>] [--json]",
     notes: [
       "Uses the saved configuration. Changed review scope requires a new run.",
     ],
@@ -378,7 +502,7 @@ const topics: Record<string, Topic> = {
       "--validation <text>  Checks actually run, or Not run",
       "--next <text>        Next steps",
       "--blockers <text>    Optional blockers",
-      "--agent codex|claude Agent owning the handoff (default: codex)",
+      "--agent codex|claude|agy Agent owning the handoff (default: codex)",
       "--session <UUID>     Conversation ID; inferred inside Codex",
     ],
     notes: [
@@ -547,9 +671,10 @@ const topics: Record<string, Topic> = {
   },
   "setup mcp": {
     description: "Connect this workspace's RL MCP server to your agent",
-    usage: "rl setup mcp [codex|claude] [--dry-run] [--json]",
+    usage: "rl setup mcp [codex|claude|agy] [--dry-run] [--json]",
     notes: [
       "Configures both clients by default: .codex/config.toml and .mcp.json in this adopted workspace.",
+      "Select agy for .agents/mcp_config.json with an instance-specific server name. No global configuration is changed.",
       "Preserves other settings and servers. Existing unmanaged entries named rl require manual resolution.",
       "Launches the installed Node/RL directly, with this workspace and its RL state bound explicitly. Rerun after moving the installation.",
       "Reload your client and review its normal project trust/MCP approval. Your existing session creates native subagents.",
@@ -581,7 +706,7 @@ const topics: Record<string, Topic> = {
   doctor: {
     group: "Project",
     description: "Check and repair agent integration",
-    usage: "rl doctor [codex|claude] [--repair] [--json]",
+    usage: "rl doctor [codex|claude|agy] [--repair] [--json]",
     notes: [
       "Reports CLI availability, installed hooks and observed activity.",
       "--repair reinstalls this workspace's RL hooks.",
@@ -695,6 +820,10 @@ export function invocation(module: string, argv: string[]): string[] {
   if (module === "mcp") return ["agent", "mcp", ...rest];
   if (module === "mcp-setup") return ["setup", "mcp", ...rest];
   if (module === "delete") return ["delete", ...rest];
+  if (module === "clean") return ["clean", ...rest];
+  if (module === "review") return ["review", ...rest];
+  if (module === "feedback") return ["feedback", ...rest];
+  if (module === "sync") return ["sync", ...rest];
   if (module === "picker") return [];
   if (module === "agent") return ["agent", ...rest];
   if (module === "git") return ["git", ...rest];
