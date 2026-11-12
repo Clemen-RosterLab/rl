@@ -89,10 +89,12 @@ export async function execute(
     timeoutMs?: number;
     env?: NodeJS.ProcessEnv;
     signal?: AbortSignal;
+    abortGraceMs?: number;
     maxOutputBytes?: number;
     processGroup?: boolean;
   } = {},
 ): Promise<CommandResult> {
+  options.signal?.throwIfAborted();
   return new Promise((resolve, reject) => {
     const child = spawn(argv[0], argv.slice(1), {
       cwd,
@@ -109,7 +111,11 @@ export async function execute(
     let overflow = false;
     let forceKill: ReturnType<typeof setTimeout> | undefined;
     const kill = (signal: NodeJS.Signals) => {
-      if (child.exitCode !== null || child.signalCode !== null) return;
+      if (
+        !options.processGroup &&
+        (child.exitCode !== null || child.signalCode !== null)
+      )
+        return;
       try {
         if (options.processGroup && child.pid) process.kill(-child.pid, signal);
         else child.kill(signal);
@@ -120,8 +126,15 @@ export async function execute(
       }
     };
     const abort = () => {
+      if (options.abortGraceMs === 0) {
+        kill("SIGKILL");
+        return;
+      }
       kill("SIGTERM");
-      forceKill ??= setTimeout(() => kill("SIGKILL"), 1000);
+      forceKill ??= setTimeout(
+        () => kill("SIGKILL"),
+        options.abortGraceMs ?? 1000,
+      );
       forceKill.unref();
     };
     const append = (chunk: Buffer, target: "stdout" | "stderr") => {
@@ -140,8 +153,8 @@ export async function execute(
     });
     child.stdin?.on("error", () => {});
     child.stdin?.end(options.input);
-    const interrupt = () => child.kill("SIGINT");
-    const terminate = () => child.kill("SIGTERM");
+    const interrupt = () => kill("SIGINT");
+    const terminate = () => kill("SIGTERM");
     process.on("SIGINT", interrupt);
     process.on("SIGTERM", terminate);
     const cleanup = () => {

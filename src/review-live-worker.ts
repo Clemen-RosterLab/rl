@@ -1,4 +1,3 @@
-import { parentPort, workerData } from "node:worker_threads";
 import {
   LiveRepository,
   saveCheckpoint,
@@ -8,8 +7,9 @@ import {
   type Checkpoint,
 } from "./review-live-engine.js";
 import { message } from "./common.js";
-const repository = new LiveRepository(workerData.root, workerData.repository);
-parentPort!.on(
+const [root, workspaceRepo, temporaryRoot, freezeId] = process.argv.slice(2);
+let repository: LiveRepository | undefined;
+process.on(
   "message",
   (request: {
     id: number;
@@ -27,6 +27,10 @@ parentPort!.on(
     revisions?: string[];
   }) => {
     try {
+      repository ??= new LiveRepository(root, workspaceRepo, {
+        temporaryRoot,
+        freezeId,
+      });
       if (request.op !== "refresh") repository.assertIdentity();
       let result: unknown;
       if (request.op === "refresh") result = repository.refresh(request.force);
@@ -60,9 +64,10 @@ parentPort!.on(
         );
         result = true;
       } else throw new Error("Unknown review worker operation");
-      parentPort!.postMessage({ id: request.id, result });
+      if (process.connected) process.send!({ id: request.id, result });
     } catch (error) {
-      parentPort!.postMessage({ id: request.id, error: message(error) });
+      if (process.connected)
+        process.send!({ id: request.id, error: message(error) });
     }
   },
 );

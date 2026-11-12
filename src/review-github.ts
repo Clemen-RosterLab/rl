@@ -35,6 +35,8 @@ export class GhReviewService implements ReviewGitHub {
         await execute(["git", "cat-file", "-e", `${oid}^{commit}`], root, {
           timeoutMs: 5000,
           signal,
+          abortGraceMs: 0,
+          processGroup: true,
         })
       ).code === 0;
     if ((await has(pr.headRefOid)) && (await has(pr.baseRefOid))) return;
@@ -51,7 +53,7 @@ export class GhReviewService implements ReviewGitHub {
     const valid = await execute(
       ["git", "check-ref-format", `refs/heads/${pr.baseRefName}`],
       root,
-      { timeoutMs: 5000, signal },
+      { timeoutMs: 5000, signal, processGroup: true, abortGraceMs: 0 },
     );
     if (valid.code) throw new Error("Invalid PR target branch");
     // Download only into private refs. Never touch HEAD, FETCH_HEAD, the index,
@@ -70,7 +72,13 @@ export class GhReviewService implements ReviewGitHub {
         `+refs/heads/${pr.baseRefName}:refs/rl/live-pr/${pr.number}/base`,
       ],
       root,
-      { timeoutMs: 30000, maxOutputBytes: 1024 * 1024, signal },
+      {
+        timeoutMs: 30000,
+        maxOutputBytes: 1024 * 1024,
+        signal,
+        abortGraceMs: 0,
+        processGroup: true,
+      },
     );
     if (result.code)
       throw new Error(
@@ -101,7 +109,14 @@ export class GhReviewService implements ReviewGitHub {
         "number,title,url,headRefName,baseRefName,headRefOid,baseRefOid,commits,files",
       ],
       root,
-      { env, timeoutMs: 8000, maxOutputBytes: 8 * 1024 * 1024, signal },
+      {
+        env,
+        timeoutMs: 8000,
+        maxOutputBytes: 8 * 1024 * 1024,
+        signal,
+        abortGraceMs: 0,
+        processGroup: true,
+      },
     );
     if (result.code)
       throw new Error(

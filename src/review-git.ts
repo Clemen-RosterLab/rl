@@ -289,8 +289,13 @@ function pass(
     conflicts,
   };
 }
-export function captureSnapshot(root: string): Snapshot {
-  const temporary = fs.mkdtempSync(path.join(os.tmpdir(), "rl-review-index-"));
+export function captureSnapshot(
+  root: string,
+  temporaryRoot = os.tmpdir(),
+): Snapshot {
+  const temporary = fs.mkdtempSync(
+    path.join(temporaryRoot, "rl-review-index-"),
+  );
   try {
     let previous = pass(root, temporary);
     for (let attempt = 0; attempt < 2; attempt++) {

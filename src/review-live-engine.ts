@@ -14,6 +14,8 @@ import {
   type ChangedFile,
 } from "./review-git.js";
 
+export const REVIEW_HISTORY_LIMIT = 10;
+
 export interface Commit {
   sha: string;
   parents: string[];
@@ -27,6 +29,7 @@ export interface Commit {
 export interface LiveState {
   snapshot: Snapshot;
   commits: Commit[];
+  workingFiles?: ReviewFile[];
   gitDir: string;
   commonDir: string;
   directories: string[];
@@ -34,7 +37,7 @@ export interface LiveState {
 }
 export interface Comparison {
   label: string;
-  scopes: { name: string; from: string; to: string }[];
+  scopes: { name: string; from: string; to: string; commit?: string }[];
   target: string;
 }
 export interface ReviewFile extends ChangedFile {
@@ -46,6 +49,7 @@ export interface ReviewFile extends ChangedFile {
 export type Mode =
   | { kind: "working" }
   | { kind: "commit"; sha: string }
+  | { kind: "commits"; commits: Commit[] }
   | { kind: "range"; from: string; to: string }
   | { kind: "branch"; base: string; head?: string }
   | { kind: "since"; checkpoint: Checkpoint };
@@ -91,13 +95,19 @@ export function reviewRoot(cwd: string, repo: string): string {
 export class LiveRepository {
   private last?: LiveState;
   private commits = new Map<string, Commit>();
+  private historyCache = new Map<string, Commit[]>();
   private readonly identity: string;
-  private readonly freezeRef = `refs/rl/live-freeze/${randomUUID()}`;
+  private readonly freezeRef: string;
   private pinned = new Set<string>();
   constructor(
     readonly root: string,
     repository = root,
+    private readonly options: {
+      temporaryRoot?: string;
+      freezeId?: string;
+    } = {},
   ) {
+    this.freezeRef = `refs/rl/live-freeze/${options.freezeId ?? randomUUID()}`;
     reviewRoot(root, repository);
     this.identity = canonical(
       reviewGit(root, ["rev-parse", "--absolute-git-dir"]).trim(),
@@ -228,7 +238,7 @@ export class LiveRepository {
       ]),
     );
     if (!force && this.last?.signature === signature) return this.last;
-    const snapshot = captureSnapshot(this.root);
+    const snapshot = captureSnapshot(this.root, this.options.temporaryRoot);
     const commits = snapshot.head ? this.history(snapshot.head) : [];
     const directories = new Set([this.root]);
     const paths = reviewGit(this.root, [
@@ -248,60 +258,107 @@ export class LiveRepository {
         directories.add(dir);
       }
     }
-    return (this.last = {
+    const state: LiveState = {
       snapshot,
       commits,
       gitDir,
       commonDir,
       directories: [...directories],
       signature,
-    });
+    };
+    state.workingFiles = this.files(
+      this.comparison({ kind: "working" }, state),
+      state,
+    );
+    return (this.last = state);
   }
   history(head: string, base?: string): Commit[] {
+    const headOid = revision(this.root, head),
+      baseOid = base ? revision(this.root, base) : undefined;
+    const key = `${headOid}:${baseOid ?? ""}`;
+    const cached = this.historyCache.get(key);
+    if (cached) return cached;
+    // Read the recent timeline and all of its statistics in a single process.
+    // NUL-delimited records preserve filenames containing tabs or newlines.
+    const fields = reviewGit(this.root, [
+      "log",
+      `-${REVIEW_HISTORY_LIMIT}`,
+      "--numstat",
+      "--no-color",
+      "--no-ext-diff",
+      "--no-textconv",
+      "-z",
+      "--find-renames",
+      "--diff-merges=first-parent",
+      "--root",
+      "--format=%x00%H%x00%P%x00%s%x00%an%x00%aI%x00",
+      headOid,
+      ...(baseOid
+        ? ["^" + reviewGit(this.root, ["merge-base", baseOid, headOid]).trim()]
+        : []),
+      "--",
+    ]).split("\0");
     const commits: Commit[] = [];
-    {
-      const log = reviewGit(this.root, [
-        "log",
-        "-100",
-        "--format=%H%x00%P%x00%s%x00%an%x00%aI",
-        revision(this.root, head),
-        ...(base
-          ? [
-              "^" +
-                reviewGit(this.root, [
-                  "merge-base",
-                  revision(this.root, base),
-                  revision(this.root, head),
-                ]).trim(),
-            ]
-          : []),
-        "--",
-      ]);
-      for (const line of log.trimEnd().split("\n").filter(Boolean)) {
-        const [sha, parents, subject, author, date] = line.split("\0");
-        let commit = this.commits.get(sha);
-        if (!commit) {
-          const p = parents.split(" ").filter(Boolean);
-          const files = changedFiles(this.root, p[0] ?? this.emptyTree(), sha);
-          commit = {
-            sha,
-            parents: p,
-            subject,
-            author,
-            date,
-            files: files.length,
-            additions: files.reduce((n, f) => n + (f.additions ?? 0), 0),
-            deletions: files.reduce((n, f) => n + (f.deletions ?? 0), 0),
-          };
-          this.commits.set(sha, commit);
-        }
-        commits.push(commit);
+    let current: Commit | undefined;
+    for (let i = 0; i < fields.length; i++) {
+      const field = fields[i].replace(/^\n/, "");
+      if (!field) continue;
+      if (OID.test(field)) {
+        const parents = fields[++i],
+          subject = fields[++i],
+          author = fields[++i],
+          date = fields[++i];
+        if (date === undefined)
+          throw new Error("Cannot parse Git commit history");
+        current = {
+          sha: field,
+          parents: parents.split(" ").filter(Boolean),
+          subject,
+          author,
+          date,
+          files: 0,
+          additions: 0,
+          deletions: 0,
+        };
+        commits.push(current);
+        continue;
       }
+      const stat = /^(\d+|-)\t(\d+|-)\t([\s\S]*)$/.exec(field);
+      if (!stat || !current)
+        throw new Error("Cannot parse Git commit statistics");
+      if (!stat[3]) i += 2; // A rename has separate old/new NUL path records.
+      current.files++;
+      current.additions += stat[1] === "-" ? 0 : Number(stat[1]);
+      current.deletions += stat[2] === "-" ? 0 : Number(stat[2]);
     }
-    return commits;
+    const timeline = commits.map((commit) => {
+      const existing = this.commits.get(commit.sha);
+      if (existing) return existing;
+      this.commits.set(commit.sha, commit);
+      return commit;
+    });
+    this.historyCache.set(key, timeline);
+    if (this.historyCache.size > 8)
+      this.historyCache.delete(this.historyCache.keys().next().value!);
+    return timeline;
   }
   emptyTree(): string {
     return reviewGit(this.root, ["mktree"], "").trim();
+  }
+  private commitComparison(ref: string): Comparison {
+    const sha = revision(this.root, ref);
+    const parents =
+      this.commits.get(sha)?.parents ??
+      reviewGit(this.root, ["rev-list", "--parents", "-n", "1", sha])
+        .trim()
+        .split(" ")
+        .slice(1);
+    const from = parents[0] ?? this.emptyTree();
+    return {
+      label: `${parents.length > 1 ? "Merge: first parent " : parents.length ? "" : "Initial commit: empty tree "}${from.slice(0, 8)} → ${sha.slice(0, 8)}`,
+      target: sha,
+      scopes: [{ name: "commit", from, to: sha }],
+    };
   }
   comparison(mode: Mode, state: LiveState): Comparison {
     const s = state.snapshot;
@@ -315,23 +372,20 @@ export class LiveRepository {
             { name: "unstaged", from: s.indexTree, to: s.worktreeTree },
           ],
         };
-      case "commit": {
-        const sha = revision(this.root, mode.sha);
-        const parents = reviewGit(this.root, [
-          "rev-list",
-          "--parents",
-          "-n",
-          "1",
-          sha,
-        ])
-          .trim()
-          .split(" ")
-          .slice(1);
-        const from = parents[0] ?? this.emptyTree();
+      case "commit":
+        return this.commitComparison(mode.sha);
+      case "commits": {
+        const scopes = mode.commits.flatMap(({ sha }) =>
+          this.commitComparison(sha).scopes.map((scope) => ({
+            ...scope,
+            commit: scope.to,
+          })),
+        );
+        if (!scopes.length) throw new Error("Select at least one commit");
         return {
-          label: `${parents.length > 1 ? "Merge: first parent " : parents.length ? "" : "Initial commit: empty tree "}${from.slice(0, 8)} → ${sha.slice(0, 8)}`,
-          target: sha,
-          scopes: [{ name: "commit", from, to: sha }],
+          label: `${scopes.length} selected ${scopes.length === 1 ? "commit" : "commits"} · files grouped by commit`,
+          target: scopes[0].to,
+          scopes,
         };
       }
       case "range": {
@@ -392,17 +446,30 @@ export class LiveRepository {
     }
   }
   files(comparison: Comparison, state: LiveState): ReviewFile[] {
+    const [staged, unstaged] = comparison.scopes;
+    if (
+      state.workingFiles &&
+      comparison.scopes.length === 2 &&
+      staged.name === "staged" &&
+      unstaged.name === "unstaged" &&
+      staged.from === state.snapshot.headTree &&
+      staged.to === state.snapshot.indexTree &&
+      unstaged.from === state.snapshot.indexTree &&
+      unstaged.to === state.snapshot.worktreeTree
+    )
+      return state.workingFiles;
     return comparison.scopes.flatMap((scope) =>
       changedFiles(this.root, scope.from, scope.to).map((file) => ({
         ...file,
-        layer:
-          scope.name === "unstaged" &&
-          state.snapshot.untracked.includes(file.path)
+        layer: scope.commit
+          ? `commit ${scope.commit.slice(0, 8)}`
+          : scope.name === "unstaged" &&
+              state.snapshot.untracked.includes(file.path)
             ? "untracked"
             : scope.name,
         from: scope.from,
         to: scope.to,
-        key: `${scope.name}\0${file.path}`,
+        key: `${scope.commit ?? scope.name}\0${file.path}`,
       })),
     );
   }

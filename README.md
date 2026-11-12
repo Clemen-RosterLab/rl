@@ -178,29 +178,75 @@ that readiness expires when its source or staged versions change.
 `rl review` stays in the current Ghostty or other ANSI terminal. It resolves the
 current Git checkout against the selected RL repository, without consulting a
 remembered agent directory. An explicit worktree name selects that instance.
-The responsive interface shows commits, file layers and a coloured unified diff.
-Below 90 columns, the focused panel takes the full width. Node's terminal APIs
+The interface stacks commits, files and working-tree changes in a left sidebar,
+with a wider, independently scrollable diff on the right. Charcoal and slate
+surfaces, pale blue selections, green additions and red deletions follow the
+review palette. Below 85 columns, the focused panel takes the full width. Node's terminal APIs
 keep the CLI dependency-light; no React, browser, server or extra TUI executable
 is needed for single-worktree review.
 
 Use `1`/`2`/`3` and Tab/Shift-Tab to focus panels; `j`/`k` or arrows navigate;
-Enter advances focus and Escape goes back. PageUp/PageDown scroll by a page.
-In the diff, Left/Right scroll horizontally. `w` selects staged, unstaged and
+Click commits, files, working-tree entries or footer actions to select them.
+Use the commit checkboxes or press Space in the commits panel to select several
+commits. The file list shows each selected commit’s patch under its commit SHA.
+Click a commit title to return to a single commit.
+The mouse wheel scrolls the panel under the pointer; over a file diff it scrolls
+only that file, three lines at a time; rapid trackpad events are rate-limited.
+Sidebar wheel navigation stays at one entry per step. Scrolling commits browses
+the timeline without changing the selected commit or diff; click a commit to
+inspect it. The
+selected file stays highlighted while the diff has focus. Each file remembers
+its scroll position. Enter advances focus;
+in the diff, Enter or the clickable `[Expand]` control opens a full-width file
+view. `[Back]` or Escape restores the sidebar. PageUp/PageDown scroll by a page,
+Home/End jump to the start/end. Click the scrollbar track to jump, or click and
+hold the thumb to drag it; scrolling continues with the pointer outside the bar
+until you release the button. In the diff,
+Left/Right or Shift+wheel scroll horizontally. `w` selects staged, unstaged and
 untracked layers; `p` compares the committed branch with its target merge-base;
 `r` accepts `FROM TO` revisions. Initial commits compare against the empty tree;
 merge commits compare with their first parent. The timeline includes the latest
-100 commits. `/` searches file paths in the files panel and text in the selected
+10 commits, loaded with their statistics in one Git call. `/` searches file paths in the files panel and text in the selected
 diff; `n`/`N` jump between matches. `o` opens the selected file and source line
 with `code --goto`; `?` shows help and `q` quits.
+
+Drag across preview text to select it, then press `y` or Ctrl-C to copy it to
+the clipboard using the terminal's [OSC 52 protocol](https://ghostty.org/docs/vt/osc/52).
+Escape clears the selection. Selected text retains its displayed version while
+live changes are detected; the status shows when a newer diff is available.
+Clearing the selection loads that latest diff. Ctrl-C quits when no text is selected.
+
+Drag the vertical divider to resize the sidebar and preview, or press `-`/`+`
+to shrink/grow the sidebar by four columns. `=` restores the default width.
+The width is remembered for this session and adapts to terminal resizing.
+In an expanded preview, Tab/Shift-Tab and `]`/`[` move to the next/previous file
+without collapsing it. Arrows and `j`/`k` scroll, PageUp/PageDown page, and
+Home/End jump to the start/end. Each file retains its scroll position. Enter
+or Escape restores the sidebar; `1`/`2` focus commits/files.
+
+Tests, styles and common boilerplate are hidden by default across working-tree,
+commit, range and branch/PR views. Press `t` or click `[t Focus: N hidden]` to
+show all files; press `t` again to restore the filter. The header counts hidden
+file layers. The naming rules recognise test/spec files, test directories,
+snapshots, CSS/SCSS/Sass/Less/Stylus styles, CSS-in-TS, dependency lockfiles,
+generated artifacts, source maps and minified JavaScript. Ordinary source,
+entry points, configuration and handwritten type declarations remain visible.
+This is path filtering, not semantic ranking. The toggle lasts for the current
+review session, preserves the selected source file and its scroll, and does not
+change commits, snapshots or review checkpoints.
 
 Local directory events are debounced for 180 ms, with a 2.5-second Git/status
 polling fallback. Worktree-specific HEAD/index and shared refs are watched
 separately. Source watching uses Git-listed directories and skips dependencies
-and build caches. Git runs in a worker thread; immutable commit metadata and
+and build caches. Git runs in a background process that Quit can stop. Immutable commit metadata and
 recent patches are cached, file patches load lazily and only changed terminal
 rows are drawn. Diff display is capped at 8 MiB per file with an explicit
 truncation notice. A live update keeps the selected commit/file and scroll where
 possible and increments the visible update counter.
+
+Quit cancels background Git and GitHub reads, disables mouse reporting and
+drains in-flight terminal input before returning control to the shell. A
+checkpoint save already in progress finishes before exit.
 
 Press `f` to freeze the captured source/index trees. Temporary private
 `refs/rl/live-freeze` refs retain them across Git GC and are removed on unfreeze

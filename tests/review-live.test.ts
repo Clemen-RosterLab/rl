@@ -3,8 +3,8 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
-import { Worker } from "node:worker_threads";
-import { ROOT, Workspace, write } from "./helpers.js";
+import { fork } from "node:child_process";
+import { CLI, ROOT, Workspace, write } from "./helpers.js";
 const engine = await import(
   pathToFileURL(path.join(ROOT, "dist/review-live-engine.js")).href
 );
@@ -199,15 +199,15 @@ test("Git worker reports failures without terminating and safely reads a specifi
   const w = new Workspace(t);
   write(path.join(w.a, "only-a.txt"), "A\n");
   write(path.join(w.b, "only-b.txt"), "B\n");
-  const worker = new Worker(path.join(ROOT, "dist/review-live-worker.js"), {
-    workerData: { root: w.a },
+  const worker = fork(path.join(ROOT, "dist/review-live-worker.js"), [w.a]);
+  t.after(() => {
+    worker.kill();
   });
-  t.after(() => worker.terminate());
   async function request(id: number, op: string, data: object = {}) {
     return new Promise<any>((resolve, reject) => {
       worker.once("error", reject);
       worker.once("message", resolve);
-      worker.postMessage({ id, op, ...data });
+      worker.send({ id, op, ...data });
     });
   }
   const state = (await request(1, "refresh")).result;
@@ -436,3 +436,464 @@ test("frozen commit comparisons survive a rewritten branch and expired reflogs",
   assert.match(repo.patch(file), /\+old reviewed commit/);
   repo.releaseFreeze();
 });
+
+test(
+  "real terminal clicks select files, faster wheel and held scrollbar drags scroll independently, and expansion restores positions",
+  { timeout: 120000 },
+  (t) => {
+    const w = new Workspace(t);
+    for (const name of ["a", "b"])
+      write(
+        path.join(w.a, `${name}.txt`),
+        Array.from(
+          { length: 120 },
+          (_, i) => `${name}${String(i + 1).padStart(3, "0")}`,
+        ).join("\n") + "\n",
+      );
+    w.git(w.a, "add", "a.txt", "b.txt");
+    w.git(w.a, "commit", "-qm", "Reviewable source");
+    write(path.join(w.a, "skipped.txt"), "middle-only\n");
+    w.git(w.a, "add", "skipped.txt");
+    w.git(w.a, "commit", "-qm", "Middle source");
+    write(path.join(w.a, "latest.txt"), "latest-only\n");
+    w.git(w.a, "add", "latest.txt");
+    w.git(w.a, "commit", "-qm", "Latest source");
+    const firstFile = path.join(w.a, "a.txt");
+    write(
+      firstFile,
+      fs.readFileSync(firstFile, "utf8").replace("a120\n", "++working-a\n"),
+    );
+    fs.appendFileSync(path.join(w.a, "b.txt"), "working-b\n");
+    const result = w.command(
+      [
+        "python3",
+        path.join(ROOT, "tests/review-live-pty.py"),
+        w.a,
+        process.execPath,
+        path.join(ROOT, "dist/cli.js"),
+        w.repo,
+        w.state,
+        path.join(w.root, "worktrees/example"),
+        "mouse",
+      ],
+      { timeoutMs: 90000 },
+    );
+    assert.match(result.stdout, /PTY: mouse.*passed/);
+  },
+);
+
+test(
+  "default file filter hides tests, styles and boilerplate without losing source selection or live updates",
+  { timeout: 120000 },
+  (t) => {
+    const w = new Workspace(t);
+    write(path.join(w.a, "deleted.spec.ts"), "deleted test\n");
+    write(path.join(w.a, "old.ts"), "renamed test\n");
+    w.git(w.a, "add", ".");
+    w.git(w.a, "commit", "-qm", "Initial test sources");
+    w.git(w.a, "rm", "deleted.spec.ts");
+    w.git(w.a, "mv", "old.ts", "renamed.test.ts");
+    write(
+      path.join(w.a, "source.ts"),
+      Array.from({ length: 80 }, (_, i) => `source${i + 1}`).join("\n") + "\n",
+    );
+    write(path.join(w.a, "source.test.ts"), "test-one\n");
+    write(path.join(w.a, "styles.css"), ".box { color: red; }\n");
+    write(path.join(w.a, "package-lock.json"), "{}\n");
+    write(
+      path.join(w.a, "types.generated.ts"),
+      "export type Value = string;\n",
+    );
+    fs.mkdirSync(path.join(w.a, "tests"));
+    write(path.join(w.a, "tests/helper.ts"), "test helper\n");
+    w.git(w.a, "add", ".");
+    w.git(w.a, "commit", "-qm", "Mixed source and tests");
+    write(path.join(w.a, "tests/only.spec.ts"), "only-test\n");
+    w.git(w.a, "add", ".");
+    w.git(w.a, "commit", "-qm", "Tests only");
+    fs.appendFileSync(path.join(w.a, "source.ts"), "live-source\n");
+    fs.appendFileSync(path.join(w.a, "source.test.ts"), "live-test\n");
+    fs.appendFileSync(path.join(w.a, "styles.css"), ".box { color: green; }\n");
+    fs.appendFileSync(path.join(w.a, "package-lock.json"), " ");
+    fs.appendFileSync(
+      path.join(w.a, "types.generated.ts"),
+      "export type Other = number;\n",
+    );
+    write(path.join(w.a, "tests/new.spec.ts"), "untracked-test\n");
+    const result = w.command(
+      [
+        "python3",
+        path.join(ROOT, "tests/review-live-pty.py"),
+        w.a,
+        process.execPath,
+        path.join(ROOT, "dist/cli.js"),
+        w.repo,
+        w.state,
+        path.join(w.root, "worktrees/example"),
+        "filter",
+      ],
+      { timeoutMs: 90000 },
+    );
+    assert.match(result.stdout, /PTY: filter.*passed/);
+  },
+);
+
+test(
+  "preview text selection and copy survive live edits, panel dragging resizes, and expanded keyboard navigation preserves file positions",
+  { timeout: 120000 },
+  (t) => {
+    const w = new Workspace(t);
+    write(
+      path.join(w.a, "a.txt"),
+      "alpha 界é\tomega\n" +
+        Array.from(
+          { length: 99 },
+          (_, i) => `a${String(i + 2).padStart(3, "0")}`,
+        ).join("\n") +
+        "\n",
+    );
+    write(
+      path.join(w.a, "b.txt"),
+      "beta\n" +
+        Array.from(
+          { length: 99 },
+          (_, i) => `b${String(i + 2).padStart(3, "0")}`,
+        ).join("\n") +
+        "\n",
+    );
+    const result = w.command(
+      [
+        "python3",
+        path.join(ROOT, "tests/review-live-pty.py"),
+        w.a,
+        process.execPath,
+        path.join(ROOT, "dist/cli.js"),
+        w.repo,
+        w.state,
+        path.join(w.root, "worktrees/example"),
+        "preview",
+      ],
+      { timeoutMs: 90000 },
+    );
+    assert.match(result.stdout, /PTY: preview.*passed/);
+  },
+);
+
+test("preview selection uses terminal columns, preserves Unicode and tabs, and layout widths stay bounded", async () => {
+  const { reviewSelectedText, reviewTextColumn, reviewLayout } = await import(
+    pathToFileURL(path.join(ROOT, "dist/review-live-view.js")).href
+  );
+  const lines = ["+界é\tblue", "+next"];
+  assert.equal(
+    reviewSelectedText({
+      lines,
+      anchor: { line: 0, column: 1 },
+      end: { line: 0, column: 4 },
+    }),
+    "界é",
+  );
+  assert.equal(
+    reviewSelectedText({
+      lines,
+      anchor: { line: 1, column: 3 },
+      end: { line: 0, column: 3 },
+    }),
+    "é    blue\n+ne",
+  );
+  assert.equal(reviewTextColumn("界é\tblue", 1), 0);
+  assert.equal(reviewTextColumn("界é\tblue", 3), 3);
+  assert.equal(reviewLayout(100, 34, 2, false, -100).commits.width, 24);
+  assert.ok(reviewLayout(100, 34, 2, false, 10000).diff.width >= 35);
+  assert.equal(reviewLayout(70, 24, 2, false, 40).divider, undefined);
+  assert.equal(reviewLayout(160, 34, 2, true, 40).viewport.width, 155);
+});
+
+test("file visibility recognises conventional test, style and boilerplate paths while retaining source and configuration", async () => {
+  const { isReviewTestPath, reviewFileCategory, visibleReviewFiles } =
+    await import(
+      pathToFileURL(path.join(ROOT, "dist/review-live-files.js")).href
+    );
+  for (const file of [
+    "tests/helpers.ts",
+    "src/__tests__/helpers.ts",
+    "src/__mocks__/service.ts",
+    "src/__snapshots__/view.snap",
+    "e2e/login.ts",
+    "cypress/support.ts",
+    "spec/helpers.rb",
+    "src/service.test.ts",
+    "src/view.spec.tsx",
+    "src/service_test.go",
+    "test_service.py",
+    "service_test.py",
+    "src/ServiceTests.cs",
+    "src/ServiceTest.java",
+    "src/TestService.java",
+    "src/ServiceSpec.scala",
+    "nested\\tests\\helpers.ts",
+  ])
+    assert.equal(isReviewTestPath(file), true, file);
+  for (const file of [
+    "src/service.ts",
+    "src/latest.ts",
+    "src/contest.ts",
+    "src/testimonials.ts",
+    "src/testing.ts",
+    "fixtures/production.json",
+    "package.json",
+  ])
+    assert.equal(isReviewTestPath(file), false, file);
+  for (const file of [
+    "src/base.css",
+    "src/view.module.scss",
+    "src/view.sass",
+    "src/site.less",
+    "src/variables.styl",
+    "src/theme.pcss",
+    "src/view.styles.ts",
+    "src/theme.css.ts",
+  ])
+    assert.equal(reviewFileCategory(file), "style", file);
+  for (const file of [
+    "package-lock.json",
+    "nested/pnpm-lock.yaml",
+    "yarn.lock",
+    "bun.lockb",
+    "Cargo.lock",
+    "go.sum",
+    "Gemfile.lock",
+    "composer.lock",
+    "uv.lock",
+    "src/__generated__/api.ts",
+    "src/generated/api.ts",
+    "dist/app.js",
+    "src/api.generated.ts",
+    "src/types.gen.ts",
+    "src/Form.Designer.cs",
+    "src/types.g.cs",
+    "app.js.map",
+    "app.min.js",
+    "cache.tsbuildinfo",
+    ".gitkeep",
+  ])
+    assert.equal(reviewFileCategory(file), "boilerplate", file);
+  for (const file of [
+    "src/index.ts",
+    "src/service.ts",
+    "src/GeneratedReport.ts",
+    "src/styles.ts",
+    "src/styles/service.ts",
+    "package.json",
+    "tsconfig.json",
+    "tailwind.config.js",
+    "src/contracts.d.ts",
+    "README.md",
+  ])
+    assert.equal(reviewFileCategory(file), undefined, file);
+  const source = {
+    path: "src/service.ts",
+    oldPath: "src/service.test.ts",
+    key: "source",
+  };
+  const tests = { path: "tests/helpers.ts", key: "test" };
+  const files = [tests, source];
+  assert.equal(visibleReviewFiles(files, false), files);
+  assert.deepEqual(visibleReviewFiles(files, true), [source]);
+  assert.equal(visibleReviewFiles(files, true)[0], source);
+  assert.deepEqual(files, [tests, source]);
+});
+
+test("mouse packets are removed before keyboard shortcuts, including fragmented UTF-8 and SGR packets", async () => {
+  const { ReviewInput } = await import(
+    pathToFileURL(path.join(ROOT, "dist/review-live-input.js")).href
+  );
+  const clicks: any[] = [],
+    keys: string[] = [];
+  const input = new ReviewInput((event: any) => clicks.push(event));
+  input.keys.on("data", (data: Buffer) => keys.push(data.toString()));
+  input.feed(Buffer.from("j\x1b["));
+  input.feed(Buffer.from("<65;100;12M\x1b[<0;3;4m"));
+  const text = Buffer.from("界");
+  input.feed(text.subarray(0, 1));
+  input.feed(text.subarray(1));
+  input.feed(Buffer.from("k"));
+  assert.equal(keys.join(""), "j界k");
+  assert.equal(clicks.length, 2);
+  assert.deepEqual(clicks[0], { button: 65, x: 99, y: 11, release: false });
+  input.close();
+});
+
+test("wheel pacing limits bursts, accepts direction changes immediately and keeps panels independent", async () => {
+  const { ReviewWheel } = await import(
+    pathToFileURL(path.join(ROOT, "dist/review-live-input.js")).href
+  );
+  const wheel = new ReviewWheel();
+  assert.equal(wheel.accept("diff", 1, 0), true);
+  for (let at = 1; at < 60; at++)
+    assert.equal(wheel.accept("diff", 1, at), false);
+  assert.equal(wheel.accept("diff", 1, 60), true);
+  assert.equal(wheel.accept("diff", -1, 61), true);
+  assert.equal(wheel.accept("files", -1, 62), true);
+  assert.equal(wheel.accept("diff", 1, 63), true);
+  assert.equal(wheel.accept("diff-horizontal", 1, 64), true);
+  assert.equal(wheel.accept("diff", 1, 65), false);
+});
+
+test("history is limited to ten recent commits, loads statistics in one Git call and reuses immutable results", (t) => {
+  const w = new Workspace(t);
+  for (let i = 0; i < 12; i++)
+    w.git(w.a, "commit", "-q", "--allow-empty", "-m", `Recent ${i}`);
+  w.env.REVIEW_REAL_GIT = w.command(["which", "git"]).stdout.trim();
+  w.env.REVIEW_HISTORY_CALLS = path.join(w.root, "history-calls.jsonl");
+  w.stub(
+    "git",
+    `const fs=require('node:fs'),cp=require('node:child_process');const args=process.argv.slice(2);fs.appendFileSync(process.env.REVIEW_HISTORY_CALLS,JSON.stringify(args)+'\\n');const result=cp.spawnSync(process.env.REVIEW_REAL_GIT,args,{stdio:'inherit'});process.exit(result.status??1);`,
+  );
+  const result = JSON.parse(
+    w.command([
+      process.execPath,
+      "--input-type=module",
+      "-e",
+      `import {LiveRepository} from ${JSON.stringify(path.join(ROOT, "dist/review-live-engine.js"))};const repo=new LiveRepository(process.argv[1]);const first=repo.history('HEAD');console.log(JSON.stringify({first,same:repo.history('HEAD')===first}));`,
+      w.a,
+    ]).stdout,
+  );
+  assert.equal(result.first.length, 10);
+  assert.equal(result.first[0].subject, "Recent 11");
+  assert.equal(result.first.at(-1).subject, "Recent 2");
+  assert.equal(result.same, true);
+  const calls = fs
+    .readFileSync(w.env.REVIEW_HISTORY_CALLS!, "utf8")
+    .trim()
+    .split("\n")
+    .map((line) => JSON.parse(line));
+  assert.equal(calls.filter((args) => args.includes("log")).length, 1);
+  assert.ok(
+    !calls.some((args) => args.includes("diff") || args.includes("diff-tree")),
+    "history does not spawn a diff for every commit",
+  );
+  const repo = new engine.LiveRepository(w.a),
+    state = repo.refresh();
+  assert.equal(
+    repo.comparison({ kind: "range", from: "HEAD~11", to: "HEAD" }, state)
+      .target,
+    state.snapshot.head,
+  );
+});
+
+test("batched history statistics preserve initial, rename, binary and merge commit counts", (t) => {
+  const w = new Workspace(t);
+  write(path.join(w.a, "old name.txt"), "one\ntwo\nthree\n");
+  w.git(w.a, "add", "old name.txt");
+  w.git(w.a, "commit", "-qm", "Original source");
+  const original = w.git(w.a, "rev-parse", "HEAD");
+  w.git(w.a, "mv", "old name.txt", "new\tname.txt");
+  fs.writeFileSync(path.join(w.a, "image.bin"), Buffer.from([0, 1, 2]));
+  w.git(w.a, "add", "image.bin");
+  w.git(w.a, "commit", "-qm", "Rename and binary");
+  const repo = new engine.LiveRepository(w.a),
+    history = repo.history("HEAD"),
+    head = history[0];
+  assert.equal(head.files, 2);
+  assert.equal(head.additions, 0);
+  assert.equal(head.deletions, 0);
+  const source = history.find((commit: any) => commit.sha === original);
+  assert.equal(source.files, 1);
+  assert.equal(source.additions, 3);
+  assert.equal(history.at(-1).files, 0);
+  write(path.join(w.b, "merged.txt"), "merged line\n");
+  w.git(w.b, "add", "merged.txt");
+  w.git(w.b, "commit", "-qm", "Other side");
+  w.git(w.a, "merge", "--no-ff", "-qm", "Merge", "feature/b");
+  const merge = repo.history("HEAD")[0];
+  assert.equal(merge.parents.length, 2);
+  assert.equal(merge.files, 1);
+  assert.equal(merge.additions, 1);
+  assert.equal(merge.deletions, 0);
+  assert.deepEqual(repo.history("HEAD", "HEAD"), []);
+});
+
+test(
+  "Quit cancels a blocked Git refresh and cleans up the frozen review session",
+  { timeout: 120000 },
+  (t) => {
+    const w = new Workspace(t);
+    write(path.join(w.a, "live.txt"), "version-one\n");
+    w.env.REVIEW_REAL_GIT = w.command(["which", "git"]).stdout.trim();
+    w.env.REVIEW_PAUSE_GIT = path.join(w.root, "pause-review-git");
+    w.env.REVIEW_GIT_INDEX_MARKER = path.join(w.root, "review-index-marker");
+    w.env.REVIEW_GIT_HEARTBEAT = path.join(w.root, "review-git-heartbeat");
+    w.stub(
+      "git",
+      String.raw`
+const fs = require("node:fs"), cp = require("node:child_process");
+const args = process.argv.slice(2);
+if (args.includes("read-tree") && process.env.GIT_INDEX_FILE && fs.existsSync(process.env.REVIEW_PAUSE_GIT)) {
+  fs.writeFileSync(process.env.REVIEW_GIT_INDEX_MARKER, JSON.stringify(process.env.GIT_INDEX_FILE));
+  cp.spawn(process.execPath, ["-e", 'setInterval(() => require("node:fs").writeFileSync(process.env.REVIEW_GIT_HEARTBEAT, "."), 25)'], {stdio:"ignore"});
+  setInterval(() => {}, 1000);
+} else {
+  const result = cp.spawnSync(process.env.REVIEW_REAL_GIT, args, {stdio:"inherit"});
+  process.exit(result.status ?? 1);
+}
+`,
+    );
+    const result = w.command(
+      [
+        "python3",
+        path.join(ROOT, "tests/review-live-pty.py"),
+        w.a,
+        process.execPath,
+        CLI,
+        w.repo,
+        w.state,
+        path.join(w.root, "worktrees/example"),
+        "quit",
+      ],
+      { timeoutMs: 90000 },
+    );
+    assert.match(result.stdout, /PTY: quit.*passed/);
+  },
+);
+
+test(
+  "Quit and Ctrl-C drain late mouse packets and immediately cancel stubborn GitHub descendants through the public CLI",
+  { timeout: 120000 },
+  (t) => {
+    for (const quitKey of ["q", "\x03"]) {
+      const w = new Workspace(t);
+      write(path.join(w.a, "live.txt"), "version-one\n");
+      w.env.RL_PR_OFFLINE = "0";
+      w.env.REVIEW_QUIT_KEY = quitKey;
+      w.env.REVIEW_GH_HEARTBEAT = path.join(w.root, "review-gh-heartbeat");
+      w.stub(
+        "gh",
+        String.raw`
+const cp = require('node:child_process');
+process.on('SIGTERM', () => {});
+cp.spawn(process.execPath, ['-e', 'process.on("SIGTERM",()=>{});setInterval(()=>require("node:fs").writeFileSync(process.env.REVIEW_GH_HEARTBEAT,"."),10)'], {stdio:'inherit'});
+setInterval(() => {}, 1000);
+`,
+      );
+      const result = w.command(
+        [
+          "python3",
+          path.join(ROOT, "tests/review-live-pty.py"),
+          w.a,
+          process.execPath,
+          CLI,
+          w.repo,
+          w.state,
+          path.join(w.root, "worktrees/example"),
+          "handoff",
+        ],
+        { timeoutMs: 45000 },
+      );
+      assert.match(result.stdout, /PTY: handoff.*passed/);
+      assert.match(result.stdout, /QUIT_LATENCY=/);
+      t.diagnostic(
+        `${quitKey === "q" ? "q" : "Ctrl-C"}: ${result.stdout.match(/QUIT_LATENCY=[\d.]+s/)?.[0]}`,
+      );
+    }
+  },
+);
