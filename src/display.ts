@@ -1,30 +1,49 @@
-import { activityView } from "./activity.js";
 import { accessLabel } from "./access.js";
-import { stripVTControlCharacters } from "node:util";
-import { homedir } from "node:os";
-import path from "node:path";
-import type { BranchStatus, Instance } from "./store.js";
+import { activityView } from "./activity.js";
 import type { RunSummary } from "./agent-runner.js";
+import type { Agent } from "./agents.js";
+import type { BranchStatus, Instance } from "./store.js";
+import {
+  formatHomePath,
+  paintAnsi,
+  sanitizeTerminalText,
+  supportsAnsiColor,
+} from "./tui/ansi.js";
 
-// Keep names and remote titles on one terminal line without control sequences.
-const text = (value: unknown): string =>
-  stripVTControlCharacters(String(value ?? ""))
-    .replace(/[\x00-\x1f\x7f-\x9f]/g, " ")
-    .trim();
+const cleanLine = (value: unknown): string =>
+  sanitizeTerminalText(value, { trim: true });
+
+function prBadgeColor(isDraft: boolean, state: string): number {
+  if (isDraft) return 33;
+  if (state === "open") return 32;
+  if (state === "merged") return 35;
+  if (state === "closed") return 31;
+  return 33;
+}
+
+const AGENT_LABELS: Readonly<Record<Agent, string>> = {
+  codex: "Codex",
+  claude: "Claude",
+  agy: "Antigravity",
+};
 
 export function prText(pr: Instance["pr"]): string {
-  if (!pr) return "PR: none saved. Run rl pr sync to refresh.";
+  if (!pr) {
+    return "PR: none saved. Run rl pr sync to refresh.";
+  }
+
   const number = typeof pr.number === "number" ? ` #${pr.number}` : "";
-  const state = [pr.isDraft ? "draft" : "", text(pr.state).toLowerCase()]
+  const state = [pr.isDraft ? "draft" : "", cleanLine(pr.state).toLowerCase()]
     .filter(Boolean)
     .join(" · ");
+
   return [
-    `PR${number}${pr.title ? `: ${text(pr.title)}` : ""}${state ? ` [${state}]` : ""}`,
+    `PR${number}${pr.title ? `: ${cleanLine(pr.title)}` : ""}${state ? ` [${state}]` : ""}`,
     pr.headRefName && pr.baseRefName
-      ? `  ${text(pr.headRefName)} → ${text(pr.baseRefName)}`
+      ? `  ${cleanLine(pr.headRefName)} → ${cleanLine(pr.baseRefName)}`
       : "",
-    `  ${text(pr.url)}`,
-    pr.syncedAt ? `  Cached ${text(pr.syncedAt)}` : "",
+    `  ${cleanLine(pr.url)}`,
+    pr.syncedAt ? `  Cached ${cleanLine(pr.syncedAt)}` : "",
   ]
     .filter(Boolean)
     .join("\n");
@@ -32,90 +51,99 @@ export function prText(pr: Instance["pr"]): string {
 
 export function statusText(
   data: Instance,
-  git: BranchStatus,
+  gitStatus: BranchStatus,
   workflow: RunSummary | null = null,
 ): string {
-  const color =
-    process.env.NO_COLOR === undefined &&
-    process.env.FORCE_COLOR !== "0" &&
-    process.env.TERM !== "dumb" &&
-    (!!process.stdout.isTTY || !!process.env.FORCE_COLOR);
+  const colorEnabled = supportsAnsiColor(process.stdout, process.env);
   const paint = (value: string, code: number) =>
-    color ? `\x1b[${code}m${value}\x1b[0m` : value;
+    paintAnsi(value, code, colorEnabled);
   const muted = (value: string) => paint(value, 90);
   const row = (label: string, value: string) =>
     `  ${muted(label.padEnd(Math.max(10, label.length + 1)))}${value}`;
-  const files = (count: number, state: string, code: number) =>
-    count ? paint(`${count} ${state} file${count === 1 ? "" : "s"}`, code) : "";
+  const fileCountLabel = (count: number, state: string, code: number) =>
+    count > 0
+      ? paint(`${count} ${state} file${count === 1 ? "" : "s"}`, code)
+      : "";
+
   const changes = [
-    files(git.staged, "staged", 32),
-    files(git.unstaged, "modified", 33),
-    files(git.untracked, "untracked", 33),
-    files(git.conflicts, "conflicted", 31),
+    fileCountLabel(gitStatus.staged, "staged", 32),
+    fileCountLabel(gitStatus.unstaged, "modified", 33),
+    fileCountLabel(gitStatus.untracked, "untracked", 33),
+    fileCountLabel(gitStatus.conflicts, "conflicted", 31),
   ].filter(Boolean);
-  const home = homedir();
-  const directory =
-    data.worktree === home
-      ? "~"
-      : data.worktree.startsWith(home + path.sep)
-        ? "~" + data.worktree.slice(home.length)
-        : data.worktree;
+
+  const directory = formatHomePath(data.worktree);
   const lines = [
     "",
-    `  ${paint(text(data.id), 1)}`,
+    `  ${paint(cleanLine(data.id), 1)}`,
     "",
-    ...(data.branch !== data.id ? [row("Branch", text(data.branch))] : []),
-    row("Path", muted(text(directory))),
-    ...(data.baseBranch ? [row("Base", text(data.baseBranch))] : []),
+    ...(data.branch !== data.id ? [row("Branch", cleanLine(data.branch))] : []),
+    row("Path", muted(cleanLine(directory))),
+    ...(data.baseBranch ? [row("Base", cleanLine(data.baseBranch))] : []),
     row(
       "Git",
-      git.availability === "ok"
+      gitStatus.availability === "ok"
         ? changes.join(" · ") || paint("clean", 32)
-        : paint(text(git.error ?? git.availability), 31),
+        : paint(cleanLine(gitStatus.error ?? gitStatus.availability), 31),
     ),
   ];
-  if (git.upstream) {
-    const sync =
-      git.ahead === 0 && git.behind === 0
-        ? paint("up to date", 32)
-        : git.ahead === null || git.behind === null
-          ? muted("commit counts unavailable")
-          : `${paint(`${git.ahead} ahead`, git.ahead ? 32 : 90)} · ${paint(`${git.behind} behind`, git.behind ? 33 : 90)} ${muted("(commits)")}`;
-    lines.push(row("Upstream", `${sync} ${muted("· " + text(git.upstream))}`));
+
+  if (gitStatus.upstream) {
+    let syncText: string;
+    if (gitStatus.ahead === 0 && gitStatus.behind === 0) {
+      syncText = paint("up to date", 32);
+    } else if (gitStatus.ahead === null || gitStatus.behind === null) {
+      syncText = muted("commit counts unavailable");
+    } else {
+      const aheadText = paint(
+        `${gitStatus.ahead} ahead`,
+        gitStatus.ahead ? 32 : 90,
+      );
+      const behindText = paint(
+        `${gitStatus.behind} behind`,
+        gitStatus.behind ? 33 : 90,
+      );
+      syncText = `${aheadText} · ${behindText} ${muted("(commits)")}`;
+    }
+    lines.push(
+      row(
+        "Upstream",
+        `${syncText} ${muted("· " + cleanLine(gitStatus.upstream))}`,
+      ),
+    );
   }
+
   lines.push("");
+
   const pr = data.pr;
   if (pr) {
     const number = typeof pr.number === "number" ? ` #${pr.number}` : "";
-    const state = text(pr.state).toLowerCase();
+    const state = cleanLine(pr.state).toLowerCase();
     const label = [pr.isDraft ? "draft" : "", state]
       .filter(Boolean)
       .join(" · ");
-    const badge = paint(
-      label,
-      pr.isDraft
-        ? 33
-        : state === "open"
-          ? 32
-          : state === "merged"
-            ? 35
-            : state === "closed"
-              ? 31
-              : 33,
-    );
+    const badge = paint(label, prBadgeColor(Boolean(pr.isDraft), state));
+    const headPrefix =
+      pr.headRefName && pr.headRefName !== data.branch
+        ? `${cleanLine(pr.headRefName)} `
+        : "";
     const target = pr.baseRefName
-      ? `${pr.headRefName && pr.headRefName !== data.branch ? text(pr.headRefName) + " " : ""}→ ${text(pr.baseRefName)}`
+      ? `${headPrefix}→ ${cleanLine(pr.baseRefName)}`
       : "";
+
     lines.push(
       `  ${paint(`PR${number}`, 1)}${badge ? ` · ${badge}` : ""}${target ? ` ${muted("· " + target)}` : ""}`,
     );
-    if (pr.title) lines.push(`  ${text(pr.title)}`);
-    lines.push(`  ${paint(text(pr.url), 36)}`);
+    if (pr.title) {
+      lines.push(`  ${cleanLine(pr.title)}`);
+    }
+    lines.push(`  ${paint(cleanLine(pr.url), 36)}`);
     if (pr.syncedAt) {
-      const stamp = text(pr.syncedAt);
-      lines.push(
-        `  ${muted(`Cached ${Number.isFinite(Date.parse(stamp)) ? accessLabel(stamp) : stamp}`)}`,
-      );
+      const stamp = cleanLine(pr.syncedAt);
+      const relative = Number.isFinite(Date.parse(stamp))
+        ? accessLabel(stamp)
+        : stamp;
+      lines.push(`  ${muted(`Cached ${relative}`)}`);
     }
   } else {
     lines.push(
@@ -123,43 +151,38 @@ export function statusText(
       `  ${muted("Run rl pr sync to refresh")}`,
     );
   }
+
   lines.push("", `  ${paint("Sessions", 1)}`);
+
   for (const agent of ["codex", "claude", "agy"] as const) {
     if (
       agent === "agy" &&
       !data.sessions.agy?.length &&
       !data.activity?.agy?.length
-    )
+    ) {
       continue;
+    }
     const activity = activityView(data.activity?.[agent]).filter(
       (item) => !item.childId,
     );
-    const states = ["working", "idle", "stale"]
+    const states = (["working", "idle", "stale"] as const)
       .map((state) => {
         const count = activity.filter((item) => item.state === state).length;
-        return count
-          ? paint(
-              `${count} ${state}`,
-              state === "working" ? 32 : state === "stale" ? 33 : 90,
-            )
-          : "";
+        if (!count) return "";
+        const code = state === "working" ? 32 : state === "stale" ? 33 : 90;
+        return paint(`${count} ${state}`, code);
       })
       .filter(Boolean);
-    lines.push(
-      row(
-        agent === "codex"
-          ? "Codex"
-          : agent === "agy"
-            ? "Antigravity"
-            : "Claude",
-        `${data.sessions[agent]?.length ?? 0} saved${states.length ? ` · ${states.join(" · ")}` : ""}`,
-      ),
-    );
+
+    const savedCount = data.sessions[agent]?.length ?? 0;
+    const stateSuffix = states.length ? ` · ${states.join(" · ")}` : "";
+    lines.push(row(AGENT_LABELS[agent], `${savedCount} saved${stateSuffix}`));
   }
+
   if (workflow) {
     lines.push(
       "",
-      `  ${paint("Workflow", 1)} · ${text(workflow.workflow)} · ${text(workflow.status)}`,
+      `  ${paint("Workflow", 1)} · ${cleanLine(workflow.workflow)} · ${cleanLine(workflow.status)}`,
       row("Steps", `${workflow.completed}/${workflow.total} completed`),
       ...(workflow.owner
         ? [
@@ -173,25 +196,31 @@ export function statusText(
         ? [
             row(
               "Review",
-              `${workflow.score === null ? "not scored" : `${workflow.score}/100`} · ${text(workflow.verdict)}`,
+              `${workflow.score === null ? "not scored" : `${workflow.score}/100`} · ${cleanLine(workflow.verdict)}`,
             ),
           ]
         : []),
     );
   }
+
   const handoff = data.task?.handoffs.at(-1);
-  if (handoff) {
+  if (handoff && data.task) {
+    const taskTone = data.task.state === "paused" ? 33 : 32;
     lines.push(
       "",
-      `  ${paint("Task", 1)} · ${paint(data.task!.state, data.task!.state === "paused" ? 33 : 32)}`,
-      `  ${text(handoff.summary)}`,
-      row("Next", text(handoff.next)),
+      `  ${paint("Task", 1)} · ${paint(data.task.state, taskTone)}`,
+      `  ${cleanLine(handoff.summary)}`,
+      row("Next", cleanLine(handoff.next)),
     );
-    if (handoff.blockers)
-      lines.push(row("Blockers", paint(text(handoff.blockers), 33)));
+    if (handoff.blockers) {
+      lines.push(row("Blockers", paint(cleanLine(handoff.blockers), 33)));
+    }
   }
-  if (Object.values(data.sessions).some((sessions) => sessions.length))
+
+  if (Object.values(data.sessions).some((sessions) => sessions.length > 0)) {
     lines.push("", `  ${muted("Resume with")} ${paint("rl resume", 36)}`);
+  }
+
   lines.push("");
   return lines.join("\n");
 }

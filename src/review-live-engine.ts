@@ -2,7 +2,14 @@ import fs from "node:fs";
 import path from "node:path";
 import { createHash, randomUUID } from "node:crypto";
 import { spawnSync } from "node:child_process";
-import { canonical, writeJson, readJson, object, gitEnv } from "./common.js";
+import {
+  canonical,
+  writeJson,
+  readJson,
+  object,
+  gitEnv,
+  inside,
+} from "./common.js";
 import {
   captureSnapshot,
   changedFiles,
@@ -473,7 +480,7 @@ export class LiveRepository {
       })),
     );
   }
-  patch(file: ReviewFile): string {
+  patch(file: ReviewFile, context = 3): string {
     const result = spawnSync(
       "git",
       [
@@ -481,9 +488,16 @@ export class LiveRepository {
         "--no-pager",
         "-c",
         "color.ui=false",
-        ...diffArgs(file.from, file.to, [
-          ...new Set([file.oldPath, file.path].filter((p): p is string => !!p)),
-        ]),
+        ...diffArgs(
+          file.from,
+          file.to,
+          [
+            ...new Set(
+              [file.oldPath, file.path].filter((p): p is string => !!p),
+            ),
+          ],
+          context,
+        ),
       ],
       {
         cwd: this.root,
@@ -491,6 +505,7 @@ export class LiveRepository {
         encoding: "utf8",
         maxBuffer: 8 * 1024 * 1024,
         timeout: 30000,
+        killSignal: "SIGKILL",
       },
     );
     if (
@@ -501,11 +516,131 @@ export class LiveRepository {
         result.stdout +
         "\n[Diff truncated at 8 MiB; open the file with o for further inspection.]"
       );
-    if (result.error || result.status)
+    if (result.error || result.status !== 0)
       throw new Error(
-        result.error?.message || result.stderr || "Git diff failed",
+        result.error?.message ||
+          result.stderr ||
+          `Git diff failed (${result.signal ?? result.status})`,
       );
     return result.stdout;
+  }
+  private blob(file: ReviewFile, side: "before" | "after"): string {
+    const supplied = side === "before" ? file.beforeBlob : file.afterBlob;
+    if (supplied) {
+      if (!OID.test(supplied))
+        throw new Error("Invalid reviewed file identity");
+      return supplied;
+    }
+    const tree = side === "before" ? file.from : file.to;
+    const name = side === "before" ? (file.oldPath ?? file.path) : file.path;
+    try {
+      return reviewGit(this.root, [
+        "rev-parse",
+        "--verify",
+        `${tree}:${name}`,
+      ]).trim();
+    } catch {
+      return "0".repeat(40);
+    }
+  }
+  content(
+    file: ReviewFile,
+    side: "before" | "after" = "after",
+    limit = 8 * 1024 * 1024,
+  ): { text: string; oid: string; binary: boolean; truncated: boolean } {
+    const oid = this.blob(file, side);
+    if (/^0+$/.test(oid))
+      return { text: "", oid, binary: false, truncated: false };
+    if (!OID.test(oid)) throw new Error("Invalid reviewed file identity");
+    const size = Number(reviewGit(this.root, ["cat-file", "-s", oid]).trim());
+    if (size > limit)
+      return {
+        text: `[File exceeds ${limit} bytes; use a smaller review scope.]`,
+        oid,
+        binary: false,
+        truncated: true,
+      };
+    const text = reviewGit(this.root, ["cat-file", "blob", oid]);
+    const binary = text.includes("\0");
+    return {
+      text: binary ? `[Binary file: ${size} bytes]` : text,
+      oid,
+      binary,
+      truncated: false,
+    };
+  }
+  editorFile(
+    file: ReviewFile,
+    directory: string,
+    side: "before" | "after" = "after",
+  ): string {
+    let oid = this.blob(file, side);
+    if (/^0+$/.test(oid)) oid = this.blob(file, "before");
+    if (/^0+$/.test(oid))
+      throw new Error(
+        "The reviewed file does not exist on this side of the comparison",
+      );
+    if (file.binary)
+      throw new Error(
+        "This reviewed file cannot be opened as text; use O to open the current worktree file",
+      );
+    const cache = path.resolve(directory, "live-review", "editor", oid);
+    const target = path.join(cache, path.basename(file.path));
+    if (
+      !inside(target, path.resolve(directory)) ||
+      canonical(target) !== target
+    )
+      throw new Error("Reviewed file cache must not traverse symlinks");
+    fs.mkdirSync(cache, { recursive: true, mode: 0o700 });
+    if (!fs.existsSync(target)) {
+      const temporary = path.join(cache, `.tmp-${randomUUID()}`);
+      const descriptor = fs.openSync(temporary, "wx", 0o600);
+      try {
+        // Stream exact bytes into the cache: huge files do not consume terminal
+        // memory, and non-UTF-8 source is not rewritten through string decoding.
+        const result = spawnSync(
+          "git",
+          ["--no-optional-locks", "cat-file", "blob", oid],
+          {
+            cwd: this.root,
+            env: gitEnv(),
+            stdio: ["ignore", descriptor, "pipe"],
+            encoding: "utf8",
+            maxBuffer: 1024 * 1024,
+            timeout: 30000,
+            killSignal: "SIGKILL",
+          },
+        );
+        if (result.error || result.status !== 0)
+          throw new Error(
+            result.error?.message ||
+              result.stderr ||
+              "Cannot materialize the reviewed file",
+          );
+        fs.chmodSync(temporary, 0o444);
+        fs.renameSync(temporary, target);
+      } finally {
+        fs.closeSync(descriptor);
+        fs.rmSync(temporary, { force: true });
+      }
+    }
+    return target;
+  }
+  references(): { label: string; ref: string; sha: string }[] {
+    return reviewGit(this.root, [
+      "for-each-ref",
+      "--format=%(refname:short)%00%(objectname)",
+      "refs/heads",
+      "refs/remotes",
+    ])
+      .trim()
+      .split("\n")
+      .filter(Boolean)
+      .slice(0, 300)
+      .map((line) => {
+        const [ref, sha] = line.split("\0");
+        return { label: ref, ref, sha };
+      });
   }
 }
 export function checkpointKey(

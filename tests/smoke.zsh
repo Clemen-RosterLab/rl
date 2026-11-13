@@ -9,7 +9,7 @@ export GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null
 export GIT_AUTHOR_NAME='rl test' GIT_AUTHOR_EMAIL=rl@example.invalid
 export GIT_COMMITTER_NAME="$GIT_AUTHOR_NAME" GIT_COMMITTER_EMAIL="$GIT_AUTHOR_EMAIL"
 export RL_REPO_ROOT="$scratch/main repo" RL_WORKTREE_DIR="$scratch/work trees"
-export RL_REPO_NAME=example RL_CONFIG="$scratch/config.zsh"
+export RL_REPO_NAME=example RL_CONFIG="$scratch/config.toml"
 export RL_PR_OFFLINE=1
 export RL_STATE_DIR="$scratch/state"
 unset RL_DEFAULT_BASE RL_REPO GIT_DIR GIT_WORK_TREE GIT_COMMON_DIR GIT_INDEX_FILE
@@ -68,7 +68,7 @@ rl delete
 cd "$scratch"
 
 # File configuration and environment precedence.
-print 'RL_DEFAULT_BASE=nonexistent' > "$RL_CONFIG"
+print 'defaultBase = "nonexistent"' > "$RL_CONFIG"
 if "$root/bin/rl" switch -c config-failure; then exit 1; fi
 RL_DEFAULT_BASE=develop "$root/bin/rl" switch -c config-override
 print 'All smoke checks passed.'

@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
-import { Workspace, read, readJson, write, ROOT } from "./helpers.js";
+import { Workspace, readJson, write, ROOT } from "./helpers.js";
 function capture(w: Workspace): string {
   const file = path.join(w.root, "picker.json");
   w.env.PICKER_CAPTURE = file;
@@ -213,7 +213,9 @@ test("pickers sort by last access, retain order when filtering, and do not count
     assert.deepEqual(names(), ["z-recent", "a-older", "unregistered"]);
     assert.ok(readJson(captured).args.includes("--no-sort"));
     assert.ok(
-      readJson(captured).args.some((arg: string) => /LAST ACCESSED$/.test(arg)),
+      readJson(captured).args.some((arg: string) =>
+        arg.endsWith("LAST ACCESSED"),
+      ),
     );
     assert.match(
       readJson(captured).rows.find((row: string) =>

@@ -8,10 +8,9 @@
   },
   "files": [
     "bin/rl",
-    "dist/*.js",
-    "lib/*.zsh",
+    "dist/**/*.js",
     "shell/rl.zsh",
-    "config.example.zsh"
+    "config.example.toml"
   ],
   "os": [
     "darwin",
@@ -25,21 +24,26 @@
     "cli"
   ],
   "scripts": {
-    "build": "tsc -p tsconfig.json",
+    "build": "node scripts/build.mjs",
     "prepack": "npm run build",
-    "postinstall": "node dist/install.js",
+    "pretest": "node -e \"fs.rmSync('.test-dist', { recursive: true, force: true })\"",
     "test": "npm run build && tsc -p tsconfig.test.json && node --test --test-concurrency=4 .test-dist/*.test.js && zsh -f tests/smoke.zsh",
     "test:package": "npm run build && tsc -p tsconfig.test.json && node --test .test-dist/package.test.js",
+    "lint": "oxlint -c .oxlintrc.json src tests",
+    "check": "npm run format:check && npm run lint && npm test",
+    "verify": "npm run format && npm run lint && npm test",
     "format": "prettier --write \"src/**/*.ts\" \"tests/**/*.ts\" \"tsconfig*.json\" package.json",
     "format:check": "prettier --check \"src/**/*.ts\" \"tests/**/*.ts\" \"tsconfig*.json\" package.json"
   },
   "dependencies": {
     "proper-lockfile": "^4.1.2",
-    "smol-toml": "^1.9.1"
+    "smol-toml": "^1.9.1",
+    "zod": "^4.0.0"
   },
   "devDependencies": {
     "@types/node": "^22.20.4",
     "@types/proper-lockfile": "^4.1.4",
+    "oxlint": "^1.0.0",
     "prettier": "^3.9.9",
     "typescript": "^7.0.2"
   },
@@ -49,7 +53,8 @@
   },
   "bundleDependencies": [
     "proper-lockfile",
-    "smol-toml"
+    "smol-toml",
+    "zod"
   ],
   "repository": {
     "type": "git",
@@ -58,6 +63,5 @@
   "homepage": "https://github.com/Clemen-RosterLab/rl#readme",
   "bugs": {
     "url": "https://github.com/Clemen-RosterLab/rl/issues"
-  },
-  "packageManager": "pnpm@10.34.9+sha512.f49b5a8ea0fdedb44bb3c0c1d6575092a53c2950d95b7ad15df11f17974877a2de3a01c07e934e9b28ce716e51c09a94962c7306d09be2e1e4b18a8c8762fd32"
+  }
 }

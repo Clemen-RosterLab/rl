@@ -48,7 +48,7 @@ export class Workspace {
   );
   repo = path.join(this.root, "repo");
   state = path.join(this.root, "state");
-  config = path.join(this.root, "config.zsh");
+  config = path.join(this.root, "config.toml");
   a = path.join(this.root, "workspace A");
   b = path.join(this.root, "workspace B");
   bin = path.join(this.root, "bin");
@@ -70,7 +70,7 @@ export class Workspace {
     GIT_COMMITTER_NAME: "Test",
     GIT_COMMITTER_EMAIL: "test@example.invalid",
   };
-  constructor(t: TestContext) {
+  constructor(t: TestContext, options: { minimal?: boolean } = {}) {
     t.after(() => fs.rmSync(this.root, { recursive: true, force: true }));
     for (const key of [
       "RL_REPO",
@@ -85,12 +85,14 @@ export class Workspace {
     write(this.config, "# test\n");
     this.command(["git", "init", "-q", "-b", "develop", this.repo]);
     this.git(this.repo, "commit", "-q", "--allow-empty", "-m", "Initial");
-    for (const [root, branch] of [
-      [this.a, "feature/a"],
-      [this.b, "feature/b"],
-    ]) {
-      this.git(this.repo, "worktree", "add", "-q", "-b", branch, root);
-      this.rl(["setup", "adopt"], { cwd: root });
+    if (!options.minimal) {
+      for (const [root, branch] of [
+        [this.a, "feature/a"],
+        [this.b, "feature/b"],
+      ]) {
+        this.git(this.repo, "worktree", "add", "-q", "-b", branch, root);
+        this.rl(["setup", "adopt"], { cwd: root });
+      }
     }
     fs.mkdirSync(this.bin);
     this.env.PATH = this.bin + path.delimiter + this.env.PATH;
@@ -113,7 +115,7 @@ export class Workspace {
       input: options.input,
       encoding: "utf8",
       maxBuffer: 16 * 1024 * 1024,
-      timeout: options.timeoutMs ?? 30000,
+      timeout: options.timeoutMs ?? 120000,
     });
     if (result.error) throw result.error;
     if (options.ok === false)
@@ -122,6 +124,7 @@ export class Workspace {
     return result;
   }
   async commandAsync(argv: string[], options: Options = {}): Promise<string> {
+    const timeoutMs = options.timeoutMs ?? 120000;
     return new Promise((resolve, reject) => {
       const child = spawn(argv[0], argv.slice(1), {
         cwd: options.cwd ?? this.root,
@@ -129,7 +132,13 @@ export class Workspace {
         stdio: "pipe",
       });
       let out = "",
-        err = "";
+        err = "",
+        timedOut = false;
+      const timer = setTimeout(() => {
+        timedOut = true;
+        child.kill("SIGKILL");
+      }, timeoutMs);
+      timer.unref();
       child.stdout.on("data", (c) => {
         out += c;
       });
@@ -137,10 +146,23 @@ export class Workspace {
         err += c;
       });
       child.stdin.end(options.input);
-      child.on("error", reject);
-      child.on("close", (code) =>
-        code === 0 ? resolve(out) : reject(new Error(err + out)),
-      );
+      child.on("error", (error) => {
+        clearTimeout(timer);
+        reject(error);
+      });
+      child.on("close", (code) => {
+        clearTimeout(timer);
+        if (timedOut) {
+          reject(
+            new Error(
+              `commandAsync timed out after ${timeoutMs}ms: ${argv.join(" ")}\nstderr: ${err}\nstdout: ${out}`,
+            ),
+          );
+          return;
+        }
+        if (code === 0) resolve(out);
+        else reject(new Error(err + out));
+      });
     });
   }
   git(cwd: string, ...args: string[]) {

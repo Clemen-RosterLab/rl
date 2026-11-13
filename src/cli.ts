@@ -1,4 +1,5 @@
 import { message } from "./common.js";
+import { isUsageError } from "./errors.js";
 import { invocation, topicHelp, usageHint } from "./help.js";
 import { main as state } from "./state.js";
 import { main as repos } from "./repos.js";
@@ -64,18 +65,12 @@ try {
   console.error(
     `rl: ${detail.startsWith("Usage:") ? "Invalid command arguments" : detail}`,
   );
-  const parseError =
-    typeof error === "object" &&
-    error !== null &&
-    "code" in error &&
-    String(error.code).startsWith("ERR_PARSE_ARGS_");
-  const argumentsError =
-    parseError ||
-    /^(?:Usage:|Invalid command arguments|Unknown option|Missing --|Expected|Unsupported .*option|--.*(?:require|supported|accept))/.test(
-      detail,
-    );
   console.error(
-    usageHint(process.argv[2] ?? "", process.argv.slice(3), argumentsError),
+    usageHint(
+      process.argv[2] ?? "",
+      process.argv.slice(3),
+      isUsageError(error),
+    ),
   );
   process.exitCode = 1;
 }

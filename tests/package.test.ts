@@ -1,49 +1,90 @@
-import test from "node:test";
+import test, { after } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
+import { spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { ROOT, Workspace, read, readJson, write } from "./helpers.js";
-function pack(w: Workspace): string {
-  const result = w.command(
+
+let sharedPackDir: string | undefined;
+let sharedArchive: string | undefined;
+
+after(() => {
+  if (sharedPackDir) {
+    fs.rmSync(sharedPackDir, { recursive: true, force: true });
+  }
+});
+
+function pack(_w: Workspace): string {
+  if (sharedArchive && fs.existsSync(sharedArchive)) {
+    return sharedArchive;
+  }
+  sharedPackDir = fs.mkdtempSync(path.join(os.tmpdir(), "rl-pack-cache-"));
+  const result = spawnSync(
+    "npm",
     [
-      "npm",
       "pack",
       "--json",
       "--ignore-scripts",
       "--offline",
       "--cache",
-      path.join(w.root, "cache"),
+      path.join(sharedPackDir, "cache"),
       "--pack-destination",
-      w.root,
+      sharedPackDir,
     ],
-    { cwd: ROOT },
+    { cwd: ROOT, encoding: "utf8", timeout: 30000 },
   );
-  return path.join(w.root, JSON.parse(result.stdout)[0].filename);
+  if (result.error) throw result.error;
+  assert.equal(result.status, 0, result.stderr + result.stdout);
+  sharedArchive = path.join(
+    sharedPackDir,
+    JSON.parse(result.stdout)[0].filename,
+  );
+  return sharedArchive;
 }
+
+function collectSourceModules(dir: string, prefix = ""): string[] {
+  const results: string[] = [];
+  for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+    const rel = prefix ? `${prefix}/${entry.name}` : entry.name;
+    if (entry.isDirectory()) {
+      results.push(...collectSourceModules(path.join(dir, entry.name), rel));
+    } else if (entry.isFile() && entry.name.endsWith(".ts")) {
+      results.push(`package/dist/${rel.slice(0, -3)}.js`);
+    }
+  }
+  return results;
+}
+
 test("npm tarball ships built JavaScript and bundled runtime dependencies, with no Python or compiler", (t) => {
   const w = new Workspace(t),
     archive = pack(w),
     names = w.command(["tar", "-tzf", archive]).stdout.trim().split("\n");
+  const expectedDist = new Set(collectSourceModules(path.join(ROOT, "src")));
   const runtime = new Set([
     "package/package.json",
     "package/README.md",
     "package/LICENSE",
     "package/bin/rl",
-    "package/lib/rl.zsh",
-    "package/lib/entry.zsh",
     "package/shell/rl.zsh",
-    "package/config.example.zsh",
+    "package/config.example.toml",
   ]);
   for (const name of names)
     assert.ok(
       runtime.has(name) ||
-        /^package\/dist\/[\w-]+\.js$/.test(name) ||
-        /^package\/node_modules\/(proper-lockfile|graceful-fs|retry|signal-exit|smol-toml)\//.test(
+        expectedDist.has(name) ||
+        /^package\/node_modules\/(proper-lockfile|graceful-fs|retry|signal-exit|smol-toml|zod)\//.test(
           name,
         ),
-      name,
+      `Unexpected file in npm tarball: ${name}`,
     );
+  for (const expected of expectedDist) {
+    assert.ok(
+      names.includes(expected),
+      `Missing compiled module in npm tarball: ${expected}`,
+    );
+  }
   assert.ok(names.includes("package/dist/cli.js"));
   for (const name of [
     "workflow",
@@ -62,6 +103,12 @@ test("npm tarball ships built JavaScript and bundled runtime dependencies, with 
     "review-live-input",
     "review-live-view",
     "review-live-files",
+    "review-live-cleanup",
+    "review-history",
+    "review-progress",
+    "review-search",
+    "review-ranking",
+    "review-rank-agent",
     "agent-launch",
     "agent-agy",
     "mcp",
@@ -77,10 +124,7 @@ test("npm tarball ships built JavaScript and bundled runtime dependencies, with 
     !names.some(
       (name) =>
         name.endsWith(".py") ||
-        (name.endsWith(".ts") &&
-          !(
-            name.startsWith("package/node_modules/") && name.endsWith(".d.ts")
-          )),
+        (name.endsWith(".ts") && !name.startsWith("package/node_modules/")),
     ),
   );
   const manifest = JSON.parse(
@@ -98,8 +142,7 @@ test("npm tarball ships built JavaScript and bundled runtime dependencies, with 
     [...manifest.bundleDependencies].sort(),
     "Every runtime dependency must be bundled for an offline installation",
   );
-  assert.equal(manifest.scripts.postinstall, "node dist/install.js");
-  for (const script of ["install", "preinstall"])
+  for (const script of ["install", "preinstall", "postinstall"])
     assert.ok(!(script in manifest.scripts));
 });
 test("offline npm install, relocation and reinstall preserve hooks, sessions and shell integration", (t) => {
@@ -309,7 +352,7 @@ test("offline npm install, relocation and reinstall preserve hooks, sessions and
   assert.equal(w.calls().at(-1).cwd, w.a);
 });
 
-test("global npm installation configures a fresh user's shell and bare rl changes directory on its first startup", (t) => {
+test("global npm installation leaves dotfiles untouched until rl setup install configures the shell", (t) => {
   const w = new Workspace(t),
     archive = pack(w);
   const home = path.join(w.root, "new user home"),
@@ -341,9 +384,14 @@ test("global npm installation configures a fresh user's shell and bare rl change
     "--offline",
     "--no-audit",
     "--no-fund",
-    "--allow-scripts=rl-workspaces",
     archive,
   ]);
+  assert.ok(
+    !fs.existsSync(path.join(home, ".zshrc")),
+    "npm install must not modify shell dotfiles before rl setup install",
+  );
+  const cli = path.join(prefix, "bin/rl");
+  w.command([cli, "setup", "install"]);
   assert.match(read(path.join(home, ".zshrc")), /rl shell integration/);
   const shim = path.join(home, ".local/share/rl/bin/rl");
   assert.ok(fs.existsSync(shim));
@@ -362,7 +410,7 @@ test("global npm installation configures a fresh user's shell and bare rl change
   );
 });
 
-test("global npm installation retains a usable repair command when system tool installation fails", (t) => {
+test("global npm installation succeeds when system tools are missing and rl setup install repairs setup once resolved", (t) => {
   const w = new Workspace(t),
     archive = pack(w);
   const home = path.join(w.root, "incomplete setup home"),
@@ -384,7 +432,7 @@ test("global npm installation retains a usable repair command when system tool i
     "brew",
     "console.error('Simulated package manager failure');process.exit(1)",
   );
-  const installed = w.command([
+  w.command([
     "npm",
     "install",
     "--global",
@@ -395,28 +443,18 @@ test("global npm installation retains a usable repair command when system tool i
     "--offline",
     "--no-audit",
     "--no-fund",
-    "--foreground-scripts",
-    "--allow-scripts=rl-workspaces",
     archive,
   ]);
-  assert.match(installed.stdout + installed.stderr, /setup is incomplete/);
-  const repair = (installed.stdout + installed.stderr).match(
-    /^  (.+ setup install)$/m,
-  )?.[1];
-  assert.ok(
-    repair,
-    "Setup must print a repair command that works without rl on PATH",
-  );
   const cli = path.join(prefix, "bin/rl");
   assert.equal(
     w.command([cli, "--version"]).stdout.trim(),
     readJson(path.join(ROOT, "package.json")).version,
   );
   assert.ok(!fs.existsSync(path.join(home, ".zshrc")));
-  const failed = w.command(["/bin/sh", "-c", repair], { ok: false });
+  const failed = w.command([cli, "setup", "install"], { ok: false });
   assert.match(failed.stderr, /Could not install RL tools/);
   assert.ok(!fs.existsSync(path.join(home, ".zshrc")));
   w.stub("fzf", "console.log('fzf 1.0')");
-  w.command(["/bin/sh", "-c", repair]);
+  w.command([cli, "setup", "install"]);
   assert.match(read(path.join(home, ".zshrc")), /rl shell integration/);
 });

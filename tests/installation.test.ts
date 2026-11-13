@@ -19,8 +19,6 @@ function fixture(t: TestContext) {
     SHELL: "/bin/zsh",
     RL_INSTALL_TEST_BIN: bin,
     RL_INSTALL_TEST_LOG: path.join(root, "calls.json"),
-    npm_lifecycle_event: "postinstall",
-    npm_config_global: "true",
   };
   const tool = (
     name: string,
@@ -172,23 +170,33 @@ test("global npm setup preserves shell settings, writes a user-owned CLI shim, a
   assert.ok(!fs.existsSync(f.env.RL_INSTALL_TEST_LOG));
 });
 
-test("an incomplete automatic setup keeps the CLI installed while explicit repair still fails", (t) => {
+test("explicit rl setup install fails cleanly on missing tools or malformed managed blocks without mutating dotfiles", (t) => {
   const f = fixture(t);
-  const automatic = f.call("installRl", [], { platform: "darwin" });
-  assert.match(automatic.stderr, /setup is incomplete/);
-  assert.match(automatic.stderr, /rl setup install/);
-  assert.ok(!fs.existsSync(path.join(f.home, ".zshrc")));
-  f.env.npm_lifecycle_event = "";
   f.call("installRl", [], { platform: "darwin" }, false);
+  assert.ok(!fs.existsSync(path.join(f.home, ".zshrc")));
   for (const name of ["git", "zsh", "fzf", "gh"]) f.tool(name);
   const profile = path.join(f.home, ".zshrc");
   const before = "# >>> rl shell integration >>>\n# Keep these settings\n";
   write(profile, before);
-  f.env.npm_lifecycle_event = "postinstall";
-  const blocked = f.call("installRl");
+  const blocked = f.call("installRl", [], {}, false);
   assert.match(blocked.stderr, /Malformed RL shell integration block/);
   assert.equal(read(profile), before);
   assert.ok(!fs.existsSync(path.join(f.home, ".local/share/rl/bin/rl")));
+});
+
+test("shell setup resolves node dynamically via PATH so Node version upgrades do not break shims or startup profiles", (t) => {
+  const f = fixture(t);
+  for (const name of ["git", "zsh", "fzf", "gh"]) f.tool(name);
+  const fakeVersionedNode = path.join(f.root, "Cellar/node/22.0.0/bin/node");
+  f.call("configureShell", [], { node: fakeVersionedNode });
+  const profile = read(path.join(f.home, ".zshrc"));
+  const shim = read(path.join(f.home, ".local/share/rl/bin/rl"));
+  assert.doesNotMatch(
+    profile,
+    /eval "\$\([^"]*Cellar\/node\/22\.0\.0\/bin\/node/,
+  );
+  assert.match(profile, /eval "\$\(node /);
+  assert.match(shim, /^exec node /m);
 });
 
 test("shell upgrades migrate commented and repeated legacy activation lines without losing user comments", (t) => {
@@ -245,8 +253,6 @@ test("a fresh zsh startup loads the installed integration and bare rl changes di
   const env = {
     ...w.env,
     SHELL: "/bin/zsh",
-    npm_lifecycle_event: "postinstall",
-    npm_config_global: "true",
   };
   const installed = spawnSync(
     process.execPath,

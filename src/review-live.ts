@@ -3,12 +3,14 @@ import readline from "node:readline";
 import fs from "node:fs";
 import os from "node:os";
 import { randomUUID } from "node:crypto";
+import { fileURLToPath } from "node:url";
 import { fork, spawn, type ChildProcess } from "node:child_process";
 import { execute, message } from "./common.js";
 import { visible } from "./review-terminal.js";
 import {
   ReviewInput,
   drainReviewInput,
+  reviewTerminalSettings,
   ReviewWheel,
   type ReviewMouse,
 } from "./review-live-input.js";
@@ -23,11 +25,12 @@ import {
   type ReviewFrame,
   type ReviewTextSelection,
   type ReviewTextPoint,
+  type ReviewMenu,
+  reviewLineNumbers,
 } from "./review-live-view.js";
 export { terminalText } from "./review-live-view.js";
 import {
   checkpointKey,
-  loadCheckpoint,
   type LiveState,
   type Mode,
   type Comparison,
@@ -37,10 +40,42 @@ import {
 } from "./review-live-engine.js";
 import { ReviewWatcher } from "./review-live-watch.js";
 import {
-  visibleReviewFiles, defaultReviewFilters, loadReviewFilters, saveReviewFilters,
-  reviewFilterCategories, type ReviewFileFilters,
+  visibleReviewFiles,
+  defaultReviewFilters,
+  loadReviewFilters,
+  saveReviewFilters,
+  reviewFilterCategories,
+  type ReviewFileFilters,
+  loadReviewSettings,
+  saveReviewSettings,
+  advancedReviewFilters,
+  type ReviewSettings,
 } from "./review-live-files.js";
 import { GhReviewService, type PullRequest } from "./review-github.js";
+import {
+  reviewFileFingerprint,
+  isFileReviewed,
+  type ReviewProgress,
+} from "./review-progress.js";
+import { sortReviewFiles, type ReviewRanks } from "./review-ranking.js";
+import {
+  rankWithReviewAgent,
+  type ReviewRankEvidence,
+} from "./review-rank-agent.js";
+import type {
+  ReviewSearchScope,
+  ReviewSearchResult,
+  ReviewSearchHit,
+} from "./review-search.js";
+import { installTerminalCrashGuard } from "./review/terminal-guard.js";
+
+interface ActionMenu extends ReviewMenu {
+  kind: "base" | "target" | "search" | "agent";
+  values?: string[];
+  base?: string;
+  identities?: Record<string, string>;
+  hits?: ReviewSearchHit[];
+}
 
 class GitWorker {
   private readonly worker: ChildProcess;
@@ -50,6 +85,10 @@ class GitWorker {
   );
   private readonly freezeId = randomUUID();
   private queue = Promise.resolve();
+  private signalReady!: () => void;
+  private readonly ready = new Promise<void>((resolve) => {
+    this.signalReady = resolve;
+  });
   private serial = 0;
   private failure?: Error;
   private closed = false;
@@ -79,11 +118,17 @@ class GitWorker {
         id,
         result,
         error,
+        ready,
       }: {
         id: number;
         result: unknown;
         error?: string;
+        ready?: boolean;
       }) => {
+        if (ready) {
+          this.signalReady();
+          return;
+        }
         const task = this.active;
         if (task?.id !== id) return;
         this.active = undefined;
@@ -96,6 +141,7 @@ class GitWorker {
     );
     const fail = (error: Error) => {
       this.failure = error;
+      this.signalReady();
       this.active?.reject(error);
       this.active = undefined;
     };
@@ -108,8 +154,13 @@ class GitWorker {
     });
   }
 
+  get pid(): number | undefined {
+    return this.worker.pid;
+  }
+
   request<T>(op: string, data: Record<string, unknown> = {}): Promise<T> {
-    const result = this.queue.then(() => {
+    const result = this.queue.then(async () => {
+      await this.ready;
       if (this.closed) throw new Error("Review closed");
       if (this.failure) throw this.failure;
       if (op === "freeze") this.frozenRefs = true;
@@ -138,8 +189,27 @@ class GitWorker {
 
   async close(gitDir?: string): Promise<void> {
     this.closed = true;
-    // A checkpoint already being saved must finish its ref and metadata writes.
-    if (this.active?.op === "mark") await this.queue;
+    // Finish a quick save here; a slow save retains its isolated worker and
+    // completes atomically after disconnect without owning terminal input.
+    if (
+      this.active &&
+      ["mark", "viewed", "review-file"].includes(this.active.op)
+    ) {
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const finished = await Promise.race([
+        this.queue.then(() => true),
+        new Promise<boolean>((resolve) => {
+          timer = setTimeout(() => resolve(false), 350);
+        }),
+      ]);
+      clearTimeout(timer);
+      if (!finished) {
+        if (this.worker.connected) this.worker.disconnect();
+        this.worker.unref();
+        this.worker.channel?.unref();
+        return;
+      }
+    }
     if (
       this.worker.pid &&
       this.worker.exitCode === null &&
@@ -171,7 +241,7 @@ class GitWorker {
       "core.hooksPath=/dev/null",
     ];
     const options = {
-      signal: AbortSignal.timeout(400),
+      signal: AbortSignal.timeout(100),
       processGroup: true,
       abortGraceMs: 0,
     };
@@ -181,11 +251,12 @@ class GitWorker {
         this.temporaryRoot,
         options,
       );
+      if (refs.code) throw new Error("Private ref cleanup deferred");
       const names = refs.stdout
         .split("\n")
         .filter((ref) => ref.startsWith(prefix));
-      if (refs.code === 0 && names.length)
-        await execute(
+      if (names.length) {
+        const deleted = await execute(
           [...command, "update-ref", "--stdin"],
           this.temporaryRoot,
           {
@@ -193,8 +264,20 @@ class GitWorker {
             input: names.map((ref) => `delete ${ref}\n`).join(""),
           },
         );
+        if (deleted.code) throw new Error("Private ref cleanup deferred");
+      }
     } catch {
-      // Cleanup is bounded when the repository has disappeared or is unresponsive.
+      const cleanup = spawn(
+        process.execPath,
+        [
+          fileURLToPath(new URL("./review-live-cleanup.js", import.meta.url)),
+          gitDir,
+          this.freezeId,
+        ],
+        { detached: true, stdio: "ignore" },
+      );
+      cleanup.once("error", () => {});
+      cleanup.unref();
     }
   }
 }
@@ -208,22 +291,32 @@ export interface LiveOptions {
   remoteInterval?: number;
 }
 const esc = "\x1b[";
-export function sourceLine(lines: string[], position: number): number {
+export function sourceLine(
+  lines: string[],
+  position: number,
+  side: "before" | "after" = "after",
+): number {
   let line = 1;
   let inHunk = false;
+  const hunk = /^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@/;
   for (let i = 0; i <= Math.min(position, lines.length - 1); i++) {
     const text = lines[i];
     if (text.startsWith("diff --git ")) inHunk = false;
-    const h = /^@@ .*\+(\d+)/.exec(text);
+    const h = hunk.exec(text);
     if (h) {
-      line = Number(h[1]);
+      line = Number(h[side === "before" ? 1 : 2]);
       inHunk = true;
     } else if (
       inHunk &&
       i < position &&
-      (text.startsWith("+") || text.startsWith(" "))
+      (text.startsWith(side === "before" ? "-" : "+") || text.startsWith(" "))
     )
       line++;
+  }
+  if (!inHunk) {
+    const next = lines.slice(position).find((text) => hunk.test(text));
+    if (next)
+      return Math.max(1, Number(hunk.exec(next)![side === "before" ? 1 : 2]));
   }
   return Math.max(1, line);
 }
@@ -254,9 +347,16 @@ const help = [
   "f    Freeze / unfreeze snapshot",
   "t    Toggle tests, styles and boilerplate (hidden by default)",
   "T    Configure hidden categories; choices are saved for this worktree",
+  "v    Toggle file reviewed · u / U next / previous unreviewed",
+  "{ / }    Previous / next hunk · C expands diff context",
+  "c    Toggle full-file context · e switches before / after",
+  "b    Pick comparison base and target revisions",
+  "d    Toggle changes since this file was last viewed",
+  "L    Logic-first ordering · A explicit agent ranking",
+  "Ctrl-f    Cross-file search · Tab changes search scope",
+  "o    Open reviewed version · O open current worktree file",
   "/    Search file paths and selected diff",
   "n / N    Next / previous match",
-  "o    Open selected file and line in VS Code",
   "Ctrl-r    Refresh local state and PR metadata",
   "?    Toggle help",
   "q / Ctrl-c    Quit",
@@ -272,6 +372,7 @@ export async function liveReview(options: LiveOptions): Promise<void> {
       "Live review requires a terminal; use --json for noninteractive output",
     );
   let fileFilters = loadReviewFilters(options.directory, options.root);
+  let settings = loadReviewSettings(options.directory, options.root);
   const git = new GitWorker(options.root, options.repository);
   const remoteAbort = new AbortController();
   let stopped = false,
@@ -295,17 +396,41 @@ export async function liveReview(options: LiveOptions): Promise<void> {
     horizontal = 0,
     helpScroll = 0,
     expandedDiff = false,
-    sidebarWidth: number | undefined,
+    sidebarWidth: number | undefined = settings.sidebarWidth,
     lines: string[] = [];
+  let fullFile = false,
+    beforeFile = false,
+    patchContext = 3,
+    sinceViewed = false;
+  const lineNumbers = true;
+  let menu: ActionMenu | undefined,
+    menuPreviousFocus = 0;
+  let progress: ReviewProgress = { version: 1, reviewed: {}, viewed: {} },
+    progressScope = "";
+  let loadedFile: ReviewFile | undefined,
+    selectionSource: ReviewFile | undefined;
+  let pendingPosition:
+    { key: string; line?: number; source?: number } | undefined;
+  let scores: ReviewRanks = {},
+    order: string[] | undefined;
+  let rankBusy = false,
+    searchScope: ReviewSearchScope = "diff",
+    searchVersion = 0;
+  let agentAbort = new AbortController(),
+    rankVersion = 0,
+    rankStale = false;
+  const rankedFingerprints = new Map<string, string>();
   let status = "Loading Git state…",
     helpOpen = false,
     filterMenuOpen = false,
     filterMenuIndex = 0,
     filterPreviousFocus = 0,
-    prompt: "range" | "search" | undefined,
+    prompt:
+      "range" | "search" | "hidePaths" | "showPaths" | "wheel" | undefined,
     input = "",
     search = "",
     pr: PullRequest | undefined,
+    latestPr: PullRequest | undefined,
     remoteCommits: Commit[] | undefined,
     latestRemoteCommits: Commit[] | undefined,
     remote = "Checking PR…";
@@ -317,6 +442,7 @@ export async function liveReview(options: LiveOptions): Promise<void> {
     patchBusy = false,
     patchAgain = false,
     patchVersion = 0;
+  let navigationVersion = 0;
   let previousRows: string[] = [],
     previousWidth = 0,
     renderTimer: ReturnType<typeof setTimeout> | undefined;
@@ -330,6 +456,7 @@ export async function liveReview(options: LiveOptions): Promise<void> {
       focus,
       expandedDiff,
       sidebarWidth,
+      lineNumbers && !helpOpen && !filterMenuOpen && !menu ? 12 : 0,
     );
   const height = () => geometry().viewport.height;
   let frame: ReviewFrame | undefined;
@@ -350,7 +477,12 @@ export async function liveReview(options: LiveOptions): Promise<void> {
   const wheelPace = new ReviewWheel();
   const selected = () => files[fileIndex];
   const workingFiles = () =>
-    visibleReviewFiles(state?.workingFiles ?? [], hideNoise, fileFilters);
+    visibleReviewFiles(
+      state?.workingFiles ?? [],
+      hideNoise,
+      fileFilters,
+      settings,
+    );
   const timeline = () => {
     const recent = remoteCommits ?? state?.commits ?? [];
     if (mode.kind !== "commits") return recent;
@@ -377,7 +509,11 @@ export async function liveReview(options: LiveOptions): Promise<void> {
     if (stopped || renderTimer) return;
     renderTimer = setTimeout(() => {
       renderTimer = undefined;
-      draw();
+      try {
+        draw();
+      } catch (cause) {
+        if (!stopped) status = message(cause);
+      }
     }, 16);
   }
   function draw(): void {
@@ -391,7 +527,34 @@ export async function liveReview(options: LiveOptions): Promise<void> {
       expanded: expandedDiff,
       sidebarWidth,
       textSelection,
-      filterMenu: filterMenuOpen ? { filters: fileFilters, index: filterMenuIndex } : undefined,
+      filterMenu: filterMenuOpen
+        ? { filters: fileFilters, index: filterMenuIndex, settings }
+        : undefined,
+      menu,
+      reviewed: new Set(
+        files
+          .filter((file) => isFileReviewed(progress, file))
+          .map((file) => file.key),
+      ),
+      changedSinceViewed: new Set(
+        files
+          .filter(
+            (file) =>
+              progress.viewed[file.key] &&
+              progress.viewed[file.key].fingerprint !==
+                reviewFileFingerprint(file),
+          )
+          .map((file) => file.key),
+      ),
+      ranks: scores,
+      fullFile,
+      beforeFile,
+      lineNumbers: lineNumbers && !helpOpen && !filterMenuOpen && !menu,
+      previewLabel: sinceViewed
+        ? "Changes since you last viewed this file · d returns to comparison"
+        : fullFile
+          ? `${beforeFile ? "Base" : "Target"} file content · c returns to diff`
+          : undefined,
       branch: state?.snapshot.branch ?? path.basename(options.root),
       head: state?.snapshot.head ?? "",
       frozen,
@@ -417,7 +580,7 @@ export async function liveReview(options: LiveOptions): Promise<void> {
         ? `${selectionNotice || "Text selected · y / Ctrl-c Copy · Esc Clear"}${textSelection.lines !== lines ? " · newer diff available" : ""}`
         : `${state && (!state.snapshot.complete || state.snapshot.conflicts.length || !state.snapshot.stable) ? `${state.snapshot.excluded.length} omitted / ${state.snapshot.conflicts.length} conflicts${!state.snapshot.stable ? " / source moving" : ""} · ` : ""}${options.pr && !pr && remote !== "Checking PR…" ? `PR #${options.pr}: ${remote}` : status}`,
       input: prompt
-        ? `${prompt === "range" ? "Range FROM TO" : "Search files / diff"}: ${input}▏`
+        ? `${prompt === "range" ? "Range FROM TO" : prompt === "search" ? `Search files / diff [${searchScope}; Tab changes scope]` : prompt === "wheel" ? "Wheel lines (1–20)" : prompt === "hidePaths" ? "Hide paths (comma-separated globs)" : "Always show paths (comma-separated globs)"}: ${input}▏`
         : undefined,
       remote,
       pr: pr
@@ -471,6 +634,8 @@ export async function liveReview(options: LiveOptions): Promise<void> {
     render();
   }
   function selectCommit(index: number): void {
+    rememberViewed();
+    navigationVersion++;
     clearTextSelection();
     helpOpen = false;
     rememberPosition();
@@ -482,6 +647,8 @@ export async function liveReview(options: LiveOptions): Promise<void> {
     void compare();
   }
   function toggleCommit(index: number): void {
+    navigationVersion++;
+    rememberViewed();
     clearTextSelection();
     const commits = timeline();
     const commit = commits[index - 1];
@@ -543,6 +710,7 @@ export async function liveReview(options: LiveOptions): Promise<void> {
     helpOpen = false;
     const next = Math.max(0, Math.min(Math.max(0, files.length - 1), index));
     if (next !== fileIndex) {
+      rememberViewed();
       clearTextSelection();
       rememberPosition();
       fileIndex = next;
@@ -552,7 +720,18 @@ export async function liveReview(options: LiveOptions): Promise<void> {
   }
   function filterFiles(oldKey = selected()?.key, oldFile = selected()): void {
     rememberPosition();
-    files = visibleReviewFiles(allFiles, hideNoise, fileFilters);
+    files = visibleReviewFiles(allFiles, hideNoise, fileFilters, settings);
+    if (order) {
+      const positions = new Map(order.map((key, index) => [key, index]));
+      files = files
+        .map((file, index) => ({ file, index }))
+        .sort(
+          (a, b) =>
+            (positions.get(a.file.key) ?? order!.length + a.index) -
+            (positions.get(b.file.key) ?? order!.length + b.index),
+        )
+        .map(({ file }) => file);
+    }
     let index = files.findIndex((file) => file.key === oldKey);
     if (index < 0 && mode.kind === "commits" && oldFile)
       index = files.findIndex(
@@ -561,9 +740,290 @@ export async function liveReview(options: LiveOptions): Promise<void> {
     fileIndex =
       index < 0 ? Math.min(fileIndex, Math.max(0, files.length - 1)) : index;
   }
+  function rememberViewed(
+    file = textSelection ? selectionSource : loadedFile,
+  ): void {
+    if (
+      !file ||
+      !state ||
+      !progressScope ||
+      progressScope !== key() ||
+      progress.viewed[file.key]?.fingerprint === reviewFileFingerprint(file)
+    )
+      return;
+    const scope = progressScope;
+    void git
+      .request<ReviewProgress>("viewed", {
+        directory: options.directory,
+        key: scope,
+        file,
+      })
+      .then((result) => {
+        if (!stopped && progressScope === scope) {
+          progress = result;
+          render();
+        }
+      })
+      .catch(error);
+  }
+  function openMenu(next: ActionMenu): void {
+    if (!menu) menuPreviousFocus = focus;
+    clearTextSelection();
+    helpOpen = filterMenuOpen = false;
+    menu = next;
+    focus = 2;
+    render();
+  }
+  function closeMenu(): void {
+    menu = undefined;
+    focus = menuPreviousFocus;
+    render();
+  }
+  async function comparisonPicker(): Promise<void> {
+    if (!state) return;
+    const version = ++navigationVersion;
+    const references =
+      await git.request<{ label: string; ref: string; sha: string }[]>(
+        "references",
+      );
+    if (stopped || version !== navigationVersion) return;
+    const choices = [
+      { label: "Current HEAD", ref: state.snapshot.head },
+      ...(options.pr && pr
+        ? [{ label: `PR #${pr.number} HEAD`, ref: pr.headRefOid }]
+        : []),
+      ...references.map((entry) => ({ label: entry.label, ref: entry.sha })),
+      ...timeline().map((commit) => ({
+        label: `${commit.sha.slice(0, 8)} ${commit.subject}`,
+        ref: commit.sha,
+      })),
+    ].filter((entry) => entry.ref);
+    openMenu({
+      kind: "base",
+      title: "COMPARE · CHOOSE BASE",
+      subtitle: "Base → target · immutable revisions; r accepts typed refs",
+      index: 0,
+      items: [
+        {
+          label: "Last reviewed → current working tree",
+          detail: "Use your exact saved source and index checkpoint",
+        },
+        ...choices.map((choice) => ({
+          label: choice.label,
+          detail: choice.ref,
+        })),
+      ],
+      values: ["__checkpoint__", ...choices.map((choice) => choice.ref)],
+    });
+  }
+  async function chooseMenu(index: number): Promise<void> {
+    const current = menu;
+    if (!current) return;
+    if (current.kind === "base") {
+      const base = current.values?.[index];
+      if (!base) return;
+      if (base === "__checkpoint__") {
+        closeMenu();
+        onKey("s", { name: "s" });
+        return;
+      }
+      openMenu({
+        ...current,
+        kind: "target",
+        title: "COMPARE · CHOOSE TARGET",
+        subtitle: `${base.slice(0, 12)} → target`,
+        base,
+        index: 0,
+        items: current.items.slice(1),
+        values: current.values!.slice(1),
+      });
+    } else if (current.kind === "target") {
+      const to = current.values?.[index];
+      if (!to || !current.base) return;
+      navigationVersion++;
+      rememberViewed();
+      mode = { kind: "range", from: current.base, to };
+      closeMenu();
+      focus = 2;
+      void compare();
+    } else if (current.kind === "search") {
+      const hit = current.hits?.[index];
+      if (!hit) return;
+      const target = files.findIndex((file) => file.key === hit.fileKey);
+      if (target < 0)
+        throw new Error(
+          "Search result changed; search the current comparison again",
+        );
+      if (
+        current.identities?.[hit.fileKey] !==
+        reviewFileFingerprint(files[target])
+      )
+        throw new Error(
+          "Search result changed; search the current comparison again",
+        );
+      closeMenu();
+      fullFile = hit.fullFile;
+      beforeFile = hit.fullFile && files[target].status.startsWith("D");
+      sinceViewed = false;
+      pendingPosition = { key: hit.fileKey, line: hit.line };
+      focus = 2;
+      selectFile(target);
+      void patch();
+    } else {
+      const provider = current.values?.[index];
+      closeMenu();
+      if (provider) await rankFiles(provider);
+    }
+  }
+  async function searchAcrossFiles(query: string): Promise<void> {
+    const version = ++searchVersion;
+    const captured = files.map((file) => ({ ...file })),
+      scope = searchScope;
+    setStatus(`Searching ${files.length} visible file layers…`);
+    const result = await git.request<ReviewSearchResult>("search", {
+      files: captured,
+      query,
+      scope,
+      context: patchContext,
+    });
+    if (stopped || version !== searchVersion) return;
+    const identities = Object.fromEntries(
+      captured.map((file) => [file.key, reviewFileFingerprint(file)]),
+    );
+    if (
+      !captured.every((file) =>
+        files.some(
+          (next) =>
+            next.key === file.key &&
+            reviewFileFingerprint(next) === identities[file.key],
+        ),
+      )
+    ) {
+      setStatus(
+        "Changes arrived during search; search the current comparison again",
+      );
+      return;
+    }
+    openMenu({
+      kind: "search",
+      title: `SEARCH RESULTS · ${result.hits.length}${result.limited ? "+" : ""}`,
+      subtitle: `${searchScope}: ${query} · scanned ${result.scanned}/${result.total}${result.limited ? " · context limit reached" : ""}`,
+      index: 0,
+      items: result.hits.length
+        ? result.hits.map((hit) => ({
+            label: `${hit.path}:${hit.line + 1}`,
+            detail: hit.preview,
+          }))
+        : [{ label: "No matches in this scope" }],
+      hits: result.hits,
+      identities,
+    });
+  }
+  async function rankFiles(provider?: string): Promise<void> {
+    if (rankBusy) {
+      setStatus("Ranking already running · Ctrl-g cancels agent ranking");
+      return;
+    }
+    if (!files.length) return;
+    if (!provider && order && !rankStale) {
+      order = undefined;
+      filterFiles();
+      setStatus("Original Git file order restored");
+      return;
+    }
+    rankBusy = true;
+    const version = ++rankVersion;
+    const captured = [...files],
+      fingerprints = new Map(
+        captured.map((file) => [file.key, reviewFileFingerprint(file)]),
+      );
+    const valid = () =>
+      !stopped &&
+      version === rankVersion &&
+      captured.every((file) =>
+        allFiles.some(
+          (current) =>
+            current.key === file.key &&
+            reviewFileFingerprint(current) === fingerprints.get(file.key),
+        ),
+      );
+    try {
+      setStatus(
+        provider
+          ? `Preparing read-only ${provider} ranking…`
+          : "Ranking logical changes in the background…",
+      );
+      let result: ReviewRanks;
+      if (provider) {
+        const evidence = await git.request<ReviewRankEvidence[]>(
+          "rank-evidence",
+          { files: captured },
+        );
+        if (!valid()) return;
+        agentAbort = new AbortController();
+        setStatus(
+          `Ranking with ${provider} · explicit read-only analysis · Ctrl-g cancels`,
+        );
+        result = await rankWithReviewAgent(
+          options.root,
+          provider,
+          evidence,
+          agentAbort.signal,
+        );
+      } else
+        result = await git.request<ReviewRanks>("rank", { files: captured });
+      if (!valid()) {
+        if (!stopped)
+          setStatus(
+            "Changes arrived during ranking; press L or A to rank the latest comparison",
+          );
+        return;
+      }
+      scores = result;
+      rankedFingerprints.clear();
+      for (const file of captured)
+        if (result[file.key])
+          rankedFingerprints.set(file.key, reviewFileFingerprint(file));
+      order = sortReviewFiles(captured, scores).map((file) => file.key);
+      rankStale = false;
+      filterFiles();
+      setStatus(
+        `${provider ? "Agent" : "Logic"} order applied · reasons shown above the diff · updates keep this order until L refreshes`,
+      );
+    } finally {
+      if (version === rankVersion) rankBusy = false;
+    }
+  }
+  function applyPendingPosition(file: ReviewFile): void {
+    if (pendingPosition?.key !== file.key) return;
+    if (pendingPosition.line !== undefined) scroll = pendingPosition.line;
+    else if (pendingPosition.source !== undefined) {
+      if (fullFile) scroll = pendingPosition.source - 1;
+      else {
+        const target = reviewLineNumbers(lines).findIndex(
+          ([old, next]) =>
+            (beforeFile ? old : next) !== undefined &&
+            (beforeFile ? old! : next!) >= pendingPosition!.source!,
+        );
+        if (target >= 0) scroll = target;
+      }
+    }
+    pendingPosition = undefined;
+    scroll = Math.max(
+      0,
+      Math.min(scroll, scrollLimit(displayedLines().length, height())),
+    );
+    rememberPosition();
+  }
   function onMouse(event: ReviewMouse): void {
     if (stopped) return;
     if (event.release) {
+      if (dividerDrag) {
+        persistSettings({ ...settings, sidebarWidth }, false);
+        setStatus(
+          `Sidebar ${geometry().commits.width} columns · drag divider or use −/+; = resets`,
+        );
+      }
       if (selectingText && textSelection) {
         textSelection.end = textPoint(event);
         if (!reviewSelectedText(textSelection)) clearTextSelection();
@@ -599,15 +1059,40 @@ export async function liveReview(options: LiveOptions): Promise<void> {
       )
       .sort((a, b) => a.width * a.height - b.width * b.height)[0];
     if (!hit) return;
-    if (filterMenuOpen) {
+    if (menu && !prompt) {
       if (event.button & 64) {
-        filterMenuIndex = Math.max(0, Math.min(reviewFilterCategories.length - 1, filterMenuIndex + (event.button & 1 ? 1 : -1)));
+        menu.index = Math.max(
+          0,
+          Math.min(
+            menu.items.length - 1,
+            menu.index + (event.button & 1 ? 1 : -1),
+          ),
+        );
+        render();
+      } else if ((event.button & 3) === 0) {
+        if (hit.action === "menu" && hit.index !== undefined)
+          void chooseMenu(hit.index).catch(error);
+        else if (hit.action === "shortcut")
+          onKey(hit.shortcut!, { name: hit.shortcut });
+      }
+      return;
+    }
+    if (filterMenuOpen && !prompt) {
+      if (event.button & 64) {
+        filterMenuIndex = Math.max(
+          0,
+          Math.min(
+            reviewFilterCategories.length + advancedReviewFilters.length - 1,
+            filterMenuIndex + (event.button & 1 ? 1 : -1),
+          ),
+        );
         render();
       } else if ((event.button & 3) === 0) {
         if (hit.action === "filter-category" && hit.index !== undefined) {
           filterMenuIndex = hit.index;
           toggleFilterCategory(hit.index);
-        } else if (hit.action === "shortcut") onKey(hit.shortcut!, {name: hit.shortcut});
+        } else if (hit.action === "shortcut")
+          onKey(hit.shortcut!, { name: hit.shortcut });
       }
       return;
     }
@@ -645,7 +1130,7 @@ export async function liveReview(options: LiveOptions): Promise<void> {
           rememberPosition();
           render();
         } else {
-          scrollDiff(delta * 3);
+          scrollDiff(delta * settings.wheelStep);
           if (selectingText && textSelection)
             textSelection.end = textPoint(event);
         }
@@ -712,6 +1197,7 @@ export async function liveReview(options: LiveOptions): Promise<void> {
         if (!patchBusy && lines.length) {
           const point = textPoint(event);
           textSelection = { anchor: point, end: point, lines };
+          selectionSource = loadedFile;
           selectingText = true;
         }
       }
@@ -757,6 +1243,7 @@ export async function liveReview(options: LiveOptions): Promise<void> {
       filterMenuOpen = false;
       focus = filterPreviousFocus;
     } else {
+      menu = undefined;
       clearTextSelection();
       helpOpen = false;
       filterPreviousFocus = focus;
@@ -773,12 +1260,37 @@ export async function liveReview(options: LiveOptions): Promise<void> {
       clearTextSelection();
       filterFiles();
       void patch();
-      setStatus(`Filters saved for this worktree · ${allFiles.length - files.length} file layers hidden`);
-    } catch (cause) { error(cause); }
+      setStatus(
+        `Filters saved for this worktree · ${allFiles.length - files.length} file layers hidden`,
+      );
+    } catch (cause) {
+      error(cause);
+    }
   }
   function toggleFilterCategory(index: number): void {
+    const advanced =
+      advancedReviewFilters[index - reviewFilterCategories.length];
+    if (advanced) {
+      const value = settings[advanced.key] ?? fileFilters.boilerplate;
+      persistSettings({ ...settings, [advanced.key]: !value });
+      return;
+    }
     const key = reviewFilterCategories[index]?.key;
-    if (key) updateFileFilters({...fileFilters, [key]: !fileFilters[key]});
+    if (key) updateFileFilters({ ...fileFilters, [key]: !fileFilters[key] });
+  }
+  function persistSettings(next: ReviewSettings, refilter = true): void {
+    try {
+      saveReviewSettings(options.directory, options.root, next);
+      settings = next;
+      if (refilter) {
+        clearTextSelection();
+        filterFiles();
+        void patch();
+      }
+      setStatus("Review preferences saved for this worktree");
+    } catch (cause) {
+      error(cause);
+    }
   }
   function textPoint(event: ReviewMouse): ReviewTextPoint {
     const { viewport } = geometry();
@@ -823,6 +1335,7 @@ export async function liveReview(options: LiveOptions): Promise<void> {
       width,
     );
     sidebarWidth = width === undefined ? undefined : layout.commits.width;
+    if (!dividerDrag) persistSettings({ ...settings, sidebarWidth }, false);
     setStatus(
       `Sidebar ${layout.commits.width} columns · drag divider or - / + · = resets`,
     );
@@ -922,6 +1435,22 @@ export async function liveReview(options: LiveOptions): Promise<void> {
       pendingWorkingFile = undefined;
       comparison = result.comparison;
       allFiles = result.files;
+      for (const file of allFiles) {
+        const identity = rankedFingerprints.get(file.key);
+        if (identity && identity !== reviewFileFingerprint(file)) {
+          rankStale = true;
+          delete scores[file.key];
+        }
+      }
+      if (progressScope !== key()) {
+        const scope = key();
+        progress = await git.request<ReviewProgress>("progress", {
+          directory: options.directory,
+          key: scope,
+        });
+        if (stopped || version !== compareVersion) return;
+        progressScope = scope;
+      }
       filterFiles(oldKey, oldFile);
       if (frozen)
         void git
@@ -934,9 +1463,10 @@ export async function liveReview(options: LiveOptions): Promise<void> {
       await patch();
       status = frozen
         ? "Frozen snapshot · background detection continues"
-        : `Updated · ${files.length} file layers · f freezes the inspected snapshot`;
+        : `Updated · ${files.length} file layers${rankStale ? " · ranking stale: L refreshes" : ""} · f freezes the inspected snapshot`;
     } catch (cause) {
       if (version === compareVersion) {
+        loadedFile = undefined;
         comparison = undefined;
         allFiles = [];
         files = [];
@@ -960,6 +1490,7 @@ export async function liveReview(options: LiveOptions): Promise<void> {
     }
     const file = selected();
     if (!file) {
+      loadedFile = undefined;
       clearTextSelection();
       rememberPosition();
       activeViewport = "";
@@ -982,24 +1513,49 @@ export async function liveReview(options: LiveOptions): Promise<void> {
       horizontal = previous?.horizontal ?? 0;
     }
     const version = patchVersion,
-      cacheKey = `${file.from}:${file.to}:${file.key}`;
+      cacheKey = `${file.key}:${reviewFileFingerprint(file)}:${fullFile ? (beforeFile ? "before" : "after") : sinceViewed ? `viewed:${progress.viewed[file.key]?.tree}` : `diff:${patchContext}`}`;
     if (patchCache.has(cacheKey)) {
       lines = patchCache.get(cacheKey)!;
+      loadedFile = file;
+      applyPendingPosition(file);
+      if (!progress.viewed[file.key]) rememberViewed(file);
       scroll = Math.min(scroll, scrollLimit(displayedLines().length, height()));
       render();
       return;
     }
     patchBusy = true;
+    loadedFile = undefined;
     // Never leave another file's patch underneath a new selection.
     lines = [`Loading ${file.path}…`];
     render();
     try {
-      const result = await git.request<string>("patch", { file });
+      let result: string;
+      if (fullFile)
+        result = (
+          await git.request<{ text: string }>("content", {
+            file,
+            side: beforeFile ? "before" : "after",
+          })
+        ).text;
+      else if (sinceViewed && progress.viewed[file.key])
+        result = await git.request<string>("delta", {
+          file,
+          viewed: progress.viewed[file.key],
+          context: patchContext,
+        });
+      else
+        result = await git.request<string>("patch", {
+          file,
+          context: patchContext,
+        });
       if (stopped || version !== patchVersion) return;
       lines = result.split("\n");
+      loadedFile = file;
       patchCache.set(cacheKey, lines);
       patchSizes.set(cacheKey, result.length);
       patchChars += result.length;
+      applyPendingPosition(file);
+      if (!progress.viewed[file.key]) rememberViewed(file);
       while (patchCache.size > 20 || patchChars > 16 * 1024 * 1024) {
         const oldest = patchCache.keys().next().value!;
         patchChars -= patchSizes.get(oldest) ?? 0;
@@ -1025,6 +1581,7 @@ export async function liveReview(options: LiveOptions): Promise<void> {
   async function discover(): Promise<void> {
     if (remoteBusy || stopped) return;
     remoteBusy = true;
+    const navigation = navigationVersion;
     try {
       await git.request("identity");
       if (stopped) return;
@@ -1041,19 +1598,21 @@ export async function liveReview(options: LiveOptions): Promise<void> {
       }
       if (stopped) return;
       const changed =
-        pr?.headRefOid !== result.headRefOid ||
-        pr?.baseRefOid !== result.baseRefOid;
+        latestPr?.headRefOid !== result.headRefOid ||
+        latestPr?.baseRefOid !== result.baseRefOid;
       const followBranch =
-        (!pr && mode.kind !== "commits") || mode.kind === "branch";
+        navigation === navigationVersion &&
+        ((!pr && mode.kind === "working") || mode.kind === "branch");
       const selectedSha =
         commitIndex > 0 ? timeline()[commitIndex - 1]?.sha : undefined;
-      pr = result;
+      latestPr = result;
+      if (!frozen) pr = result;
       if (options.pr && changed)
         latestRemoteCommits = await git.request<Commit[]>("history", {
-          head: pr.headRefOid,
-          base: pr.baseRefOid,
+          head: result.headRefOid,
+          base: result.baseRefOid,
         });
-      remote = `#${pr.number} head ${pr.headRefOid.slice(0, 8)} (polled separately)`;
+      remote = `#${result.number} head ${result.headRefOid.slice(0, 8)} (polled separately)`;
       if (options.pr && changed && !frozen) {
         remoteCommits = latestRemoteCommits;
         if (selectedSha)
@@ -1061,11 +1620,21 @@ export async function liveReview(options: LiveOptions): Promise<void> {
             0,
             timeline().findIndex((c) => c.sha === selectedSha) + 1,
           );
-        if (followBranch) {
-          mode = { kind: "branch", base: pr.baseRefOid, head: pr.headRefOid };
+        if (followBranch && navigation === navigationVersion && !frozen) {
+          mode = {
+            kind: "branch",
+            base: result.baseRefOid,
+            head: result.headRefOid,
+          };
           void compare();
         }
-      } else if (changed && frozen) {
+      }
+      if (
+        frozen &&
+        pr &&
+        (pr.headRefOid !== result.headRefOid ||
+          pr.baseRefOid !== result.baseRefOid)
+      ) {
         remote += " · newer PR metadata";
         render();
       }
@@ -1111,7 +1680,10 @@ export async function liveReview(options: LiveOptions): Promise<void> {
       );
     if (mode.kind === "commits" && mode.commits.length > 1)
       throw new Error("Select one commit or a range to mark a checkpoint");
-    if (!state.snapshot.stable)
+    if (
+      (mode.kind === "working" || mode.kind === "since") &&
+      !state.snapshot.stable
+    )
       throw new Error(
         "Source moved during capture; refresh before marking reviewed",
       );
@@ -1140,6 +1712,8 @@ export async function liveReview(options: LiveOptions): Promise<void> {
       directory: options.directory,
       key: capturedKey,
       point,
+      state,
+      pr: options.pr,
     });
     setStatus(
       `Marked inspected snapshot ${point.label} reviewed · s compares later changes`,
@@ -1156,6 +1730,21 @@ export async function liveReview(options: LiveOptions): Promise<void> {
       return;
     }
     if (prompt) {
+      if (name === "tab" && prompt === "search") {
+        const scopes: ReviewSearchScope[] = [
+          "diff",
+          "paths",
+          "changes",
+          "files",
+        ];
+        searchScope =
+          scopes[
+            (scopes.indexOf(searchScope) + (keypress.shift ? 3 : 1)) %
+              scopes.length
+          ];
+        render();
+        return;
+      }
       if (name === "escape") {
         prompt = undefined;
         input = "";
@@ -1174,13 +1763,34 @@ export async function liveReview(options: LiveOptions): Promise<void> {
               "Enter exactly two revisions: FROM TO (e.g. HEAD~3 HEAD)",
             );
           else {
+            navigationVersion++;
+            rememberViewed();
+            clearTextSelection();
             mode = { kind: "range", from: refs[0], to: refs[1] };
             rememberPosition();
             void compare();
           }
-        } else {
+        } else if (kind === "search") {
           search = value;
-          nextMatch();
+          if (searchScope === "changes" || searchScope === "files")
+            void searchAcrossFiles(value).catch(error);
+          else {
+            focus = searchScope === "paths" ? 1 : 2;
+            nextMatch();
+          }
+        } else if (kind === "wheel") {
+          const wheelStep = Number(value);
+          if (!Number.isInteger(wheelStep) || wheelStep < 1 || wheelStep > 20)
+            setStatus("Wheel speed must be an integer between 1 and 20");
+          else persistSettings({ ...settings, wheelStep }, false);
+        } else {
+          const paths = value
+            .split(",")
+            .map((entry) => entry.trim())
+            .filter(Boolean);
+          if (paths.length > 100 || paths.some((entry) => entry.length > 500))
+            setStatus("Use at most 100 path rules of 500 characters each");
+          else persistSettings({ ...settings, [kind]: paths });
         }
       } else if (name === "backspace")
         input = Array.from(input).slice(0, -1).join("");
@@ -1192,19 +1802,70 @@ export async function liveReview(options: LiveOptions): Promise<void> {
       finish();
       return;
     }
+    if (menu) {
+      if (name === "escape") {
+        searchVersion++;
+        closeMenu();
+      } else if (name === "return") void chooseMenu(menu.index).catch(error);
+      else if (
+        name === "down" ||
+        text === "j" ||
+        name === "up" ||
+        text === "k"
+      ) {
+        menu.index = Math.max(
+          0,
+          Math.min(
+            menu.items.length - 1,
+            menu.index + (name === "down" || text === "j" ? 1 : -1),
+          ),
+        );
+        render();
+      }
+      return;
+    }
     if (filterMenuOpen) {
       if (name === "escape" || text === "T") toggleFilterMenu();
-      else if (["1", "2", "3"].includes(text)) {
+      else if (["1", "2", "3", "4", "5"].includes(text)) {
         filterMenuIndex = Number(text) - 1;
         toggleFilterCategory(filterMenuIndex);
-      } else if (name === "return" || text === " ") toggleFilterCategory(filterMenuIndex);
-      else if (text === "a" || text === "d") updateFileFilters({...defaultReviewFilters});
-      else if (text === "n") updateFileFilters({test:false, style:false, boilerplate:false});
-      else if (text === "t") {
+      } else if (name === "return" || text === " ")
+        toggleFilterCategory(filterMenuIndex);
+      else if (text === "a" || text === "d" || text === "n") {
+        persistSettings({
+          ...settings,
+          lockfiles: undefined,
+          generated: undefined,
+        });
+        updateFileFilters(
+          text === "n"
+            ? { test: false, style: false, boilerplate: false }
+            : { ...defaultReviewFilters },
+        );
+      } else if (text === "h" || text === "i" || text === "w") {
+        prompt =
+          text === "h" ? "hidePaths" : text === "i" ? "showPaths" : "wheel";
+        input =
+          prompt === "wheel"
+            ? String(settings.wheelStep)
+            : settings[prompt].join(", ");
+        render();
+      } else if (text === "t") {
         toggleFilterMenu();
-        onKey("t", {name: "t"});
-      } else if (name === "down" || text === "j" || name === "up" || text === "k") {
-        filterMenuIndex = Math.max(0, Math.min(reviewFilterCategories.length - 1, filterMenuIndex + (name === "down" || text === "j" ? 1 : -1)));
+        onKey("t", { name: "t" });
+      } else if (
+        name === "down" ||
+        text === "j" ||
+        name === "up" ||
+        text === "k"
+      ) {
+        filterMenuIndex = Math.max(
+          0,
+          Math.min(
+            reviewFilterCategories.length + advancedReviewFilters.length - 1,
+            filterMenuIndex + (name === "down" || text === "j" ? 1 : -1),
+          ),
+        );
         render();
       }
       return;
@@ -1237,7 +1898,134 @@ export async function liveReview(options: LiveOptions): Promise<void> {
     if (text === "/") {
       prompt = "search";
       input = search;
+      searchScope = focus === 1 ? "paths" : "diff";
       render();
+      return;
+    }
+    if (keypress.ctrl && name === "f") {
+      prompt = "search";
+      input = search;
+      searchScope = "changes";
+      render();
+      return;
+    }
+    if (keypress.ctrl && name === "g") {
+      rankVersion++;
+      agentAbort.abort();
+      rankBusy = false;
+      searchVersion++;
+      setStatus("Background analysis cancelled");
+      return;
+    }
+    if (text === "b") {
+      void comparisonPicker().catch(error);
+      return;
+    }
+    if (text === "L") {
+      void rankFiles().catch(error);
+      return;
+    }
+    if (text === "A") {
+      openMenu({
+        kind: "agent",
+        title: "AGENT RANKING · CHOOSE PROVIDER",
+        subtitle:
+          "Explicit read-only analysis of captured patches; may use your provider quota",
+        index: 0,
+        items: [
+          { label: "Codex" },
+          { label: "Claude" },
+          { label: "Antigravity" },
+        ],
+        values: ["codex", "claude", "agy"],
+      });
+      return;
+    }
+    if (text === "v") {
+      const file = textSelection ? selectionSource : loadedFile;
+      if (!file || patchBusy || compareBusy || !progressScope) {
+        setStatus(
+          "Wait for the displayed file to finish loading before marking it reviewed",
+        );
+        return;
+      }
+      const scope = progressScope;
+      void git
+        .request<ReviewProgress>("review-file", {
+          directory: options.directory,
+          key: scope,
+          file,
+        })
+        .then((result) => {
+          if (stopped || scope !== progressScope) return;
+          progress = result;
+          setStatus(
+            `${isFileReviewed(progress, file) ? "Reviewed" : "Unmarked"} ${file.path} · u jumps to the next unreviewed file`,
+          );
+        })
+        .catch(error);
+      return;
+    }
+    if (text === "u" || text === "U") {
+      for (let n = 1; n <= files.length; n++) {
+        const index =
+          (fileIndex + (text === "U" ? -n : n) + files.length) % files.length;
+        if (!isFileReviewed(progress, files[index])) {
+          focus = 2;
+          selectFile(index);
+          return;
+        }
+      }
+      setStatus("All visible files in this comparison are reviewed");
+      return;
+    }
+    if (text === "{" || text === "}") {
+      const hunks = displayedLines().flatMap((line, index) =>
+        line.startsWith("@@ ") ? [index] : [],
+      );
+      const target =
+        text === "}"
+          ? hunks.find((index) => index > scroll)
+          : hunks.reverse().find((index) => index < scroll);
+      if (target !== undefined) scrollDiff(target - scroll);
+      else setStatus("No further hunk in this direction");
+      return;
+    }
+    if (text === "c" || text === "e" || text === "C") {
+      const file = selected();
+      if (!file) return;
+      const source = fullFile
+        ? scroll + 1
+        : sourceLine(displayedLines(), scroll);
+      clearTextSelection();
+      if (text === "C") {
+        patchContext = patchContext === 3 ? 12 : patchContext === 12 ? 40 : 3;
+        fullFile = sinceViewed = false;
+      } else if (text === "e") {
+        fullFile = true;
+        beforeFile = !beforeFile;
+        sinceViewed = false;
+      } else {
+        fullFile = !fullFile;
+        sinceViewed = false;
+        if (fullFile) beforeFile = file.status.startsWith("D");
+      }
+      pendingPosition = { key: file.key, source };
+      void patch();
+      return;
+    }
+    if (text === "d") {
+      const file = selected();
+      if (!file) return;
+      if (!progress.viewed[file.key]) {
+        setStatus("This file has no earlier viewed revision yet");
+        return;
+      }
+      clearTextSelection();
+      sinceViewed = !sinceViewed;
+      fullFile = false;
+      scroll = 0;
+      void patch();
       return;
     }
     if (text === "r" && !keypress.ctrl) {
@@ -1274,9 +2062,13 @@ export async function liveReview(options: LiveOptions): Promise<void> {
             target: comparison.target,
             revisions: comparison.scopes.flatMap((s) => [s.from, s.to]),
           })
-          .catch(error);
+          .catch((cause) => {
+            frozen = false;
+            error(cause);
+          });
       else if (!frozen) void git.request("release").catch(error);
       if (!frozen && latest) {
+        pr = latestPr ?? pr;
         state = latest;
         remoteCommits = latestRemoteCommits;
         newer = false;
@@ -1292,6 +2084,8 @@ export async function liveReview(options: LiveOptions): Promise<void> {
       return;
     }
     if (text === "w") {
+      navigationVersion++;
+      rememberViewed();
       clearTextSelection();
       mode = { kind: "working" };
       commitIndex = 0;
@@ -1300,6 +2094,8 @@ export async function liveReview(options: LiveOptions): Promise<void> {
       return;
     }
     if (text === "p") {
+      navigationVersion++;
+      rememberViewed();
       clearTextSelection();
       mode = {
         kind: "branch",
@@ -1311,15 +2107,26 @@ export async function liveReview(options: LiveOptions): Promise<void> {
       return;
     }
     if (text === "s") {
+      navigationVersion++;
+      rememberViewed();
       clearTextSelection();
       try {
         if (state) {
-          mode = {
-            kind: "since",
-            checkpoint: loadCheckpoint(options.directory, key()),
-          };
-          rememberPosition();
-          void compare();
+          const navigation = navigationVersion;
+          void git
+            .request<Checkpoint>("checkpoint", {
+              directory: options.directory,
+              key: key(),
+              branch: state.snapshot.branch,
+              pr: options.pr,
+            })
+            .then((checkpoint) => {
+              if (stopped || navigation !== navigationVersion) return;
+              mode = { kind: "since", checkpoint };
+              rememberPosition();
+              void compare();
+            })
+            .catch(error);
         }
       } catch (cause) {
         error(cause);
@@ -1330,21 +2137,49 @@ export async function liveReview(options: LiveOptions): Promise<void> {
       void mark().catch(error);
       return;
     }
-    if (text === "o") {
-      const file = selected();
+    if (text === "o" || text === "O") {
+      const file = textSelection ? selectionSource : loadedFile;
       if (!file) return;
-      const location = `${path.join(options.root, file.path)}:${sourceLine(displayedLines(), scroll)}`;
-      const editor = spawn("code", ["--goto", location], {
-        cwd: options.root,
-        detached: true,
-        stdio: "ignore",
-      });
-      editor.once("error", error);
-      editor.once("exit", (code, signal) => {
-        if (code === 0) setStatus(`Opened ${file.path}`);
-        else error(new Error(`VS Code launcher exited with ${signal ?? code}`));
-      });
-      editor.unref();
+      if (patchBusy || compareBusy) {
+        setStatus("Wait for the reviewed file to finish loading");
+        return;
+      }
+      const line = fullFile
+        ? scroll + 1
+        : sourceLine(
+            displayedLines(),
+            scroll,
+            file.status.startsWith("D") ? "before" : "after",
+          );
+      const open = (target: string) => {
+        if (stopped) return;
+        const editor = spawn("code", ["--goto", `${target}:${line}`], {
+          cwd: options.root,
+          detached: true,
+          stdio: "ignore",
+        });
+        editor.once("error", error);
+        editor.once("exit", (code, signal) => {
+          if (code === 0) setStatus(`Opened ${file.path}`);
+          else
+            error(new Error(`VS Code launcher exited with ${signal ?? code}`));
+        });
+        editor.unref();
+      };
+      if (text === "O")
+        void git
+          .request("identity")
+          .then(() => open(path.join(options.root, file.path)))
+          .catch(error);
+      else
+        void git
+          .request<string>("editor", {
+            file,
+            directory: options.directory,
+            side: fullFile && beforeFile ? "before" : "after",
+          })
+          .then(open)
+          .catch(error);
       return;
     }
     if (keypress.ctrl && name === "r") {
@@ -1443,6 +2278,7 @@ export async function liveReview(options: LiveOptions): Promise<void> {
     resolveExit = resolve;
   });
   const wasRaw = process.stdin.isRaw;
+  const restoreTerminalSettings = reviewTerminalSettings(process.stdin);
   const onData = (data: Buffer) => inputEvents.feed(data);
   const resize = () => {
     scrollbarDrag = undefined;
@@ -1453,8 +2289,10 @@ export async function liveReview(options: LiveOptions): Promise<void> {
   };
   const finish = () => {
     if (stopped) return;
+    rememberViewed();
     stopped = true;
     remoteAbort.abort();
+    agentAbort.abort();
     resolveExit();
   };
   const terminate = () => finish();
@@ -1462,6 +2300,10 @@ export async function liveReview(options: LiveOptions): Promise<void> {
     () => void discover(),
     options.remoteInterval ?? 60000,
   );
+  const disarmCrashGuard = installTerminalCrashGuard({
+    restoreTerminalSettings,
+    getWorkerPid: () => git.pid,
+  });
   try {
     readline.emitKeypressEvents(inputEvents.keys);
     process.stdin.setRawMode(true);
@@ -1503,20 +2345,9 @@ export async function liveReview(options: LiveOptions): Promise<void> {
     inputEvents.keys.off("keypress", onKey);
     inputEvents.close();
     process.stdout.off("resize", resize);
-    const restore =
-      "\x1b[0m" +
-      esc +
-      "?1000l" +
-      esc +
-      "?1002l" +
-      esc +
-      "?1006l" +
-      esc +
-      "?25h" +
-      esc +
-      "?1049l";
+    const stopMouse = esc + "?1000l" + esc + "?1002l" + esc + "?1006l";
     const restored = new Promise<void>((resolve, reject) => {
-      process.stdout.write(restore, (error) =>
+      process.stdout.write(stopMouse, (error) =>
         error ? reject(error) : resolve(),
       );
     });
@@ -1527,9 +2358,19 @@ export async function liveReview(options: LiveOptions): Promise<void> {
       await releaseInput();
       process.stdin.setRawMode(wasRaw ?? false);
       process.stdin.pause();
+      restoreTerminalSettings();
+      // Reveal the shell only after we have stopped reading and restored its
+      // real terminal attributes. The old prompt must never be shown raw.
+      await new Promise<void>((resolve, reject) => {
+        process.stdout.write(
+          "\x1b[0m" + esc + "?25h" + esc + "?1049l",
+          (error) => (error ? reject(error) : resolve()),
+        );
+      });
       process.off("SIGINT", terminate);
       process.off("SIGTERM", terminate);
       process.off("SIGHUP", terminate);
+      disarmCrashGuard();
     }
   }
 }

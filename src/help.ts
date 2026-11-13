@@ -684,7 +684,7 @@ const topics: Record<string, Topic> = {
     description: "Install or check Git, zsh, fzf and GitHub CLI",
     usage: "rl setup dependencies [--check | --dry-run] [--json]",
     notes: [
-      "npm installation installs missing tools through an existing package manager. This command repairs skipped or failed dependency setup.",
+      "Installs missing tools through an existing package manager, or checks availability with --check.",
       "Uses Homebrew on macOS, and Homebrew, APT, DNF, Yum, Pacman or APK on Linux. Administrator access may be required on Linux.",
       "Runs directly with Node, so it also works before zsh or a repository is available.",
     ],
@@ -693,9 +693,9 @@ const topics: Record<string, Topic> = {
     description: "Complete or repair RL installation and shell integration",
     usage: "rl setup install [--shell zsh|bash]",
     notes: [
-      "Global npm installation runs this automatically: missing Git, zsh, fzf and gh are installed, then your shell startup file is updated.",
+      "Installs missing Git, zsh, fzf and gh, then registers shell integration in your startup file.",
       "Preserves your settings and updates one RL-owned block. New terminals load RL automatically; reload the installing terminal once.",
-      "Use this command after an install with lifecycle scripts disabled, or to repair setup.",
+      "Run once after npm install --global rl-workspaces, or again at any time to repair setup.",
     ],
   },
   "setup shell": {
@@ -761,10 +761,14 @@ function match(words: string[]): string | undefined {
       name = words.slice(0, length).join(" ");
   return name;
 }
-export function topicHelp(words: string[]): string {
+export function topicHelp(words: string[], strictLeaf = false): string {
   if (!words.length) return mainHelp();
   const name = match(words);
-  if (!name || (children(name).length && words.length > name.split(" ").length))
+  if (
+    !name ||
+    ((strictLeaf || children(name).length > 0) &&
+      words.length > name.split(" ").length)
+  )
     throw new Error(`Unknown help topic: ${safe(words.join(" "))}`);
   const topic = topics[name];
   const lines = [topic.description, "", `Usage: ${topic.usage}`];
@@ -790,7 +794,7 @@ export function topicHelp(words: string[]): string {
   if (topic.related?.length)
     lines.push(
       "",
-      `Related: ${topic.related.map((name) => `rl help ${name}`).join(", ")}`,
+      `Related: ${topic.related.map((related) => `rl help ${related}`).join(", ")}`,
     );
   return [
     ...lines,
@@ -857,16 +861,16 @@ export function invocation(module: string, argv: string[]): string[] {
   };
   return rest.length ? rest : defaults[module] ? [defaults[module]] : [];
 }
-export function usageHint(
-  module: string,
-  argv: string[],
-  details = false,
-): string {
-  const words = invocation(module, argv),
-    name = match(words);
+export function usageHintForWords(words: string[], details = false): string {
+  const leading: string[] = [];
+  for (const word of words) {
+    if (word.startsWith("-")) break;
+    leading.push(word);
+  }
+  const name = match(leading.length ? leading : words);
   if (!name) return "Run rl help for available commands.";
-  const topic = topics[name],
-    lines = [`Usage: ${topic.usage}`];
+  const topic = topics[name];
+  const lines = [`Usage: ${topic.usage}`];
   if (details && topic.options?.length)
     lines.push("", "Options:", ...topic.options.map((option) => "  " + option));
   if (details && children(name).length)
@@ -880,15 +884,31 @@ export function usageHint(
     );
   return [...lines, `See rl help ${name}.`].join("\n");
 }
+
+export function usageHint(
+  module: string,
+  argv: string[],
+  details = false,
+): string {
+  return usageHintForWords(invocation(module, argv), details);
+}
+
 export function explicitHelp(argv: string[]): string {
   let words = [...argv];
   if (words[0] === "--repo") words = words.slice(2);
   else if (words[0]?.startsWith("--repo=")) words = words.slice(1);
-  if (words[0] === "help") words.shift();
   const separator = words.indexOf("--");
   if (separator >= 0) words = words.slice(0, separator);
   words = words.filter((word) => word !== "--help" && word !== "-h");
-  return topicHelp(words);
+  if (words[0] === "help") {
+    return topicHelp(words.slice(1), true);
+  }
+  const leading: string[] = [];
+  for (const word of words) {
+    if (word.startsWith("-")) break;
+    leading.push(word);
+  }
+  return topicHelp(leading);
 }
 if (
   process.argv[1] &&

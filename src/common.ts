@@ -5,6 +5,7 @@ import { randomUUID } from "node:crypto";
 import { spawnSync, spawn } from "node:child_process";
 import { parseArgs } from "node:util";
 import lockfile from "proper-lockfile";
+import { UsageError } from "./errors.js";
 import { readJsonObject } from "./json.js";
 import { executableError } from "./dependencies.js";
 
@@ -98,7 +99,6 @@ export async function execute(
   return new Promise((resolve, reject) => {
     const child = spawn(argv[0], argv.slice(1), {
       cwd,
-      timeout: options.timeoutMs,
       env: options.env ?? (argv[0] === "git" ? gitEnv() : process.env),
       detached: options.processGroup,
       stdio: options.interactive
@@ -110,6 +110,8 @@ export async function execute(
     let outputBytes = 0;
     let overflow = false;
     let forceKill: ReturnType<typeof setTimeout> | undefined;
+    let deadline: ReturnType<typeof setTimeout> | undefined;
+    let timedOut = false;
     const kill = (signal: NodeJS.Signals) => {
       if (
         !options.processGroup &&
@@ -159,6 +161,7 @@ export async function execute(
     process.on("SIGTERM", terminate);
     const cleanup = () => {
       if (forceKill) clearTimeout(forceKill);
+      if (deadline) clearTimeout(deadline);
       options.signal?.removeEventListener("abort", abort);
       process.off("SIGINT", interrupt);
       process.off("SIGTERM", terminate);
@@ -174,13 +177,22 @@ export async function execute(
         return;
       }
       resolve({
-        code: code ?? 128 + (os.constants.signals[signal!] ?? 1),
+        code: timedOut
+          ? 124
+          : (code ?? 128 + (os.constants.signals[signal!] ?? 1)),
         stdout,
-        stderr,
+        stderr: timedOut
+          ? `${stderr}\nCommand timed out after ${options.timeoutMs} ms`.trim()
+          : stderr,
       });
     });
     options.signal?.addEventListener("abort", abort, { once: true });
     if (options.signal?.aborted) abort();
+    if (options.timeoutMs && options.timeoutMs > 0)
+      deadline = setTimeout(() => {
+        timedOut = true;
+        abort();
+      }, options.timeoutMs);
   });
 }
 export function object(value: unknown): value is Record<string, unknown> {
@@ -282,19 +294,23 @@ export function args(
 }
 export function required(values: Record<string, unknown>, key: string): string {
   const value = values[key];
-  if (typeof value !== "string" || !value) throw new Error(`Missing --${key}`);
+  if (typeof value !== "string" || !value) {
+    throw new UsageError(`Missing --${key}`);
+  }
   return value;
 }
+
 export function arity(values: string[], min: number, max = min): void {
-  if (values.length < min || values.length > max)
-    throw new Error("Invalid command arguments; run rl --help");
+  if (values.length < min || values.length > max) {
+    throw new UsageError("Invalid command arguments; run rl --help");
+  }
 }
 export async function pooled<T, R>(
   items: T[],
   limit: number,
   action: (item: T) => Promise<R>,
 ): Promise<R[]> {
-  const results: R[] = new Array(items.length);
+  const results = Array.from<R>({ length: items.length });
   let next = 0;
   await Promise.all(
     Array.from({ length: Math.min(limit, items.length) }, async () => {

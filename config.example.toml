@@ -1,0 +1,10 @@
+# Copy to ~/.config/rl/config.toml (or point RL_CONFIG to a custom path).
+# Paths support leading ~ or $HOME. Environment variables override these settings.
+
+worktreeDir = "~/.rl/worktrees"
+stateDir = "~/.rl/instances"
+defaultBase = "origin/test"
+
+# Optional registered repository alias; `rl --repo <alias>` overrides this.
+# Without it, RL selects by current worktree, then the `rl repo use` default.
+# repo = "frontend"

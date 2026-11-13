@@ -195,38 +195,47 @@ test("watching detects atomic replacement, nested untracked creation, commits, i
   assert.notEqual(state.gitDir, state.commonDir);
 });
 
-test("Git worker reports failures without terminating and safely reads a specific worktree", async (t) => {
-  const w = new Workspace(t);
-  write(path.join(w.a, "only-a.txt"), "A\n");
-  write(path.join(w.b, "only-b.txt"), "B\n");
-  const worker = fork(path.join(ROOT, "dist/review-live-worker.js"), [w.a]);
-  t.after(() => {
-    worker.kill();
-  });
-  async function request(id: number, op: string, data: object = {}) {
-    return new Promise<any>((resolve, reject) => {
-      worker.once("error", reject);
-      worker.once("message", resolve);
-      worker.send({ id, op, ...data });
+test(
+  "Git worker reports failures without terminating and safely reads a specific worktree",
+  { timeout: 30000 },
+  async (t) => {
+    const w = new Workspace(t);
+    write(path.join(w.a, "only-a.txt"), "A\n");
+    write(path.join(w.b, "only-b.txt"), "B\n");
+    const worker = fork(path.join(ROOT, "dist/review-live-worker.js"), [w.a]);
+    t.after(() => {
+      worker.kill();
     });
-  }
-  const state = (await request(1, "refresh")).result;
-  const result = await request(2, "compare", {
-    mode: { kind: "working" },
-    state,
-  });
-  assert.ok(result.result.files.some((f: any) => f.path === "only-a.txt"));
-  assert.ok(!result.result.files.some((f: any) => f.path === "only-b.txt"));
-  const failure = await request(3, "compare", {
-    mode: { kind: "range", from: "missing-ref", to: "HEAD" },
-    state,
-  });
-  assert.ok(failure.error);
-  assert.equal(
-    (await request(4, "refresh")).result.snapshot.branch,
-    "feature/a",
-  );
-});
+    const ready = await new Promise<any>((resolve, reject) => {
+      worker.once("message", resolve);
+      worker.once("error", reject);
+    });
+    assert.equal(ready.ready, true);
+    async function request(id: number, op: string, data: object = {}) {
+      return new Promise<any>((resolve, reject) => {
+        worker.once("error", reject);
+        worker.once("message", resolve);
+        worker.send({ id, op, ...data });
+      });
+    }
+    const state = (await request(1, "refresh")).result;
+    const result = await request(2, "compare", {
+      mode: { kind: "working" },
+      state,
+    });
+    assert.ok(result.result.files.some((f: any) => f.path === "only-a.txt"));
+    assert.ok(!result.result.files.some((f: any) => f.path === "only-b.txt"));
+    const failure = await request(3, "compare", {
+      mode: { kind: "range", from: "missing-ref", to: "HEAD" },
+      state,
+    });
+    assert.ok(failure.error);
+    assert.equal(
+      (await request(4, "refresh")).result.snapshot.branch,
+      "feature/a",
+    );
+  },
+);
 
 test("terminal utilities sanitize control sequences, respect wide characters and locate source lines", () => {
   assert.equal(terminal.terminalText("\x1b[31mred\x1b[0m\x00", 5), "red  ");
@@ -483,7 +492,7 @@ test(
 );
 
 test(
-  "default file filter hides tests, styles and boilerplate without losing source selection or live updates",
+  "file filters retain selection and live updates, support configurable categories and persist across TUI launches",
   { timeout: 120000 },
   (t) => {
     const w = new Workspace(t);
@@ -535,6 +544,21 @@ test(
       { timeoutMs: 90000 },
     );
     assert.match(result.stdout, /PTY: filter.*passed/);
+    const reopened = w.command(
+      [
+        "python3",
+        path.join(ROOT, "tests/review-live-pty.py"),
+        w.a,
+        process.execPath,
+        path.join(ROOT, "dist/cli.js"),
+        w.repo,
+        w.state,
+        path.join(w.root, "worktrees/example"),
+        "filter-reopen",
+      ],
+      { timeoutMs: 45000 },
+    );
+    assert.match(reopened.stdout, /PTY: filter-reopen.*passed/);
   },
 );
 
@@ -606,6 +630,60 @@ test("preview selection uses terminal columns, preserves Unicode and tabs, and l
   assert.ok(reviewLayout(100, 34, 2, false, 10000).diff.width >= 35);
   assert.equal(reviewLayout(70, 24, 2, false, 40).divider, undefined);
   assert.equal(reviewLayout(160, 34, 2, true, 40).viewport.width, 155);
+});
+
+test("review filter preferences are atomic, worktree-scoped and validated; disabled categories and show-all preserve files", async (t) => {
+  const w = new Workspace(t);
+  const preferences = await import(
+    pathToFileURL(path.join(ROOT, "dist/review-live-files.js")).href
+  );
+  const directory = path.join(w.root, "review-preferences");
+  const defaults = preferences.loadReviewFilters(directory, w.a);
+  assert.deepEqual(defaults, { test: true, style: true, boilerplate: true });
+  const configured = { test: true, style: false, boilerplate: false };
+  preferences.saveReviewFilters(directory, w.a, configured);
+  assert.deepEqual(preferences.loadReviewFilters(directory, w.a), configured);
+  assert.deepEqual(preferences.loadReviewFilters(directory, w.b), defaults);
+  const files = [
+    { path: "source.ts", key: "source" },
+    { path: "source.test.ts", key: "test" },
+    { path: "source.css", key: "style" },
+    { path: "package-lock.json", key: "boilerplate" },
+  ];
+  assert.deepEqual(
+    preferences
+      .visibleReviewFiles(files, true, configured)
+      .map((file: any) => file.key),
+    ["source", "style", "boilerplate"],
+  );
+  assert.equal(preferences.visibleReviewFiles(files, false, configured), files);
+  const saved = preferences.reviewFilterFile(directory, w.a);
+  fs.writeFileSync(
+    saved,
+    JSON.stringify({ version: 1, hidden: { test: "false" } }),
+  );
+  assert.throws(
+    () => preferences.loadReviewFilters(directory, w.a),
+    /Invalid review filter/,
+  );
+  fs.writeFileSync(
+    saved,
+    JSON.stringify({ version: 1, hidden: { style: false } }),
+  );
+  assert.deepEqual(preferences.loadReviewFilters(directory, w.a), {
+    test: true,
+    style: false,
+    boilerplate: true,
+  });
+  const outside = path.join(w.root, "outside.json");
+  fs.writeFileSync(outside, "untouched");
+  fs.unlinkSync(saved);
+  fs.symlinkSync(outside, saved);
+  assert.throws(
+    () => preferences.saveReviewFilters(directory, w.a, configured),
+    /symlinks/,
+  );
+  assert.equal(fs.readFileSync(outside, "utf8"), "untouched");
 });
 
 test("file visibility recognises conventional test, style and boilerplate paths while retaining source and configuration", async () => {
@@ -894,6 +972,37 @@ setInterval(() => {}, 1000);
       t.diagnostic(
         `${quitKey === "q" ? "q" : "Ctrl-C"}: ${result.stdout.match(/QUIT_LATENCY=[\d.]+s/)?.[0]}`,
       );
+    }
+  },
+);
+
+test(
+  "Quit returns working input to an interactive shell and repairs inherited raw or no-echo terminal modes",
+  { timeout: 120000 },
+  (t) => {
+    for (const scenario of [
+      "terminal-raw",
+      "terminal-noecho",
+      "shell",
+      "shell-function",
+    ]) {
+      const w = new Workspace(t);
+      write(path.join(w.a, "live.txt"), "version-one\n");
+      const result = w.command(
+        [
+          "python3",
+          path.join(ROOT, "tests/review-live-pty.py"),
+          w.a,
+          process.execPath,
+          CLI,
+          w.repo,
+          w.state,
+          path.join(w.root, "worktrees/example"),
+          scenario,
+        ],
+        { timeoutMs: 45000 },
+      );
+      assert.match(result.stdout, new RegExp(`PTY: ${scenario}.*passed`));
     }
   },
 );

@@ -60,12 +60,21 @@ test("help is specific and works without valid configuration or repository selec
   assert.match(workflow, /score\s+Rescore/);
   assert.doesNotMatch(workflow, /--provider|--policy|--base/);
   assert.match(w.rl(["workflow", "run", "--help"]).stdout, /--base/);
+  assert.match(w.rl(["pr", "--json", "--help"]).stdout, /Usage: rl pr/);
+  assert.match(
+    w.rl(["setup", "--dry-run", "--help"]).stdout,
+    /Usage: rl setup/,
+  );
   assert.match(w.rl(["setup", "shell", "--help"]).stdout, /rl setup shell/);
   assert.equal(read(file), before);
   assert.ok(!fs.existsSync(w.log));
   const bad = w.rl(["help", "pr", "unknown"], { ok: false });
   assert.match(bad.stderr, /Unknown help topic/);
   assert.equal(bad.stdout, "");
+  assert.match(
+    w.rl(["help", "switch", "bogus"], { ok: false }).stderr,
+    /Unknown help topic/,
+  );
 });
 
 test("invalid arguments print only the command's usage and options", (t) => {

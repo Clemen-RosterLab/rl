@@ -1,5 +1,27 @@
+import { spawnSync } from "node:child_process";
 import { PassThrough } from "node:stream";
 import { StringDecoder } from "node:string_decoder";
+
+/** Capture actual terminal attributes, including flags not represented by isRaw. */
+export function reviewTerminalSettings(
+  input: NodeJS.ReadStream & { fd: number },
+): () => void {
+  const stty = (args: string[]) =>
+    spawnSync("stty", args, {
+      stdio: [input.fd, "pipe", "ignore"],
+      encoding: "utf8",
+      env: { ...process.env, LC_ALL: "C" },
+      timeout: 500,
+      killSignal: "SIGKILL",
+    });
+  const saved = stty(["-g"]);
+  const settings = saved.status === 0 ? saved.stdout.trim() : undefined;
+  return () => {
+    if (settings) {
+      stty([settings]);
+    }
+  };
+}
 
 /** Keep in-flight terminal reports out of the shell during the mouse-off handoff. */
 export function drainReviewInput(
@@ -16,10 +38,16 @@ export function drainReviewInput(
       await new Promise<void>((resolve) => {
         const deadline = performance.now() + 150;
         const settle = () => {
-          const now = performance.now();
-          const remaining = Math.min(50 - (now - lastInput), deadline - now);
-          if (remaining <= 0) resolve();
-          else setTimeout(settle, Math.ceil(remaining));
+          const current = performance.now();
+          const remaining = Math.min(
+            50 - (current - lastInput),
+            deadline - current,
+          );
+          if (remaining <= 0) {
+            resolve();
+          } else {
+            setTimeout(settle, Math.ceil(remaining));
+          }
         };
         settle();
       });
@@ -28,26 +56,49 @@ export function drainReviewInput(
     }
   };
 }
+
 export interface ReviewMouse {
   x: number;
   y: number;
   button: number;
   release: boolean;
 }
+
 /** Remove mouse packets before readline can interpret their digits as shortcuts. */
 export class ReviewInput {
   readonly keys = new PassThrough();
   private decoder = new StringDecoder("utf8");
   private pending = "";
+  private discardingMouseTail = false;
   private timer?: ReturnType<typeof setTimeout>;
+
   constructor(private mouse: (event: ReviewMouse) => void) {}
+
   feed(data: Buffer): void {
     clearTimeout(this.timer);
     this.pending += this.decoder.write(data);
     this.drain();
   }
+
   private drain(): void {
     while (this.pending) {
+      if (this.discardingMouseTail) {
+        const tail = /^[\d;]*([Mm])/.exec(this.pending);
+        if (tail) {
+          this.pending = this.pending.slice(tail[0].length);
+          this.discardingMouseTail = false;
+          continue;
+        }
+        if (/^[\d;]+$/.test(this.pending) && this.pending.length < 64) {
+          this.timer = setTimeout(() => {
+            this.pending = "";
+            this.discardingMouseTail = false;
+          }, 100);
+          return;
+        }
+        this.discardingMouseTail = false;
+      }
+
       if (this.pending.startsWith("\x1b[<")) {
         const match = /^\x1b\[<(\d+);(\d+);(\d+)([Mm])/.exec(this.pending);
         if (match) {
@@ -63,6 +114,7 @@ export class ReviewInput {
         if (/^\x1b\[<[\d;]*$/.test(this.pending) && this.pending.length < 64) {
           this.timer = setTimeout(() => {
             this.pending = "";
+            this.discardingMouseTail = true;
           }, 100);
           return;
         }
@@ -71,6 +123,7 @@ export class ReviewInput {
         this.pending = end < 0 ? "" : this.pending.slice(end + 4);
         continue;
       }
+
       if (this.pending === "\x1b" || this.pending === "\x1b[") {
         this.timer = setTimeout(() => {
           const value = this.pending;
@@ -79,15 +132,18 @@ export class ReviewInput {
         }, 25);
         return;
       }
-      const next = this.pending.indexOf("\x1b", 1),
-        length = next < 0 ? this.pending.length : next;
+
+      const next = this.pending.indexOf("\x1b", 1);
+      const length = next < 0 ? this.pending.length : next;
       this.keys.write(this.pending.slice(0, length));
       this.pending = this.pending.slice(length);
     }
   }
+
   close(): void {
     clearTimeout(this.timer);
     this.pending = "";
+    this.discardingMouseTail = false;
     this.keys.destroy();
   }
 }
@@ -95,12 +151,16 @@ export class ReviewInput {
 /** Discard excess wheel packets instead of queuing a fling after scrolling stops. */
 export class ReviewWheel {
   private last = new Map<string, { direction: number; at: number }>();
+
   accept(target: string, direction: number, now = performance.now()): boolean {
     const previous = this.last.get(target);
-    if (previous?.direction === direction && now - previous.at < 60)
+    if (previous?.direction === direction && now - previous.at < 60) {
       return false;
+    }
     this.last.set(target, { direction, at: now });
-    if (this.last.size > 64) this.last.delete(this.last.keys().next().value!);
+    if (this.last.size > 64) {
+      this.last.delete(this.last.keys().next().value!);
+    }
     return true;
   }
 }

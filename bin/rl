@@ -1,2 +1,6 @@
-#!/usr/bin/env node
-await import('../dist/bootstrap.js');
+#!/bin/sh
+':' //; if [ -t 0 ] && [ -t 1 ]; then case " $* " in *" review "*) stty icanon echo isig icrnl 2>/dev/null; rl_review_tty=$(stty -g 2>/dev/null); trap 'test -z "$rl_review_tty" || stty "$rl_review_tty" 2>/dev/null' 0; trap 'exit 130' 2; trap 'exit 143' 15; trap 'exit 129' 1; node "$0" "$@"; exit "$?";; esac; fi; exec node "$0" "$@"
+// The shell guard restores input after Node's exit-time tty reset. This line
+// also remains valid JavaScript for callers that explicitly invoke node bin/rl.
+const { runPublicCli } = await import("../dist/public-cli.js");
+process.exitCode = await runPublicCli(process.argv.slice(2));

@@ -1,0 +1,14 @@
+{
+  "$schema": "https://unpkg.com/knip@5/schema.json",
+  "entry": [
+    "src/bootstrap.ts!",
+    "src/cli.ts!",
+    "src/help.ts!",
+    "src/install.ts!",
+    "src/dependencies.ts!",
+    "src/review-live-worker.ts!",
+    "tests/**/*.test.ts"
+  ],
+  "project": ["src/**/*.ts", "tests/**/*.ts"],
+  "ignoreDependencies": ["@types/proper-lockfile"]
+}

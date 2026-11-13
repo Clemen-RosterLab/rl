@@ -1,23 +1,25 @@
 import path from "node:path";
-import { stripVTControlCharacters } from "node:util";
-import { args, canonical, locked, message, json } from "./common.js";
 import { commandContext, contextOptions } from "./command-context.js";
+import { args, canonical, json, locked, message } from "./common.js";
+import { UsageError } from "./errors.js";
 import { GIT_WORKFLOW_DIRECTORY, GIT_WORKFLOW_LOCK } from "./git-safety.js";
 import { candidates, select } from "./picker.js";
 import { worktrees } from "./repos.js";
 import { cleanWorkspace, size, type CleanupReport } from "./storage.js";
+import { sanitizeTerminalText } from "./tui/ansi.js";
+import { selectMatchingItem } from "./workspaces/resolve.js";
 
-type Status = "cleaned" | "would-clean" | "unchanged" | "skipped" | "failed";
-interface Result {
+type CleanStatus =
+  "cleaned" | "would-clean" | "unchanged" | "skipped" | "failed";
+
+interface CleanWorktreeResult {
   name: string;
   branch: string;
   path: string;
-  status: Status;
+  status: CleanStatus;
   detail: string;
   cleanup?: CleanupReport;
 }
-const visible = (value: string) =>
-  stripVTControlCharacters(value).replace(/[\x00-\x1f\x7f-\x9f]/g, " ");
 
 export async function main(argv: string[]): Promise<number> {
   const { values, positionals } = args(argv, contextOptions, [
@@ -25,38 +27,43 @@ export async function main(argv: string[]): Promise<number> {
     "dry-run",
     "json",
   ]);
-  if (values.all && positionals.length)
-    throw new Error("--all cannot be combined with workspace names");
+  if (values.all && positionals.length > 0) {
+    throw new UsageError("--all cannot be combined with workspace names");
+  }
+
   const context = commandContext(values);
   const choices = candidates(context.repo, context.managedDir, context.store);
-  const selected = values.all
-    ? choices
-    : positionals.length
-      ? [
-          ...new Set(
-            positionals.map((name) => {
-              const matches = choices.filter(
-                (item) =>
-                  item.name === name ||
-                  item.branch === name ||
-                  (path.isAbsolute(name) && item.path === canonical(name)),
-              );
-              if (matches.length !== 1)
-                throw new Error(
-                  matches.length
-                    ? `Ambiguous RL worktree: ${name}; use its branch or absolute path`
-                    : `RL worktree not found: ${name}. Use rl list.`,
-                );
-              return matches[0];
-            }),
-          ),
-        ]
-      : await select(context.store, choices, context.defaultBase, "clean");
-  const dryRun = !!values["dry-run"];
+
+  let selected;
+  if (values.all) {
+    selected = choices;
+  } else if (positionals.length > 0) {
+    selected = [
+      ...new Set(
+        positionals.map((selector) =>
+          selectMatchingItem(choices, selector, {
+            ambiguousMessage: (s) =>
+              `Ambiguous RL worktree: ${s}; use its branch or absolute path`,
+            notFoundMessage: (s) => `RL worktree not found: ${s}. Use rl list.`,
+          }),
+        ),
+      ),
+    ];
+  } else {
+    selected = await select(
+      context.store,
+      choices,
+      context.defaultBase,
+      "clean",
+    );
+  }
+
+  const dryRun = Boolean(values["dry-run"]);
+
   const perform = async () => {
-    const results: Result[] = [];
+    const results: CleanWorktreeResult[] = [];
     for (const item of selected) {
-      const result: Result = {
+      const result: CleanWorktreeResult = {
         name: item.name,
         branch: item.branch,
         path: item.path,
@@ -64,71 +71,83 @@ export async function main(argv: string[]): Promise<number> {
         detail: "",
       };
       results.push(result);
+
       try {
         const current = worktrees(context.repo).find(
           (record) => canonical(record.worktree) === item.path,
         );
-        if (!current || current.branch !== `refs/heads/${item.branch}`)
+        if (!current || current.branch !== `refs/heads/${item.branch}`) {
           throw new Error(
             "Worktree branch changed or is unavailable; inspect it and retry",
           );
-        if ("locked" in current) throw new Error("Worktree is locked");
+        }
+        if ("locked" in current) {
+          throw new Error("Worktree is locked");
+        }
+
         result.status = "failed";
         result.cleanup = cleanWorkspace(context, item.path, dryRun, true);
-        result.status = result.cleanup.paths.length
-          ? dryRun
-            ? "would-clean"
-            : "cleaned"
-          : "unchanged";
-        result.detail = result.cleanup.paths.length
-          ? `${dryRun ? "Would remove" : "Removed"} ${result.cleanup.paths.join(", ")} (${size(result.cleanup.estimatedBytes)} estimated)`
-          : "No eligible generated directories";
+
+        if (result.cleanup.paths.length > 0) {
+          result.status = dryRun ? "would-clean" : "cleaned";
+          const verb = dryRun ? "Would remove" : "Removed";
+          result.detail = `${verb} ${result.cleanup.paths.join(", ")} (${size(result.cleanup.estimatedBytes)} estimated)`;
+        } else {
+          result.status = "unchanged";
+          result.detail = "No eligible generated directories";
+        }
       } catch (error) {
         result.detail = message(error);
       }
-      // Let the shared Git lock renew between large worktree cleanups.
+
+      // Yield between large worktrees so proper-lockfile heartbeats can run.
       await new Promise<void>((resolve) => setImmediate(resolve));
     }
+
     const summary = {
       selected: selected.length,
-      cleaned: results.filter((result) => result.status === "cleaned").length,
-      "would-clean": results.filter((result) => result.status === "would-clean")
+      cleaned: results.filter((row) => row.status === "cleaned").length,
+      "would-clean": results.filter((row) => row.status === "would-clean")
         .length,
-      unchanged: results.filter((result) => result.status === "unchanged")
-        .length,
-      skipped: results.filter((result) => result.status === "skipped").length,
-      failed: results.filter((result) => result.status === "failed").length,
+      unchanged: results.filter((row) => row.status === "unchanged").length,
+      skipped: results.filter((row) => row.status === "skipped").length,
+      failed: results.filter((row) => row.status === "failed").length,
       estimatedBytes: results.reduce(
-        (total, result) => total + (result.cleanup?.estimatedBytes ?? 0),
+        (total, row) => total + (row.cleanup?.estimatedBytes ?? 0),
         0,
       ),
     };
-    if (values.json)
+
+    if (values.json) {
       json({ repository: context.repo, dryRun, results, summary });
-    else {
-      if (!selected.length)
-        console.log("No RL worktrees selected for cleanup.");
-      else {
-        console.log(`\n${dryRun ? "Cleanup preview" : "Cleanup results"}\n`);
-        for (const result of results) {
-          console.log(`  ${visible(result.name)}  [${result.status}]`);
-          console.log(`    ${visible(result.detail)}`);
-        }
-        console.log(
-          `\n${summary.selected} worktree(s) · ${dryRun ? summary["would-clean"] + " would clean" : summary.cleaned + " cleaned"} · ${summary.unchanged} unchanged · ${summary.skipped} skipped · ${summary.failed} failed`,
-        );
-        console.log(
-          `Estimated ${dryRun ? "space to free" : "cleanup size"}: ${size(summary.estimatedBytes)}`,
-        );
+    } else if (selected.length === 0) {
+      console.log("No RL worktrees selected for cleanup.");
+    } else {
+      console.log(`\n${dryRun ? "Cleanup preview" : "Cleanup results"}\n`);
+      for (const row of results) {
+        console.log(`  ${sanitizeTerminalText(row.name)}  [${row.status}]`);
+        console.log(`    ${sanitizeTerminalText(row.detail)}`);
       }
-    }
-    return summary.skipped || summary.failed ? 1 : 0;
-  };
-  return dryRun || !selected.length
-    ? perform()
-    : locked(
-        path.join(context.store.root, GIT_WORKFLOW_DIRECTORY),
-        GIT_WORKFLOW_LOCK,
-        perform,
+      const actionSummary = dryRun
+        ? `${summary["would-clean"]} would clean`
+        : `${summary.cleaned} cleaned`;
+      console.log(
+        `\n${summary.selected} worktree(s) · ${actionSummary} · ${summary.unchanged} unchanged · ${summary.skipped} skipped · ${summary.failed} failed`,
       );
+      console.log(
+        `Estimated ${dryRun ? "space to free" : "cleanup size"}: ${size(summary.estimatedBytes)}`,
+      );
+    }
+
+    return summary.skipped > 0 || summary.failed > 0 ? 1 : 0;
+  };
+
+  if (dryRun || selected.length === 0) {
+    return perform();
+  }
+  return locked(
+    path.join(context.store.root, GIT_WORKFLOW_DIRECTORY),
+    GIT_WORKFLOW_LOCK,
+    perform,
+  );
 }

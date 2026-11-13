@@ -1,37 +1,40 @@
-import { fileURLToPath } from "node:url";
-import { Readable } from "node:stream";
 import path from "node:path";
-import { args, arity, message, required } from "./common.js";
+import { Readable } from "node:stream";
+import { fileURLToPath } from "node:url";
 import { activityView } from "./activity.js";
-import { contextText, Store } from "./store.js";
 import { agentAdapter } from "./agent-registry.js";
-import { currentSessionId } from "./session.js";
 import { syncCodexSessions } from "./codex-sessions.js";
-import { pauseTask, PAUSE_FIELDS } from "./task.js";
-import { HANDOFF_FIELDS, MAX_HANDOFF_TEXT } from "./task-state.js";
-import {
-  automationContext,
-  callWorkflowTool,
-  WORKFLOW_TOOLS,
-  workflowToolSchema,
-} from "./session-workflows.js";
-
+import { args, arity, message, required } from "./common.js";
+import { UsageError } from "./errors.js";
 import {
   isJsonObject,
   parseJson,
   readJsonObject,
   type JsonObject,
 } from "./json.js";
+import { currentSessionId } from "./session.js";
+import {
+  automationContext,
+  callWorkflowTool,
+  WORKFLOW_TOOLS,
+  workflowToolSchema,
+} from "./session-workflows.js";
+import { contextText, Store } from "./store.js";
+import { pauseTask, PAUSE_FIELDS } from "./task.js";
+import { HANDOFF_FIELDS, MAX_HANDOFF_TEXT } from "./task-state.js";
+
 const PROTOCOL_VERSION = "2025-11-25";
 const RPC_VERSION = "2.0";
 const MAX_MESSAGE_BYTES = 1024 * 1024;
 const MAX_NOTE_LENGTH = 64 * 1024;
+
 const ERROR = {
   parse: -32700,
   request: -32600,
   method: -32601,
   params: -32602,
-};
+} as const;
+
 const TOOLS = [
   {
     name: "rl_task_pause",
@@ -71,14 +74,17 @@ const TOOLS = [
     description: "Append a milestone or handoff update to shared progress.",
     append: true,
   },
-];
+] as const;
 
 async function* readMessages(input: Readable): AsyncGenerator<string | null> {
   let parts: Buffer[] = [];
   let size = 0;
   let oversized = false;
+
   for await (const chunk of input) {
-    if (!Buffer.isBuffer(chunk)) throw new Error("MCP input must be bytes");
+    if (!Buffer.isBuffer(chunk)) {
+      throw new Error("MCP input must be bytes");
+    }
     let start = 0;
     while (start < chunk.length) {
       const newline = chunk.indexOf("\n", start);
@@ -94,7 +100,9 @@ async function* readMessages(input: Readable): AsyncGenerator<string | null> {
           size += length;
         }
       }
-      if (newline < 0) break;
+      if (newline < 0) {
+        break;
+      }
       yield oversized ? null : Buffer.concat(parts, size).toString("utf8");
       parts = [];
       size = 0;
@@ -102,8 +110,75 @@ async function* readMessages(input: Readable): AsyncGenerator<string | null> {
       start = newline + 1;
     }
   }
-  if (oversized || size)
+  if (oversized || size > 0) {
     yield oversized ? null : Buffer.concat(parts, size).toString("utf8");
+  }
+}
+
+function buildCoreToolDescriptor(tool: (typeof TOOLS)[number]): JsonObject {
+  let properties: JsonObject = {};
+  if (tool.name === "rl_task_pause") {
+    properties = {
+      ...Object.fromEntries(
+        HANDOFF_FIELDS.map((field) => [
+          field,
+          {
+            type: "string",
+            maxLength: MAX_HANDOFF_TEXT,
+            ...(field === "blockers" ? {} : { minLength: 1 }),
+          },
+        ]),
+      ),
+      agent: { type: "string", enum: ["codex", "claude", "agy"] },
+      sessionId: {
+        type: "string",
+        description: "Full UUID of the current conversation.",
+      },
+    };
+  } else if (tool.name === "rl_session_save") {
+    properties = {
+      agent: { type: "string", enum: ["codex", "claude", "agy"] },
+      sessionId: {
+        type: "string",
+        description: "Full session UUID; never a name or prefix.",
+      },
+    };
+  } else if (tool.append) {
+    properties = {
+      text: {
+        type: "string",
+        minLength: 1,
+        maxLength: MAX_NOTE_LENGTH,
+      },
+    };
+  }
+
+  const requiredFields =
+    tool.name === "rl_task_pause"
+      ? ["summary", "changes", "validation", "next"]
+      : tool.append
+        ? ["text"]
+        : [];
+
+  return {
+    name: tool.name,
+    description: tool.description,
+    inputSchema: {
+      type: "object",
+      properties,
+      required: requiredFields,
+      additionalProperties: false,
+    },
+    annotations: {
+      readOnlyHint:
+        !tool.append &&
+        tool.name !== "rl_session_save" &&
+        tool.name !== "rl_status" &&
+        tool.name !== "rl_task_pause",
+      destructiveHint: false,
+      openWorldHint: false,
+    },
+  };
 }
 
 async function callTool(
@@ -112,33 +187,42 @@ async function callTool(
   input: JsonObject,
 ): Promise<string> {
   const name = tool.name;
-  const session = name === "rl_session_save";
-  const allowed = session
-    ? ["agent", "sessionId"]
-    : name === "rl_task_pause"
-      ? PAUSE_FIELDS
-      : tool.append
-        ? ["text"]
-        : [];
-  if (Object.keys(input).some((key) => !allowed.includes(key)))
+  const allowed: readonly string[] =
+    name === "rl_session_save"
+      ? ["agent", "sessionId"]
+      : name === "rl_task_pause"
+        ? PAUSE_FIELDS
+        : tool.append
+          ? ["text"]
+          : [];
+
+  if (Object.keys(input).some((key) => !allowed.includes(key))) {
     throw new Error("Unexpected tool argument");
-  if (name === "rl_task_pause")
+  }
+  if (name === "rl_task_pause") {
     return JSON.stringify(await pauseTask(store, input));
+  }
+
   const text = input.text;
   if (
     tool.append &&
     (typeof text !== "string" || !text.trim() || text.length > MAX_NOTE_LENGTH)
-  )
+  ) {
     throw new Error(
       `text must be non-empty and at most ${MAX_NOTE_LENGTH} characters`,
     );
-  if (name === "rl_status") await syncCodexSessions(store, process.cwd());
+  }
+  if (name === "rl_status") {
+    await syncCodexSessions(store, process.cwd());
+  }
+
   return store.locked(() => {
     const [file, data] = store.current();
     switch (name) {
       case "rl_session_save": {
-        if (input.agent !== undefined && typeof input.agent !== "string")
+        if (input.agent !== undefined && typeof input.agent !== "string") {
           throw new Error("agent must be codex, claude or agy");
+        }
         const agent = agentAdapter(input.agent ?? "codex").name;
         const sid = currentSessionId(agent, input.sessionId);
         store.recordSession(file, data, agent, sid);
@@ -164,7 +248,9 @@ async function callTool(
       case "rl_progress":
         return store.readDocument(file, "progress");
       default: {
-        if (typeof text !== "string") throw new Error("text is required");
+        if (typeof text !== "string") {
+          throw new Error("text is required");
+        }
         store.updateDocument(
           file,
           data,
@@ -182,134 +268,89 @@ export async function serveMcp(store: Store): Promise<number> {
   const metadata = readJsonObject(
     fileURLToPath(new URL("../package.json", import.meta.url)),
   );
-  if (typeof metadata.version !== "string")
+  if (typeof metadata.version !== "string") {
     throw new Error("Invalid package version");
+  }
   const version = metadata.version;
   let initialized = false;
   let ready = false;
+
   for await (const line of readMessages(process.stdin)) {
     let id: string | number | null = null;
-    let code = ERROR.parse;
+    let code: number = ERROR.parse;
     try {
-      if (line === null) throw new Error("Message too large");
+      if (line === null) {
+        throw new Error("Message too large");
+      }
       const raw = parseJson(line);
       code = ERROR.request;
       if (
         !isJsonObject(raw) ||
         raw.jsonrpc !== RPC_VERSION ||
         typeof raw.method !== "string"
-      )
+      ) {
         throw new Error("Invalid JSON-RPC request");
+      }
       if (
         raw.id !== undefined &&
         typeof raw.id !== "string" &&
         typeof raw.id !== "number"
-      )
+      ) {
         throw new Error("Invalid request id");
+      }
       if (raw.id === undefined) {
-        if (raw.method === "notifications/initialized" && initialized)
+        if (raw.method === "notifications/initialized" && initialized) {
           ready = true;
+        }
         continue;
       }
+
       id = raw.id;
       const params = raw.params ?? {};
       code = ERROR.params;
-      if (!isJsonObject(params)) throw new Error("params must be an object");
+      if (!isJsonObject(params)) {
+        throw new Error("params must be an object");
+      }
+
       let result: JsonObject;
       if (raw.method === "initialize") {
-        if (initialized) throw new Error("Already initialized");
+        if (initialized) {
+          throw new Error("Already initialized");
+        }
         if (
           typeof params.protocolVersion !== "string" ||
           !isJsonObject(params.capabilities) ||
           !isJsonObject(params.clientInfo) ||
           typeof params.clientInfo.name !== "string" ||
           typeof params.clientInfo.version !== "string"
-        )
+        ) {
           throw new Error("Invalid initialization parameters");
+        }
         initialized = true;
+        let instructions =
+          "Use RL tools for the current workspace's shared context and sessions.";
+        try {
+          instructions =
+            automationContext(store.current()[1].worktree) || instructions;
+        } catch {
+          // Allow initialization even if branch diverged; tool calls surface concrete state errors.
+        }
         result = {
           protocolVersion: PROTOCOL_VERSION,
           capabilities: { tools: {} },
           serverInfo: { name: "rl", version },
-          instructions:
-            automationContext(store.current()[1].worktree) ||
-            "Use RL tools for the current workspace's shared context and sessions.",
+          instructions,
         };
-      } else if (raw.method === "ping") result = {};
-      else {
-        if (!ready) throw new Error("Initialize before using tools");
+      } else if (raw.method === "ping") {
+        result = {};
+      } else {
+        if (!ready) {
+          throw new Error("Initialize before using tools");
+        }
         if (raw.method === "tools/list") {
           result = {
             tools: [
-              ...TOOLS.map((tool): JsonObject => ({
-                name: tool.name,
-                description: tool.description,
-                inputSchema: {
-                  type: "object",
-                  properties:
-                    tool.name === "rl_task_pause"
-                      ? {
-                          ...Object.fromEntries(
-                            HANDOFF_FIELDS.map((field) => [
-                              field,
-                              {
-                                type: "string",
-                                maxLength: MAX_HANDOFF_TEXT,
-                                ...(field === "blockers"
-                                  ? {}
-                                  : { minLength: 1 }),
-                              },
-                            ]),
-                          ),
-                          agent: {
-                            type: "string",
-                            enum: ["codex", "claude", "agy"],
-                          },
-                          sessionId: {
-                            type: "string",
-                            description:
-                              "Full UUID of the current conversation.",
-                          },
-                        }
-                      : tool.name === "rl_session_save"
-                        ? {
-                            agent: {
-                              type: "string",
-                              enum: ["codex", "claude", "agy"],
-                            },
-                            sessionId: {
-                              type: "string",
-                              description:
-                                "Full session UUID; never a name or prefix.",
-                            },
-                          }
-                        : tool.append
-                          ? {
-                              text: {
-                                type: "string",
-                                minLength: 1,
-                                maxLength: MAX_NOTE_LENGTH,
-                              },
-                            }
-                          : {},
-                  required:
-                    tool.name === "rl_task_pause"
-                      ? ["summary", "changes", "validation", "next"]
-                      : tool.append
-                        ? ["text"]
-                        : [],
-                  additionalProperties: false,
-                },
-                annotations: {
-                  readOnlyHint:
-                    !tool.append &&
-                    tool.name !== "rl_session_save" &&
-                    tool.name !== "rl_status" &&
-                    tool.name !== "rl_task_pause",
-                  destructiveHint: false,
-                  openWorldHint: false,
-                },
-              })),
+              ...TOOLS.map(buildCoreToolDescriptor),
               ...WORKFLOW_TOOLS.map((tool) => ({
                 name: tool.name,
                 description: tool.description,
@@ -326,14 +367,16 @@ export async function serveMcp(store: Store): Promise<number> {
           if (
             typeof params.name !== "string" ||
             (params.arguments !== undefined && !isJsonObject(params.arguments))
-          )
+          ) {
             throw new Error("Invalid tool call");
+          }
           const tool = TOOLS.find((item) => item.name === params.name);
           const workflowTool = WORKFLOW_TOOLS.find(
             (item) => item.name === params.name,
           );
-          if (!tool && !workflowTool)
+          if (!tool && !workflowTool) {
             throw new Error(`Unknown tool: ${params.name}`);
+          }
           try {
             const text = workflowTool
               ? JSON.stringify(
@@ -356,16 +399,17 @@ export async function serveMcp(store: Store): Promise<number> {
           throw new Error("Method not found");
         }
       }
+
       process.stdout.write(
-        JSON.stringify({ jsonrpc: RPC_VERSION, id, result }) + "\n",
+        `${JSON.stringify({ jsonrpc: RPC_VERSION, id, result })}\n`,
       );
     } catch (error) {
       process.stdout.write(
-        JSON.stringify({
+        `${JSON.stringify({
           jsonrpc: RPC_VERSION,
           id,
           error: { code, message: message(error) },
-        }) + "\n",
+        })}\n`,
       );
     }
   }
@@ -385,10 +429,11 @@ export async function main(argv: string[]): Promise<number> {
   );
   if (values.workspace !== undefined) {
     const workspace = required(values, "workspace");
-    if (!path.isAbsolute(workspace))
-      throw new Error("Expected an absolute MCP workspace path");
-    const [, instance] = store.current(workspace);
-    process.chdir(instance.worktree);
+    if (!path.isAbsolute(workspace)) {
+      throw new UsageError("Expected an absolute MCP workspace path");
+    }
+    const [root] = store.worktree(workspace);
+    process.chdir(root);
   }
   return serveMcp(store);
 }

@@ -241,10 +241,22 @@ _rl_main() {
     review|feedback)
       local review_command="$command"
       shift
-      command node "${${functions_source[_rl_main]}:A:h:h}/dist/cli.js" "$review_command" \
-        --repo "$repo_root" --state-dir "$state_dir" --base-dir "$base_dir/$repo_name" \
-        --default-base "$default_base" "$@"
-      return ;;
+      local review_tty='' review_result=0
+      if [[ "$review_command" == review && -t 0 && -t 1 ]]; then
+        # Keep terminal ownership outside Node's final stdio reset, including
+        # when this command is called through the interactive rl() function.
+        command stty icanon echo isig icrnl 2>/dev/null
+        review_tty=$(command stty -g 2>/dev/null)
+      fi
+      {
+        command node "${${functions_source[_rl_main]}:A:h:h}/dist/cli.js" "$review_command" \
+          --repo "$repo_root" --state-dir "$state_dir" --base-dir "$base_dir/$repo_name" \
+          --default-base "$default_base" "$@"
+        review_result=$?
+      } always {
+        [[ -z "$review_tty" ]] || command stty "$review_tty" 2>/dev/null
+      }
+      return "$review_result" ;;
     clean)
       shift
       command node "${${functions_source[_rl_main]}:A:h:h}/dist/cli.js" clean \

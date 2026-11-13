@@ -1,6 +1,6 @@
-import { pullRequestBase } from "./base.js";
 import fs from "node:fs";
 import path from "node:path";
+import { pullRequestBase } from "./base.js";
 import {
   args,
   arity,
@@ -13,56 +13,55 @@ import {
   now,
   required,
 } from "./common.js";
-import { branchStatus, Instance, Store } from "./store.js";
+import { UsageError } from "./errors.js";
+import { resolveBaseRef } from "./git/base.js";
+import { branchStatus, type Instance, Store } from "./store.js";
 import { NOTE_TEMPLATES } from "./templates.js";
-const longest = (text: string): number =>
+
+const longestBackticks = (text: string): number =>
   Math.max(0, ...Array.from(text.matchAll(/`+/g), (match) => match[0].length));
+
 function fence(text: string): string {
-  const delimiter = "`".repeat(Math.max(3, longest(text) + 1));
+  const delimiter = "`".repeat(Math.max(3, longestBackticks(text) + 1));
   return `${delimiter}text\n${text.trimEnd()}\n${delimiter}`;
 }
-function inline(text: string): string {
-  text = text.replaceAll("\n", "\\n").replaceAll("\r", "\\r");
-  const delimiter = "`".repeat(longest(text) + 1);
-  return `${delimiter} ${text} ${delimiter}`;
+
+function inlineCode(text: string): string {
+  const escaped = text.replaceAll("\n", "\\n").replaceAll("\r", "\\r");
+  const delimiter = "`".repeat(longestBackticks(escaped) + 1);
+  return `${delimiter} ${escaped} ${delimiter}`;
 }
-function quote(text: string): string {
-  return text.trimEnd()
-    ? text
-        .trimEnd()
-        .split(/\r?\n/)
-        .map((line) => (line ? "> " + line : ">"))
-        .join("\n")
-    : "> No notes recorded.";
+
+function markdownBlockquote(text: string): string {
+  if (!text.trimEnd()) {
+    return "> No notes recorded.";
+  }
+  return text
+    .trimEnd()
+    .split(/\r?\n/)
+    .map((line) => (line ? `> ${line}` : ">"))
+    .join("\n");
 }
-function resolveBase(
+
+function resolveComparisonBase(
   root: string,
   requested: string,
   explicit: boolean,
 ): [string | null, string | null] {
-  const candidates = [requested];
-  if (!requested.startsWith("origin/")) candidates.push("origin/" + requested);
-  else if (!explicit) candidates.push(requested.slice(7));
-  for (const candidate of candidates) {
-    try {
-      return [
-        candidate,
-        git(
-          root,
-          "rev-parse",
-          "--verify",
-          "--end-of-options",
-          candidate + "^{commit}",
-        ),
-      ];
-    } catch {
-      /* Try local/remote fallback. */
-    }
+  const resolved = resolveBaseRef(root, requested, {
+    prefer: "local",
+    allowLocalFallbackForExplicitOrigin: !explicit,
+  });
+  if (resolved) {
+    return [resolved.ref, resolved.oid];
   }
-  if (explicit) throw new Error(`Comparison base does not exist: ${requested}`);
+  if (explicit) {
+    throw new Error(`Comparison base does not exist: ${requested}`);
+  }
   return [null, null];
 }
-function render(
+
+function renderSummaryMarkdown(
   store: Store,
   data: Instance,
   context: string,
@@ -70,38 +69,46 @@ function render(
   defaultBase: string,
   requested?: string,
 ): string {
-  const root = data.worktree,
-    status = branchStatus(store.repo, data);
-  if (status.availability !== "ok")
+  const root = data.worktree;
+  const status = branchStatus(store.repo, data);
+  if (status.availability !== "ok") {
     throw new Error(status.error || "Worktree is unavailable");
-  if (status.branchChanged)
+  }
+  if (status.branchChanged) {
     throw new Error(
       "The checked-out branch changed while preparing the summary; retry on the instance branch",
     );
+  }
+
   const head = git(root, "rev-parse", "--verify", "HEAD^{commit}");
   const prBase = requested ? null : pullRequestBase(store.repo, data.pr);
   const comparison =
     requested ||
     prBase?.target ||
     (typeof data.baseBranch === "string" ? data.baseBranch : defaultBase);
-  if (prBase && !prBase.resolved)
+
+  if (prBase && !prBase.resolved) {
     throw new Error(
       `PR target branch is unavailable locally: ${prBase.target}. Fetch its ref or refresh the snapshot with 'rl pr sync'.`,
     );
+  }
+
   const [base, baseOid] = prBase?.resolved
     ? [prBase.resolved.ref, prBase.resolved.oid]
-    : resolveBase(root, comparison, !!requested);
+    : resolveComparisonBase(root, comparison, Boolean(requested));
+
   const parts = [
     "# RL worktree summary",
     `Generated: ${now()}`,
-    `- Instance: ${inline(data.id)}\n- Repository: ${inline(store.repo)}\n- Worktree: ${inline(root)}\n- Branch: ${inline(data.branch)}\n- HEAD: ${inline(head)}`,
+    `- Instance: ${inlineCode(data.id)}\n- Repository: ${inlineCode(store.repo)}\n- Worktree: ${inlineCode(root)}\n- Branch: ${inlineCode(data.branch)}\n- HEAD: ${inlineCode(head)}`,
     "This report combines saved documentation with local Git evidence. Recorded progress is authored by you or your agents; commits and file changes do not establish completion or successful validation. No agent was called and no remote state was fetched. Git data is sampled while the command runs.",
     "## Recorded implementation progress",
-    quote(progress),
+    markdownBlockquote(progress),
     "## Feature and domain context",
-    quote(context),
+    markdownBlockquote(context),
     "## Committed work",
   ];
+
   if (baseOid && base) {
     let mergeBase: string;
     try {
@@ -112,7 +119,7 @@ function render(
       );
     }
     parts.push(
-      `Comparison reference: ${inline(base)} (${inline(baseOid)}). Changes are measured from its merge-base with HEAD: ${inline(mergeBase)}.`,
+      `Comparison reference: ${inlineCode(base)} (${inlineCode(baseOid)}). Changes are measured from its merge-base with HEAD: ${inlineCode(mergeBase)}.`,
     );
     const commits = git(
       root,
@@ -140,14 +147,17 @@ function render(
       "### Committed file changes",
       changes ? fence(changes) : "No net committed file changes.",
     );
-  } else
+  } else {
     parts.push(
-      `The configured comparison base ${inline(comparison)} could not be resolved. Committed work was omitted; run \`rl notes summary --base <branch-or-commit>\` to include it.`,
+      `The configured comparison base ${inlineCode(comparison)} could not be resolved. Committed work was omitted; run \`rl notes summary --base <branch-or-commit>\` to include it.`,
     );
+  }
+
   parts.push(
     "## Uncommitted work",
     `Git status entries: ${status.staged} staged, ${status.unstaged} unstaged, ${status.untracked} untracked, ${status.conflicts} conflicts. An untracked directory counts as one status entry.`,
   );
+
   for (const [title, flags] of [
     ["Staged changes", ["--cached"]],
     ["Unstaged changes", []],
@@ -161,34 +171,47 @@ function render(
       "--stat",
       "--",
     );
-    parts.push("### " + title, changes ? fence(changes) : "None.");
+    parts.push(`### ${title}`, changes ? fence(changes) : "None.");
   }
-  const files = gitRaw(root, "ls-files", "--others", "--exclude-standard", "-z")
+
+  const untrackedFiles = gitRaw(
+    root,
+    "ls-files",
+    "--others",
+    "--exclude-standard",
+    "-z",
+  )
     .split("\0")
     .filter(Boolean);
+
   parts.push(
     "### Untracked files",
-    files.length
-      ? fence(files.map((name) => JSON.stringify(name)).join("\n"))
+    untrackedFiles.length > 0
+      ? fence(untrackedFiles.map((name) => JSON.stringify(name)).join("\n"))
       : "None.",
     "## Upstream status",
   );
-  parts.push(
-    status.upstream
-      ? `Upstream: ${inline(status.upstream)}. ` +
-          (status.ahead !== null
-            ? `Ahead ${status.ahead}, behind ${status.behind} using locally cached refs.`
-            : "Ahead/behind counts are unavailable.")
-      : "No upstream is configured for this branch.",
-  );
+
+  if (status.upstream) {
+    const syncDetail =
+      status.ahead !== null
+        ? `Ahead ${status.ahead}, behind ${status.behind} using locally cached refs.`
+        : "Ahead/behind counts are unavailable.";
+    parts.push(`Upstream: ${inlineCode(status.upstream)}. ${syncDetail}`);
+  } else {
+    parts.push("No upstream is configured for this branch.");
+  }
+
   parts.push(
     "## Pull request (cached)",
     data.pr
       ? fence(JSON.stringify(data.pr, null, 2))
       : "No PR snapshot saved. Use `rl pr sync` to associate or refresh one.",
   );
-  return parts.join("\n\n") + "\n";
+
+  return `${parts.join("\n\n")}\n`;
 }
+
 export async function main(argv: string[]): Promise<number> {
   const { values, positionals } = args(
     argv,
@@ -197,66 +220,92 @@ export async function main(argv: string[]): Promise<number> {
     { output: "o" },
   );
   arity(positionals, 0);
-  if (values.force && !values.output)
-    throw new Error("--force is only needed with --output");
-  if (values.stdout && values.output)
-    throw new Error("Choose --stdout or --output");
+  if (values.force && !values.output) {
+    throw new UsageError("--force is only needed with --output");
+  }
+  if (values.stdout && values.output) {
+    throw new UsageError("Choose --stdout or --output");
+  }
+
   const store = new Store(
     required(values, "repo"),
     required(values, "state-dir"),
   );
-  const { file, data, context, progress } = await store.locked(() => {
-    const [file, data] = store.current();
-    const note = (name: string) => {
-      const text = fs.readFileSync(path.join(path.dirname(file), name), "utf8");
+
+  const {
+    file: instanceFile,
+    data: instanceData,
+    context,
+    progress,
+  } = await store.locked(() => {
+    const [currentFile, currentData] = store.current();
+    const readNote = (name: string) => {
+      const text = fs.readFileSync(
+        path.join(path.dirname(currentFile), name),
+        "utf8",
+      );
       return text === NOTE_TEMPLATES[name] ? "" : text;
     };
     return {
-      file,
-      data,
-      context: note("context.md"),
-      progress: note("progress.md"),
+      file: currentFile,
+      data: currentData,
+      context: readNote("context.md"),
+      progress: readNote("progress.md"),
     };
   });
-  const report = render(
+
+  const report = renderSummaryMarkdown(
     store,
-    data,
+    instanceData,
     context,
     progress,
     required(values, "default-base"),
     typeof values.base === "string" ? values.base : undefined,
   );
+
   if (values.stdout) {
     process.stdout.write(report);
     return 0;
   }
+
   const target = values.output
     ? path.resolve(expandHome(String(values.output)))
-    : path.join(path.dirname(file), "summary.md");
-  if (path.extname(target).toLowerCase() !== ".md")
-    throw new Error("Summary output must have a .md extension");
-  if (isSymlink(target))
+    : path.join(path.dirname(instanceFile), "summary.md");
+
+  if (path.extname(target).toLowerCase() !== ".md") {
+    throw new UsageError("Summary output must have a .md extension");
+  }
+  if (isSymlink(target)) {
     throw new Error(`Refusing to overwrite a symlink: ${target}`);
+  }
   if (
     ["context.md", "progress.md"].some(
       (name) =>
-        canonical(target) === canonical(path.join(path.dirname(file), name)),
+        canonical(target) ===
+        canonical(path.join(path.dirname(instanceFile), name)),
     )
-  )
+  ) {
     throw new Error(
       "Summary output cannot replace the instance's source documentation",
     );
+  }
+
   if (values.output && !values.force) {
     try {
       fs.writeFileSync(target, report, { flag: "wx" });
     } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === "EEXIST")
+      if ((error as NodeJS.ErrnoException).code === "EEXIST") {
         throw new Error(
           `Output already exists: ${target}. Use --force to replace it`,
+          { cause: error },
         );
+      }
       throw error;
     }
-  } else atomicWrite(target, report);
+  } else {
+    atomicWrite(target, report);
+  }
+
   console.log(target);
   return 0;
 }

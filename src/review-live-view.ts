@@ -1,10 +1,18 @@
 import path from "node:path";
 import { visible } from "./review-terminal.js";
 import type { Commit, Mode, ReviewFile } from "./review-live-engine.js";
-import { reviewFilterCategories, type ReviewFileFilters } from "./review-live-files.js";
+import {
+  reviewFilterCategories,
+  advancedReviewFilters,
+  type ReviewFileFilters,
+  type ReviewSettings,
+} from "./review-live-files.js";
+import type { ReviewRanks } from "./review-ranking.js";
 
-const foreground = (hex: string) => `\x1b[38;2;${rgb(hex)}m`;
-const background = (hex: string) => `\x1b[48;2;${rgb(hex)}m`;
+const foreground = (hex: string) =>
+  process.env.NO_COLOR ? "" : `\x1b[38;2;${rgb(hex)}m`;
+const background = (hex: string) =>
+  process.env.NO_COLOR ? "" : `\x1b[48;2;${rgb(hex)}m`;
 function rgb(hex: string): string {
   return [0, 2, 4].map((i) => parseInt(hex.slice(i, i + 2), 16)).join(";");
 }
@@ -120,9 +128,10 @@ export interface ReviewLayout {
 export function reviewLayout(
   width: number,
   rows: number,
-  focus: number,
+  _focus: number,
   expanded = false,
   sidebarWidth?: number,
+  gutterWidth = 0,
 ): ReviewLayout {
   width = Math.max(1, width);
   rows = Math.max(1, rows);
@@ -171,9 +180,9 @@ export function reviewLayout(
     height: body.height,
   };
   const viewport = {
-    x: diff.x + 1,
+    x: diff.x + 1 + gutterWidth,
     y: diff.y + 3,
-    width: Math.max(1, diff.width - 3),
+    width: Math.max(1, diff.width - 3 - gutterWidth),
     height: Math.max(1, diff.height - 5),
   };
   const divider = narrow
@@ -201,6 +210,7 @@ export interface HitRegion extends Rect {
     | "scrollbar"
     | "divider"
     | "filter-category"
+    | "menu"
     | "working"
     | "expand"
     | "shortcut";
@@ -214,7 +224,19 @@ export interface ReviewView {
   expanded: boolean;
   sidebarWidth?: number;
   textSelection?: ReviewTextSelection;
-  filterMenu?: { filters: ReviewFileFilters; index: number };
+  filterMenu?: {
+    filters: ReviewFileFilters;
+    index: number;
+    settings?: ReviewSettings;
+  };
+  menu?: ReviewMenu;
+  reviewed?: Set<string>;
+  changedSinceViewed?: Set<string>;
+  ranks?: ReviewRanks;
+  fullFile?: boolean;
+  beforeFile?: boolean;
+  lineNumbers?: boolean;
+  previewLabel?: string;
   branch: string;
   head: string;
   frozen: boolean;
@@ -240,6 +262,13 @@ export interface ReviewView {
   remote: string;
   pr?: string;
   updates: number;
+}
+export interface ReviewMenu {
+  title: string;
+  subtitle?: string;
+  index: number;
+  items: { label: string; detail?: string }[];
+  hint?: string;
 }
 export interface ReviewFrame {
   rows: string[];
@@ -271,6 +300,33 @@ export function reviewScrollbar(
   return { limit, thumbSize, thumbStart, travel };
 }
 
+const lineNumberCache = new WeakMap<
+  string[],
+  [number | undefined, number | undefined][]
+>();
+export function reviewLineNumbers(
+  lines: string[],
+): [number | undefined, number | undefined][] {
+  const cached = lineNumberCache.get(lines);
+  if (cached) return cached;
+  let old = 0,
+    next = 0,
+    inHunk = false;
+  const result = lines.map((line): [number | undefined, number | undefined] => {
+    const hunk = /^@@ -(\d+)(?:,\d+)? \+(\d+)/.exec(line);
+    if (hunk) {
+      old = Number(hunk[1]);
+      next = Number(hunk[2]);
+      inHunk = true;
+    } else if (line.startsWith("diff --git ")) inHunk = false;
+    else if (inHunk && line.startsWith("+")) return [undefined, next++];
+    else if (inHunk && line.startsWith("-")) return [old++, undefined];
+    else if (inHunk && line.startsWith(" ")) return [old++, next++];
+    return [undefined, undefined];
+  });
+  lineNumberCache.set(lines, result);
+  return result;
+}
 const diffColors = new WeakMap<string[], Uint8Array>();
 function diffLineColors(lines: string[]): Uint8Array {
   const cached = diffColors.get(lines);
@@ -295,6 +351,7 @@ export function reviewFrame(view: ReviewView): ReviewFrame {
       view.focus,
       view.expanded,
       view.sidebarWidth,
+      view.lineNumbers ? 12 : 0,
     ),
     palette = reviewPalette;
   const spans: {
@@ -318,15 +375,40 @@ export function reviewFrame(view: ReviewView): ReviewFrame {
     selection?: { from: number; to: number },
   ): void {
     if (y < 0 || y >= layout.rows || x >= layout.width || width <= 0) return;
-    spans[y].push({
-      x: Math.max(0, x),
-      width: Math.min(width, layout.width - x),
+    const clampedX = Math.max(0, x);
+    const clampedWidth = Math.min(width, layout.width - clampedX);
+    if (clampedWidth <= 0) return;
+    const newEnd = clampedX + clampedWidth;
+    const nextRow: (typeof spans)[number] = [];
+    for (const existing of spans[y]) {
+      const existingEnd = existing.x + existing.width;
+      if (existingEnd <= clampedX || existing.x >= newEnd) {
+        nextRow.push(existing);
+        continue;
+      }
+      if (existing.x < clampedX) {
+        nextRow.push({ ...existing, width: clampedX - existing.x });
+      }
+      if (existingEnd > newEnd) {
+        const delta = newEnd - existing.x;
+        nextRow.push({
+          ...existing,
+          x: newEnd,
+          width: existingEnd - newEnd,
+          offset: existing.offset + delta,
+        });
+      }
+    }
+    nextRow.push({
+      x: clampedX,
+      width: clampedWidth,
       text,
       fg,
       bg,
       offset,
       selection,
     });
+    spans[y] = nextRow;
   }
   const rule = (rect: Rect, y = rect.y) =>
     paint(rect.x, y, rect.width, "─".repeat(rect.width), palette.border);
@@ -389,8 +471,21 @@ export function reviewFrame(view: ReviewView): ReviewFrame {
     palette.muted,
   );
   if (filterX + filterButton.length < testToggleX) {
-    paint(filterX, 1, filterButton.length, filterButton, view.filterMenu ? palette.blue : palette.muted);
-    hits.push({ x: filterX, y: 1, width: filterButton.length, height: 1, action: "shortcut", shortcut: "T" });
+    paint(
+      filterX,
+      1,
+      filterButton.length,
+      filterButton,
+      view.filterMenu ? palette.blue : palette.muted,
+    );
+    hits.push({
+      x: filterX,
+      y: 1,
+      width: filterButton.length,
+      height: 1,
+      action: "shortcut",
+      shortcut: "T",
+    });
   }
   paint(
     testToggleX,
@@ -480,7 +575,11 @@ export function reviewFrame(view: ReviewView): ReviewFrame {
   }
   function files(): void {
     const rect = layout.files;
-    heading(rect, "2 FILES IN SELECTION", view.focus === 1);
+    heading(
+      rect,
+      `2 FILES IN SELECTION${view.reviewed ? ` · ${view.files.filter((file) => view.reviewed!.has(file.key)).length}/${view.files.length} reviewed` : ""}`,
+      view.focus === 1,
+    );
     hits.push({ ...rect, action: "files" });
     const capacity = Math.max(1, Math.floor((rect.height - 2) / 2)),
       start = listStart(view.fileIndex, capacity);
@@ -498,7 +597,7 @@ export function reviewFrame(view: ReviewView): ReviewFrame {
       line(
         rect,
         y,
-        `${file.status} ${file.oldPath ? path.basename(file.oldPath) + " → " : ""}${path.basename(file.path)}`,
+        `${view.reviewed?.has(file.key) ? "✓ " : view.changedSinceViewed?.has(file.key) ? "● " : ""}${file.status} ${file.oldPath ? path.basename(file.oldPath) + " → " : ""}${path.basename(file.path)}`,
         active ? palette.blue : tone,
         active,
       );
@@ -585,25 +684,109 @@ export function reviewFrame(view: ReviewView): ReviewFrame {
       viewport = layout.viewport,
       file = view.files[view.fileIndex],
       lines = view.help ?? view.lines;
+    if (view.menu) {
+      heading(rect, view.menu.title, true);
+      paint(
+        rect.x,
+        rect.y + 1,
+        rect.width,
+        view.menu.subtitle ?? "",
+        palette.muted,
+      );
+      const capacity = Math.max(1, Math.floor((rect.height - 5) / 2));
+      const start = Math.min(
+        listStart(view.menu.index, capacity),
+        Math.max(0, view.menu.items.length - capacity),
+      );
+      for (let row = 0; row < capacity; row++) {
+        const index = start + row,
+          item = view.menu.items[index];
+        if (!item) break;
+        const y = rect.y + 3 + row * 2,
+          selected = index === view.menu.index;
+        line(
+          rect,
+          y,
+          item.label,
+          selected ? palette.blue : palette.text,
+          selected,
+        );
+        line(rect, y + 1, item.detail ?? "", palette.muted, selected);
+        hits.push({
+          x: rect.x,
+          y,
+          width: rect.width,
+          height: 2,
+          action: "menu",
+          index,
+        });
+      }
+      paint(
+        rect.x,
+        rect.y + rect.height - 1,
+        rect.width,
+        view.menu.hint ?? "j/k Move · Enter Select · Escape Close",
+        palette.muted,
+      );
+      return;
+    }
     if (view.filterMenu) {
       heading(rect, "FILE FILTERS · HIDE CHECKED CATEGORIES", true);
-      paint(rect.x, rect.y + 1, rect.width, "Saved for this worktree", palette.muted);
-      for (const [index, category] of reviewFilterCategories.entries()) {
-        const y = rect.y + 3 + index * 3;
-        if (y + 1 >= rect.y + rect.height) break;
+      paint(
+        rect.x,
+        rect.y + 1,
+        rect.width,
+        "Saved for this worktree",
+        palette.muted,
+      );
+      const categories = [...reviewFilterCategories, ...advancedReviewFilters];
+      const capacity = Math.max(1, Math.floor((rect.height - 5) / 3));
+      const start = Math.min(
+        listStart(view.filterMenu.index, capacity),
+        Math.max(0, categories.length - capacity),
+      );
+      for (let row = 0; row < capacity; row++) {
+        const index = start + row,
+          category = categories[index];
+        if (!category) break;
+        const y = rect.y + 3 + row * 3;
         const active = index === view.filterMenu.index;
-        line(rect, y, `${index + 1} [${view.filterMenu.filters[category.key] ? "x" : " "}] ${category.label}`, active ? palette.blue : palette.text, active);
+        const checked =
+          category.key === "lockfiles" || category.key === "generated"
+            ? (view.filterMenu.settings?.[category.key] ??
+              view.filterMenu.filters.boilerplate)
+            : view.filterMenu.filters[category.key];
+        line(
+          rect,
+          y,
+          `${index + 1} [${checked ? "x" : " "}] ${category.label}`,
+          active ? palette.blue : palette.text,
+          active,
+        );
         line(rect, y + 1, category.description, palette.muted, active);
-        hits.push({ x: rect.x, y, width: rect.width, height: 2, action: "filter-category", index });
+        hits.push({
+          x: rect.x,
+          y,
+          width: rect.width,
+          height: 2,
+          action: "filter-category",
+          index,
+        });
       }
-      const tips = [
-        "j/k or arrows · Space/Enter toggle · 1/2/3 toggle",
-        "a Hide all · n Show all · d Defaults",
-        "Escape / T Done · t temporarily shows all files",
-      ];
-      for (const [index, tip] of tips.entries())
-        if (rect.y + 13 + index < rect.y + rect.height)
-          paint(rect.x, rect.y + 13 + index, rect.width, tip, palette.muted);
+      paint(
+        rect.x,
+        rect.y + rect.height - 2,
+        rect.width,
+        "Space Toggle · 1–5 · a/n All/None · d Defaults",
+        palette.muted,
+      );
+      paint(
+        rect.x,
+        rect.y + rect.height - 1,
+        rect.width,
+        "h Hide paths · i Include paths · w Wheel speed · Esc Done",
+        palette.muted,
+      );
       return;
     }
     const offset = Math.min(
@@ -612,7 +795,8 @@ export function reviewFrame(view: ReviewView): ReviewFrame {
     );
     const contentHeight = Math.min(viewport.height, Math.max(1, lines.length));
     const bar = reviewScrollbar(lines.length, viewport.height, offset);
-    const colors = view.help ? undefined : diffLineColors(lines);
+    const colors =
+      view.help || view.fullFile ? undefined : diffLineColors(lines);
     const selection =
       !view.help && view.textSelection
         ? reviewSelectionBounds(view.textSelection)
@@ -624,7 +808,11 @@ export function reviewFrame(view: ReviewView): ReviewFrame {
       rect.x,
       rect.y,
       Math.max(0, rect.width - controls),
-      view.help ? "KEYBOARD" : "3 DIFF PREVIEW",
+      view.help
+        ? "KEYBOARD"
+        : view.fullFile
+          ? `3 FILE · ${view.beforeFile ? "BEFORE" : "AFTER"}`
+          : "3 DIFF PREVIEW",
       view.focus === 2 ? palette.blue : palette.text,
     );
     paint(
@@ -650,7 +838,21 @@ export function reviewFrame(view: ReviewView): ReviewFrame {
         : "Select a file to review",
       palette.muted,
     );
-    paint(rect.x, rect.y + 2, rect.width, "", palette.text, palette.surface);
+    paint(
+      rect.x,
+      rect.y + 2,
+      rect.width,
+      view.previewLabel ??
+        (file && view.ranks?.[file.key]
+          ? `${view.ranks[file.key].kind}: ${view.ranks[file.key].reason}`
+          : ""),
+      palette.muted,
+      palette.surface,
+    );
+    const numbers =
+      view.lineNumbers && !view.help && !view.fullFile
+        ? reviewLineNumbers(lines)
+        : undefined;
     for (let i = 0; i < contentHeight; i++) {
       const text = lines[offset + i] ?? "";
       let tone = palette.text;
@@ -684,6 +886,22 @@ export function reviewFrame(view: ReviewView): ReviewFrame {
             }
           : undefined;
       paint(rect.x, viewport.y + i, 1, "", palette.text, surface);
+      if (view.lineNumbers && !view.help) {
+        const [old, next] = view.fullFile
+          ? [undefined, offset + i + 1]
+          : (numbers![offset + i] ?? []);
+        paint(
+          rect.x + 1,
+          viewport.y + i,
+          12,
+          `${old === undefined ? "" : old}`.padStart(5) +
+            " " +
+            `${next === undefined ? "" : next}`.padStart(5) +
+            " ",
+          palette.muted,
+          palette.surface,
+        );
+      }
       paint(
         viewport.x,
         viewport.y + i,
@@ -730,7 +948,8 @@ export function reviewFrame(view: ReviewView): ReviewFrame {
       });
   }
   if (layout.narrow) {
-    if (view.filterMenu || view.expanded || view.focus === 2) diff();
+    if (view.menu || view.filterMenu || view.expanded || view.focus === 2)
+      diff();
     else if (view.focus === 0) commits();
     else files();
   } else {
@@ -778,7 +997,8 @@ export function reviewFrame(view: ReviewView): ReviewFrame {
     { text: "−", key: "-" },
     { text: "+", key: "+" },
     { text: "T Filters", key: "T" },
-    { text: view.hideNoise ? "T Show all" : "T Focus files", key: "t" },
+    { text: "b Compare", key: "b" },
+    { text: view.hideNoise ? "t Show all" : "t Focus files", key: "t" },
     { text: "Tab Switch", key: "\t" },
     { text: "R Range", key: "r" },
     { text: "S Since Review", key: "s" },

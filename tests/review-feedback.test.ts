@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
-import { Workspace, read, write } from "./helpers.js";
+import { Workspace, write } from "./helpers.js";
 
 function send(w: Workspace, args: string[], ok = true) {
   return JSON.parse(

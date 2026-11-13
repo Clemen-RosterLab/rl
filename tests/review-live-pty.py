@@ -6,6 +6,7 @@ import json
 import os
 import pty
 import select
+import shlex
 import re
 import unicodedata
 import signal
@@ -21,6 +22,30 @@ terminal_rows, terminal_columns = 34, 160
 pid, fd = pty.fork()
 if pid == 0:
     os.chdir(root)
+    if scenario in ('shell', 'shell-function'):
+        os.execvpe('zsh', ['zsh', '-f', '-i'], {
+            **os.environ, 'PROMPT': 'RL_SHELL_READY> ', 'ZDOTDIR': root,
+        })
+    if scenario in ('terminal-raw', 'terminal-noecho'):
+        broken = termios.tcgetattr(0)
+        broken[3] &= ~termios.ECHO
+        if scenario == 'terminal-raw':
+            broken[3] &= ~(termios.ICANON | termios.ISIG)
+            broken[0] &= ~termios.ICRNL
+            broken[6][termios.VMIN] = 1
+            broken[6][termios.VTIME] = 0
+        termios.tcsetattr(0, termios.TCSANOW, broken)
+        result = subprocess.run([cli, 'review', '--live'])
+        assert result.returncode == 0, result.returncode
+        attributes = termios.tcgetattr(0)
+        for flag, label in [(termios.ICANON, 'canonical input'), (termios.ECHO, 'echo'), (termios.ISIG, 'signals')]:
+            assert attributes[3] & flag, f'Shell did not recover {label}'
+        assert attributes[0] & termios.ICRNL, 'Enter did not recover carriage-return translation'
+        print('SHELL_CAN_READ', flush=True)
+        typed = os.read(0, 65536)
+        assert typed == b'typing-after-review\n', typed
+        print('SHELL_TYPED_OK', flush=True)
+        sys.exit(0)
     if scenario == "handoff":
         result = subprocess.run([node, cli, 'review', '--live'])
         assert result.returncode == 0, result.returncode
@@ -39,10 +64,13 @@ if pid == 0:
         sys.exit(0)
     if scenario == "quit":
         os.execv(node, [node, cli, 'review', '--live'])
+    extra = ['--pr', '99', '--remote-interval', '10'] if scenario in ('pr-navigation', 'pr-freeze') else []
     os.execv(node, [node, cli, 'review', '--repo', repo, '--state-dir', state,
-                      '--base-dir', base, '--default-base', 'develop', '--live'])
+                      '--base-dir', base, '--default-base', 'develop', '--live', *extra])
 
 output = bytearray()
+osc_expression = re.compile(r'\x1b\].*?(?:\x07|\x1b\\)', re.S)
+csi_expression = re.compile(r'\x1b\[([?0-9;]*)([@-~])')
 
 def size(rows, columns):
     global terminal_rows, terminal_columns
@@ -86,11 +114,11 @@ def screen(with_colours=False):
     x = y = i = 0
     while i < len(data):
         if data[i] == '\x1b':
-            osc = re.match(r'\x1b\].*?(?:\x07|\x1b\\)', data[i:], re.S)
+            osc = osc_expression.match(data, i)
             if osc:
                 i += len(osc.group(0))
                 continue
-            match = re.match(r'\x1b\[([?0-9;]*)([@-~])', data[i:])
+            match = csi_expression.match(data, i)
             if match:
                 parameters, operation = match.groups()
                 if operation == 'H':
@@ -441,6 +469,55 @@ def filter_scenario():
     expect_screen('[t Focus: 6 hidden]')
     click('[t Focus: 6 hidden]')
     expect_screen('[t All files]')
+    click('[Filters]')
+    expect_screen('FILE FILTERS')
+    click('2 [x] Styles')
+    expect_screen('2 [ ] Styles')
+    click('1 [x] Tests')
+    expect_screen('1 [ ] Tests')
+    expect_screen('3 [x] Boilerplate')
+    expect_screen('[t Focus: 2 hidden]')
+    key('\x1b')
+    expect_screen('3 DIFF PREVIEW')
+    key('t')
+    expect_screen('[t All files]')
+    key('t')
+    expect_screen('[t Focus: 2 hidden]')
+    key('T')
+    expect_screen('FILE FILTERS')
+    expect_screen('1 [ ] Tests')
+    expect_screen('2 [ ] Styles')
+    key('n')
+    expect_screen('3 [ ] Boilerplate')
+    expect_screen('[t Focus: 0 hidden]')
+    key('d')
+    expect_screen('1 [x] Tests')
+    expect_screen('2 [x] Styles')
+    expect_screen('3 [x] Boilerplate')
+    expect_screen('[t Focus: 6 hidden]')
+    key('12')
+    expect_screen('1 [ ] Tests')
+    expect_screen('2 [ ] Styles')
+    expect_screen('[t Focus: 2 hidden]')
+    key('T')
+    expect_screen('3 DIFF PREVIEW')
+    key('q')
+
+def filter_reopen_scenario():
+    expect_screen('Updated')
+    expect_screen('[t Focus: 2 hidden]')
+    key('T')
+    expect_screen('FILE FILTERS')
+    expect_screen('1 [ ] Tests')
+    expect_screen('2 [ ] Styles')
+    expect_screen('3 [x] Boilerplate')
+    key('jj ')
+    expect_screen('3 [ ] Boilerplate')
+    expect_screen('[t Focus: 0 hidden]')
+    key(' ')
+    expect_screen('3 [x] Boilerplate')
+    key('T')
+    expect_screen('3 DIFF PREVIEW')
     key('q')
 
 def freeze_refs():
@@ -448,6 +525,119 @@ def freeze_refs():
         os.environ['REVIEW_REAL_GIT'], 'for-each-ref', '--format=%(refname)',
         'refs/rl/live-freeze',
     ], cwd=root).strip()
+
+def improvements_scenario():
+    expect_screen('+return 2;')
+    expect_screen('Updated')
+    pump(.3)  # The initial viewed identity is saved in the background.
+    with open(os.path.join(root, 'alpha.ts')) as file:
+        content = file.read()
+    with open(os.path.join(root, 'alpha.ts'), 'w') as file:
+        file.write(content.replace('return 2;', 'return 3;'))
+    expect_screen('+return 3;')
+    expect_screen('● M alpha.ts')
+    key('d')
+    expect_screen('Changes since you last viewed')
+    expect_screen('-return 2;')
+    key('d')
+    expect_screen('-return 1;')
+    key('v')
+    expect_screen('1/2 reviewed')
+    key('u')
+    expect_screen('beta.ts · unstaged')
+    expect_screen('+return 2;')
+    key('v')
+    expect_screen('2/2 reviewed')
+    key('[')
+    expect_screen('alpha.ts · unstaged')
+    key('c')
+    expect_screen('3 FILE · AFTER')
+    expect_screen('return 3;')
+    assert not any('+return 3;' in row for row in screen()), 'Full-file context retained diff prefixes'
+    key('e')
+    expect_screen('3 FILE · BEFORE')
+    expect_screen('return 1;')
+    key('C')
+    expect_screen('3 DIFF PREVIEW')
+    expect_screen('-return 1;')
+    key('\x1b[H}')
+    expect_screen('@@ ')
+    key('\x06')
+    expect_screen('Tab changes scope')
+    key('return 3\r')
+    expect_screen('SEARCH RESULTS · 1')
+    key('\r')
+    expect_screen('+return 3;')
+    key('/\t\t\t')  # diff -> paths -> changes -> full reviewed files
+    expect_screen('[files;')
+    key('\x7f' * 100 + 'context marker 20\r')
+    expect_screen('SEARCH RESULTS · 2')
+    key('\r')
+    expect_screen('3 FILE · AFTER')
+    expect_screen('context marker')
+    key('b')
+    expect_screen('COMPARE · CHOOSE BASE')
+    key('j\r')
+    expect_screen('COMPARE · CHOOSE TARGET')
+    key('\r')
+    expect_screen('Range ')
+    key('w')
+    expect_screen('working tree')
+    expect_screen('Updated')
+    key('L')
+    expect_screen('Logic order applied')
+    key('T')
+    expect_screen('Dependency lockfiles')
+    key('w')
+    expect_screen('Wheel lines')
+    key('\x7f7\r')
+    expect_screen('Review preferences saved')
+    key('\x1b')
+    pump(.6)
+    key('+')
+    expect_screen('Sidebar 60 columns')
+    key('q')
+
+def pr_navigation_scenario():
+    expect_screen('+local pending')
+    key('rHEAD~1 HEAD\r')
+    expect_screen('Range HEAD~1')
+    expect_screen('PR polled')
+    assert any('Range HEAD~1' in row for row in screen()), 'Delayed PR discovery replaced the selected range'
+    key('q')
+
+def pr_freeze_scenario():
+    expect_screen('committed branch')
+    expect_screen('+old remote')
+    expect_screen('Updated')
+    key('f')
+    expect_screen('FROZEN')
+    with open(os.environ['REVIEW_NEXT_PR'], 'w') as file:
+        file.write('next')
+    key('\x12')
+    expect_screen('NEW PR UPDATE')
+    key('p')
+    expect_screen('+old remote')
+    pump(.3)
+    assert not any('+new remote' in row for row in screen()), 'Frozen p followed a newer remote head'
+    key('f')
+    expect_screen('+new remote')
+    key('q')
+
+def checkpoint_quit_scenario():
+    expect_screen('+version-one')
+    expect_screen('Updated')
+    lock = os.environ['REVIEW_STORE_LOCK']
+    os.mkdir(lock)
+    key('m')
+    snapshots = os.environ['REVIEW_SNAPSHOT_DIRECTORY']
+    deadline = time.monotonic()+10
+    while not (os.path.isdir(snapshots) and os.listdir(snapshots)):
+        assert time.monotonic()<deadline, 'Checkpoint never reached the contended store lock'
+        pump(.05)
+    started = time.monotonic()
+    key('q')
+    return started
 
 def quit_scenario():
     expect('+version-one')
@@ -494,6 +684,31 @@ def handoff_scenario():
         pump(.008)
     return started
 
+def shell_scenario():
+    expect('RL_SHELL_READY> ')
+    if scenario == 'shell-function':
+        integration = os.path.join(os.path.dirname(os.path.dirname(cli)), 'shell/rl.zsh')
+        key(f'source {shlex.quote(integration)}; rl review --live\r')
+    else:
+        key(f'{shlex.quote(cli)} review --live\r')
+    expect_screen('+version-one')
+    expect_screen('Updated')
+    start = key('q')
+    expect('RL_SHELL_READY> ', start)
+    key("printf '\\nSHELL_%s\\n' INPUT_OK\r")
+    expect('SHELL_INPUT_OK', start)
+    offset = len(output)
+    expect('RL_SHELL_READY> ', start)
+    key('exit\r')
+
+def terminal_recovery_scenario():
+    expect_screen('+version-one')
+    expect_screen('Updated')
+    start = key('q')
+    expect('SHELL_CAN_READ', start)
+    key('typing-after-review\r')
+    expect('SHELL_TYPED_OK', start)
+
 
 try:
     size(34, 160)
@@ -503,10 +718,24 @@ try:
         preview_scenario()
     elif scenario == "filter":
         filter_scenario()
+    elif scenario == "filter-reopen":
+        filter_reopen_scenario()
+    elif scenario == "improvements":
+        improvements_scenario()
+    elif scenario == "pr-navigation":
+        pr_navigation_scenario()
+    elif scenario == "pr-freeze":
+        pr_freeze_scenario()
+    elif scenario == "checkpoint-quit":
+        quit_started = checkpoint_quit_scenario()
     elif scenario == "quit":
         scratch = quit_scenario()
     elif scenario == "handoff":
         quit_started = handoff_scenario()
+    elif scenario in ('shell', 'shell-function'):
+        shell_scenario()
+    elif scenario in ('terminal-raw', 'terminal-noecho'):
+        terminal_recovery_scenario()
     else:
         expect('+version-one')
         expect('Updated')
@@ -567,9 +796,29 @@ try:
         time.sleep(.1)
         assert os.stat(os.environ['REVIEW_GH_HEARTBEAT']).st_mtime_ns == last_heartbeat, 'GitHub descendant survived Quit'
         print(f'QUIT_LATENCY={elapsed:.3f}s')
+    if scenario == "checkpoint-quit":
+        elapsed = time.monotonic()-quit_started
+        assert elapsed < .9, f'Contended checkpoint held the terminal for {elapsed:.3f}s'
+        os.rmdir(os.environ['REVIEW_STORE_LOCK'])
+        deadline = time.monotonic()+5
+        metadata = os.environ['REVIEW_CHECKPOINT_STATE']
+        while True:
+            try:
+                with open(metadata) as file:
+                    complete = bool(json.load(file)['checkpoints'])
+            except FileNotFoundError:
+                complete = False
+            if complete:
+                break
+            assert time.monotonic()<deadline, 'Disconnected checkpoint worker did not finish its save'
+            time.sleep(.05)
+        print(f'QUIT_LATENCY={elapsed:.3f}s')
     if scenario == "quit":
         assert not os.path.exists(scratch), 'Cancelled refresh left its temporary index'
-        assert not freeze_refs(), 'Quit left its private freeze refs'
+        deadline = time.monotonic()+5
+        while freeze_refs():
+            assert time.monotonic()<deadline, 'Quit left its private freeze refs'
+            time.sleep(.05)
         heartbeat = os.environ['REVIEW_GIT_HEARTBEAT']
         last_heartbeat = os.stat(heartbeat).st_mtime_ns
         time.sleep(.2)

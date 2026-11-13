@@ -1,15 +1,10 @@
-import { agentAdapter } from "./agent-registry.js";
-import { activityView } from "./activity.js";
-import { handleHook } from "./hooks.js";
-import { doctor } from "./doctor.js";
-import { currentSessionId } from "./session.js";
-import { syncCodexSessions } from "./codex-sessions.js";
-import { resumeSessions } from "./agent-resume.js";
-import { workflowSummary } from "./agent-runner.js";
-import { github } from "./pr-workflow.js";
-import { prText, statusText } from "./display.js";
 import fs from "node:fs";
 import path from "node:path";
+import { activityView } from "./activity.js";
+import { agentAdapter } from "./agent-registry.js";
+import { resumeSessions } from "./agent-resume.js";
+import { workflowSummary } from "./agent-runner.js";
+import { syncCodexSessions } from "./codex-sessions.js";
 import {
   args,
   arity,
@@ -20,12 +15,24 @@ import {
   now,
   object,
   required,
-  run,
 } from "./common.js";
-import { Agent, branchStatus, Store, type Instance } from "./store.js";
-function agent(value: string): Agent {
+import { prText, statusText } from "./display.js";
+import { doctor } from "./doctor.js";
+import { UsageError } from "./errors.js";
+import { resolveGitHubRepository, runGh } from "./github/client.js";
+import { handleHook } from "./hooks.js";
+import { parseJsonObject } from "./json.js";
+import { github } from "./pr-workflow.js";
+import { currentSessionId } from "./session.js";
+import { type Agent, branchStatus, type Instance, Store } from "./store.js";
+
+function parseAgent(value: string): Agent {
   return agentAdapter(value).name;
 }
+
+const SYNC_PR_FIELDS =
+  "number,url,state,title,headRefName,baseRefName,isDraft,updatedAt";
+
 async function syncPr(
   store: Store,
   requested?: string,
@@ -33,57 +40,58 @@ async function syncPr(
 ): Promise<number> {
   const [file, data] = await store.locked(() => store.current());
   const selector = requested || data.pr?.url || data.branch;
-  if (selector.startsWith("-"))
-    throw new Error("PR selector must be a branch, number, or URL");
-  const repository: unknown = JSON.parse(
-    run(["gh", "repo", "view", "--json", "nameWithOwner,url"], data.worktree),
-  );
-  if (!object(repository) || typeof repository.url !== "string")
-    throw new Error("GitHub returned invalid repository metadata");
-  const repoUrl = repository.url.replace(/\/+$/, ""),
-    parsed = new URL(repoUrl);
-  if (
-    parsed.protocol !== "https:" ||
-    !parsed.host ||
-    !parsed.pathname.replaceAll("/", "")
-  )
-    throw new Error("GitHub returned an invalid repository URL");
-  const prefix = repoUrl + "/pull/";
-  if (selector.includes("://") && !selector.startsWith(prefix))
+  if (selector.startsWith("-")) {
+    throw new UsageError("PR selector must be a branch, number, or URL");
+  }
+
+  const repository = await resolveGitHubRepository(data.worktree);
+  const prefix = `${repository.url}/pull/`;
+  if (selector.includes("://") && !selector.startsWith(prefix)) {
     throw new Error("PR URL does not belong to this GitHub repository");
-  const fields =
-    "number,url,state,title,headRefName,baseRefName,isDraft,updatedAt";
-  const pr: unknown = JSON.parse(
-    run(
-      [
-        "gh",
-        "pr",
-        "view",
-        selector,
-        "--repo",
-        parsed.host + parsed.pathname,
-        "--json",
-        fields,
-      ],
-      data.worktree,
-    ),
-  );
-  if (!object(pr) || fields.split(",").some((field) => !(field in pr)))
+  }
+
+  const prResult = await runGh(data.worktree, [
+    "pr",
+    "view",
+    selector,
+    "--repo",
+    `${repository.host}/${repository.name}`,
+    "--json",
+    SYNC_PR_FIELDS,
+  ]);
+  if (prResult.code !== 0) {
+    throw new Error(prResult.stderr.trim() || "Could not load PR metadata");
+  }
+
+  const pr = parseJsonObject(prResult.stdout) as Record<string, unknown>;
+  if (
+    !object(pr) ||
+    SYNC_PR_FIELDS.split(",").some((field) => !(field in pr))
+  ) {
     throw new Error("GitHub returned incomplete PR metadata");
-  if (pr.headRefName !== data.branch)
+  }
+  if (pr.headRefName !== data.branch) {
     throw new Error("PR head branch does not match the RL instance branch");
-  if (typeof pr.url !== "string" || !pr.url.startsWith(prefix))
+  }
+  if (typeof pr.url !== "string" || !pr.url.startsWith(prefix)) {
     throw new Error("PR does not belong to this GitHub repository");
+  }
+
   pr.syncedAt = now();
   await store.locked(() => {
     const [currentFile, current] = store.current(data.worktree);
-    if (currentFile !== file)
+    if (currentFile !== file) {
       throw new Error("Instance changed while fetching PR state");
-    current.pr = pr as typeof current.pr;
+    }
+    current.pr = pr as Instance["pr"];
     store.save(file, current);
   });
-  if (asJson) json(pr);
-  else console.log(prText(pr as Instance["pr"]));
+
+  if (asJson) {
+    json(pr);
+  } else {
+    console.log(prText(pr as Instance["pr"]));
+  }
   return 0;
 }
 
@@ -93,6 +101,7 @@ async function openPr(store: Store, asJson: boolean): Promise<number> {
     json(data.pr);
     return 0;
   }
+
   if (data.pr) {
     const url = new URL(data.pr.url);
     if (
@@ -100,10 +109,14 @@ async function openPr(store: Store, asJson: boolean): Promise<number> {
       url.username ||
       url.password ||
       !/\/pull\/[1-9]\d*$/.test(url.pathname)
-    )
+    ) {
       throw new Error("Invalid saved PR URL; run rl pr sync to refresh");
+    }
     console.log(prText(data.pr));
-  } else console.log(`Opening PR for ${data.branch}…`);
+  } else {
+    console.log(`Opening PR for ${data.branch}…`);
+  }
+
   try {
     const result = await github(data.worktree, [
       "pr",
@@ -111,20 +124,26 @@ async function openPr(store: Store, asJson: boolean): Promise<number> {
       data.pr?.url ?? data.branch,
       "--web",
     ]);
-    if (result.code)
+    if (result.code !== 0) {
       throw new Error(
         result.stderr.trim() || "Could not open PR in the browser",
       );
-    if (result.stdout) process.stdout.write(result.stdout);
+    }
+    if (result.stdout) {
+      process.stdout.write(result.stdout);
+    }
     return 0;
   } catch (error) {
-    if (!data.pr) throw error;
+    if (!data.pr) {
+      throw error;
+    }
     console.error(
       `Could not open the browser: ${message(error)}. Use the PR link above.`,
     );
     return 0;
   }
 }
+
 export async function main(argv: string[]): Promise<number> {
   const { values, positionals } = args(
     argv,
@@ -141,13 +160,17 @@ export async function main(argv: string[]): Promise<number> {
     ],
     { latest: "l" },
   );
+
   const store = new Store(
     required(values, "repo"),
     required(values, "state-dir"),
   );
   const [command, ...rest] = positionals;
-  if ((values.latest || values.l) && command !== "resume")
-    throw new Error("--latest is only supported by rl resume");
+
+  if ((values.latest || values.l) && command !== "resume") {
+    throw new UsageError("--latest is only supported by rl resume");
+  }
+
   if (command === "adopt") {
     arity(rest, 0);
     const [file, data] = await store.adopt(
@@ -155,59 +178,78 @@ export async function main(argv: string[]): Promise<number> {
       typeof values.base === "string" ? values.base : undefined,
       values["extended-hooks"] ? true : undefined,
     );
-    if (!values.quiet)
+    if (!values.quiet) {
       console.log(
         `RL instance: ${data.id}\nState: ${path.dirname(file)}\nSession hooks installed. In Codex, review and trust them with /hooks.`,
       );
+    }
     return 0;
   }
+
   if (command === "resume") {
     arity(rest, 0, 1);
     return resumeSessions(
       store,
-      rest[0] === undefined ? undefined : agent(rest[0]),
-      { latest: !!(values.latest || values.l) },
+      rest[0] === undefined ? undefined : parseAgent(rest[0]),
+      { latest: Boolean(values.latest || values.l) },
     );
   }
+
   if (command === "doctor") {
     arity(rest, 0, 1);
     if (values.repair) {
       const [, data] = store.current();
       await store.adopt(data.worktree);
     }
-    return doctor(store, rest[0], !!values.json);
+    return doctor(store, rest[0], Boolean(values.json));
   }
+
   if (command === "hook") {
     arity(rest, 2, 3);
-    if (rest.length === 3 && rest[1] !== "agy")
-      throw new Error("Only agy hooks accept an explicit native event");
+    if (rest.length === 3 && rest[1] !== "agy") {
+      throw new UsageError("Only agy hooks accept an explicit native event");
+    }
     return handleHook(store, rest[0], rest[1], rest[2]);
   }
+
   if (command === "pr" && rest[0] === "sync") {
     arity(rest, 1, 2);
-    return syncPr(store, rest[1], !!values.json);
+    return syncPr(store, rest[1], Boolean(values.json));
   }
+
   if (command === "pr" && (!rest.length || rest[0] === "open")) {
     arity(rest, 0, rest[0] === "open" ? 1 : 0);
-    return openPr(store, !!values.json);
+    return openPr(store, Boolean(values.json));
   }
-  if (command === "status") arity(rest, 0);
+
+  if (command === "status") {
+    arity(rest, 0);
+  }
+
   if (command === "session" && rest[0] === "list") {
     arity(rest, 1, 2);
-    if (rest[1]) agent(rest[1]);
+    if (rest[1]) {
+      parseAgent(rest[1]);
+    }
   }
-  if (command === "status" && values.fetch)
+
+  if (command === "status" && values.fetch) {
     git(store.repo, "fetch", "--all", "--prune");
-  if (command === "status" || (command === "session" && rest[0] === "list"))
+  }
+
+  if (command === "status" || (command === "session" && rest[0] === "list")) {
     await syncCodexSessions(store, process.cwd());
+  }
+
   let replacement = "";
   if (
-    ["context", "progress"].includes(command) &&
-    ["set", "append"].includes(rest[0])
+    (command === "context" || command === "progress") &&
+    (rest[0] === "set" || rest[0] === "append")
   ) {
     arity(rest, 2);
     replacement = fs.readFileSync(rest[1] === "-" ? 0 : rest[1], "utf8");
   }
+
   return store.locked(() => {
     if (command === "archive") {
       arity(rest, 0);
@@ -215,6 +257,7 @@ export async function main(argv: string[]): Promise<number> {
       store.archiveWorktrees([root]);
       return 0;
     }
+
     const [file, data] = store.current();
     if (command === "status") {
       arity(rest, 0);
@@ -231,47 +274,77 @@ export async function main(argv: string[]): Promise<number> {
         gitStatus: branchStatus(store.repo, data),
         workflow: workflowSummary(store),
       };
-      if (values.json) json(status);
-      else console.log(statusText(data, status.gitStatus, status.workflow));
-    } else if (command === "session") {
+      if (values.json) {
+        json(status);
+      } else {
+        console.log(statusText(data, status.gitStatus, status.workflow));
+      }
+      return 0;
+    }
+
+    if (command === "session") {
       if (rest[0] === "save") {
         arity(rest, 1, 3);
-        const kind = agent(rest[1] ?? "codex");
+        const kind = parseAgent(rest[1] ?? "codex");
         const sid = currentSessionId(kind, rest[2]);
         store.recordSession(file, data, kind, sid);
-        if (values.json)
+        if (values.json) {
           json({ agent: kind, sessionId: sid, instance: data.id });
-        else console.log(`Saved ${kind} session ${sid} for ${data.id}`);
-      } else if (rest[0] === "add") {
+        } else {
+          console.log(`Saved ${kind} session ${sid} for ${data.id}`);
+        }
+        return 0;
+      }
+      if (rest[0] === "add") {
         arity(rest, 3);
-        const kind = agent(rest[1]);
+        const kind = parseAgent(rest[1]);
         store.recordSession(file, data, kind, rest[2]);
         console.log(`Associated ${kind} session ${rest[2]} with ${data.id}`);
-      } else if (rest[0] === "list") {
+        return 0;
+      }
+      if (rest[0] === "list") {
         arity(rest, 1, 2);
-        json(rest[1] ? (data.sessions[agent(rest[1])] ?? []) : data.sessions);
-      } else
-        throw new Error(
-          "Usage: rl agent sessions [agent] | save [agent] [UUID]",
+        json(
+          rest[1] ? (data.sessions[parseAgent(rest[1])] ?? []) : data.sessions,
         );
-    } else if (command === "context" || command === "progress") {
-      const target = path.join(path.dirname(file), command + ".md"),
-        action = rest[0];
+        return 0;
+      }
+      throw new UsageError(
+        "Usage: rl agent sessions [agent] | save [agent] [UUID]",
+      );
+    }
+
+    if (command === "context" || command === "progress") {
+      const target = path.join(path.dirname(file), `${command}.md`);
+      const action = rest[0];
       if (action === "path" || action === "show") {
         arity(rest, 1);
-        if (action === "path") console.log(target);
-        else process.stdout.write(store.readDocument(file, command));
-      } else if (action === "set" || action === "append") {
+        if (action === "path") {
+          console.log(target);
+        } else {
+          process.stdout.write(store.readDocument(file, command));
+        }
+        return 0;
+      }
+      if (action === "set" || action === "append") {
         store.updateDocument(file, data, command, action, replacement);
-      } else
-        throw new Error(
-          `Usage: rl ${command} show|path|set <file>|append <file>`,
-        );
-    } else if (command === "pr" && rest[0] === "show") {
+        return 0;
+      }
+      throw new UsageError(
+        `Usage: rl ${command} show|path|set <file>|append <file>`,
+      );
+    }
+
+    if (command === "pr" && rest[0] === "show") {
       arity(rest, 1);
-      if (values.json) json(data.pr);
-      else console.log(prText(data.pr));
-    } else throw new Error("Unknown state command");
-    return 0;
+      if (values.json) {
+        json(data.pr);
+      } else {
+        console.log(prText(data.pr));
+      }
+      return 0;
+    }
+
+    throw new UsageError("Unknown state command");
   });
 }

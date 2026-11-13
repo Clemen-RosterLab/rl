@@ -354,7 +354,8 @@ test("zsh and bash integration switch directories, remember previous workspace, 
         ? `_rl_main() { return 88; }\nrl path @\n`
         : "rl path @\n") +
       `rl exec -- "$RL_TEST_CLI" switch @ >/dev/null\n[[ "$PWD" == "$RL_TEST_WORKSPACE" ]] || exit 14\n` +
-      `rl switch remove-${shell}\nrl delete remove-${shell} >/dev/null\n[[ "$PWD" == "$RL_REPO_ROOT" ]] || exit 13\n`;
+      `rl switch remove-${shell}\nrl delete remove-${shell} >/dev/null\n[[ "$PWD" == "$RL_REPO_ROOT" ]] || exit 13\n` +
+      `[[ "$RL_PREVIOUS_WORKSPACE" == "$RL_TEST_WORKSPACE" ]] || exit 15\n`;
     w.env.RL_TEST_CLI = CLI;
     w.env.RL_TEST_WORKSPACE = workspace;
     assert.equal(
@@ -434,6 +435,30 @@ test("explicit repository selection follows exec into nested rl despite environm
   ];
   assert.equal(w.rl(command).stdout.trim(), backend);
   delete w.env.RL_REPO;
-  write(w.config, "RL_REPO=front\n");
+  write(w.config, 'repo = "front"\n');
   assert.equal(w.rl(command).stdout.trim(), backend);
+});
+
+test("both zsh and bash support --repo <alias> switch - and reject non-declarative shell code in config", (t) => {
+  const w = new Workspace(t);
+  w.rl(["repo", "add", "front", w.repo, "--base", "develop"]);
+  const workspace = w.managed("previous-target");
+  w.env.RL_TEST_CLI = CLI;
+  w.env.RL_TEST_WORKSPACE = workspace;
+  for (const shell of ["zsh", "bash"]) {
+    const script = `eval "$("$RL_TEST_CLI" setup shell ${shell})"\nrl switch previous-target\nrl switch @\nrl --repo front switch -\n[[ "$PWD" == "$RL_TEST_WORKSPACE" ]] || exit 21\n`;
+    w.command(
+      [shell, ...(shell === "zsh" ? ["-f"] : ["--norc"]), "-c", script],
+      {
+        cwd: w.repo,
+      },
+    );
+  }
+  const unsafeConfig = path.join(w.root, "unsafe.zsh");
+  write(unsafeConfig, 'RL_DEFAULT_BASE="$(echo exploited)"\n');
+  w.env.RL_CONFIG = unsafeConfig;
+  assert.match(
+    w.rl(["path", "@"], { ok: false }).stderr,
+    /command substitution|migrate settings to config\.toml/,
+  );
 });

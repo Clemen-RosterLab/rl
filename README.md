@@ -6,24 +6,25 @@ Create a workspace, start an agent, and keep task notes and sessions together.
 Switch projects, prepare local dependencies, check PRs, and merge finished work
 without losing your place.
 
-Requires macOS or Linux and Node.js 22+. Global npm installation sets up Git,
+Requires macOS or Linux and Node.js 22+. `rl setup install` sets up Git,
 zsh, fzf, GitHub CLI and integration for your zsh or bash terminal.
 
 ## Install
 
-Install from npm:
+Install from npm and run the one-time setup:
 
 ```sh
-npm install --global rl-workspaces --foreground-scripts
+npm install --global rl-workspaces
+rl setup install
 ```
 
 See Development below to build and try unpublished changes.
 
-The installer installs missing tools through your package manager, preserves
+`rl setup install` installs missing tools through your package manager, preserves
 your shell settings, and registers one RL integration block. Open a new terminal
-after installation; bare `rl` can then select a workspace and change directory.
-For the terminal that ran the install, use the activation command printed by the
-installer, or:
+afterward; bare `rl` can then select a workspace and change directory.
+For the terminal that ran setup, use the activation command printed by
+`rl setup install`, or:
 
 ```sh
 eval "$(command rl setup shell zsh)"
@@ -34,23 +35,22 @@ eval "$(command rl setup shell bash)"
 This activates the setup already registered for future terminals. Shell
 integration is what lets `rl` change the calling terminal's directory; an
 executable by itself can only print the selected path. The integration loads
-the current runtime on each call, including after npm upgrades.
+the current runtime on each call, including after npm or Node upgrades.
 
 Tool installation needs Homebrew on macOS, or Homebrew/APT/DNF/Yum/Pacman/APK
-on Linux, with permission to install packages. A failed setup reports the command
-to finish in your terminal. If lifecycle scripts were disabled, run
-`rl setup install` to complete everything. `rl setup dependencies --check`
+on Linux, with permission to install packages. `rl setup dependencies --check`
 checks tools without changing them. GitHub PR commands require `gh auth login`.
 
-If automatic setup cannot finish, the CLI stays installed and reports what needs
-repairing. Resolve that issue and run `rl setup install` again. Agent commands
-also need your chosen Codex or Claude CLI installed and signed in.
+If setup cannot finish, resolve the reported issue and run `rl setup install`
+again. Agent commands also need your chosen Codex, Claude or Antigravity CLI
+installed and signed in.
 
 If npm reports `EACCES` or permission denied for its global directory, install
 into a directory you own:
 
 ```sh
-npm install --global rl-workspaces --prefix "$HOME/.local" --foreground-scripts
+npm install --global rl-workspaces --prefix "$HOME/.local"
+"$HOME/.local/bin/rl" setup install
 ```
 
 Open a new terminal afterward, or use the absolute activation command printed
@@ -207,8 +207,10 @@ untracked layers; `p` compares the committed branch with its target merge-base;
 `r` accepts `FROM TO` revisions. Initial commits compare against the empty tree;
 merge commits compare with their first parent. The timeline includes the latest
 10 commits, loaded with their statistics in one Git call. `/` searches file paths in the files panel and text in the selected
-diff; `n`/`N` jump between matches. `o` opens the selected file and source line
-with `code --goto`; `?` shows help and `q` quits.
+diff; `n`/`N` jump between matches. `o` opens the captured Git version and source
+line with `code --goto`, including historical or PR-only files. These cached
+copies are read-only; `O` opens the current worktree file instead. `?` shows help
+and `q` quits.
 
 Drag across preview text to select it, then press `y` or Ctrl-C to copy it to
 the clipboard using the terminal's [OSC 52 protocol](https://ghostty.org/docs/vt/osc/52).
@@ -218,22 +220,62 @@ Clearing the selection loads that latest diff. Ctrl-C quits when no text is sele
 
 Drag the vertical divider to resize the sidebar and preview, or press `-`/`+`
 to shrink/grow the sidebar by four columns. `=` restores the default width.
-The width is remembered for this session and adapts to terminal resizing.
+The width is saved for this worktree and adapts to terminal resizing.
 In an expanded preview, Tab/Shift-Tab and `]`/`[` move to the next/previous file
 without collapsing it. Arrows and `j`/`k` scroll, PageUp/PageDown page, and
 Home/End jump to the start/end. Each file retains its scroll position. Enter
 or Escape restores the sidebar; `1`/`2` focus commits/files.
 
 Tests, styles and common boilerplate are hidden by default across working-tree,
-commit, range and branch/PR views. Press `t` or click `[t Focus: N hidden]` to
-show all files; press `t` again to restore the filter. The header counts hidden
+commit, range and branch/PR views. Press `T` or click `[Filters]` to choose which
+categories to hide independently. Click a checkbox, use arrows/`j`/`k` then
+Space/Enter, or press `1`–`5` to toggle a category. Dependency lockfiles and
+generated artifacts have independent overrides. `h` edits comma-separated hide
+globs; `i` edits always-show exceptions. Patterns match repository-relative
+paths: `**/vendor/**`, `docs/`, `**/*.test.ts`. Always-show rules take priority.
+`w` sets preview wheel speed from 1 to 20 lines, saved for this worktree.
+`a` hides all categories,
+`n` shows all, `d` restores defaults, and Escape/`T` closes the menu. Choices
+are saved immediately in RL's local metadata for this worktree and apply to
+later review sessions, including other branches or PRs in that same worktree.
+
+Press `t` or click `[t Focus: N hidden]` to temporarily show all files; press
+`t` again to restore your configured filters. The header counts hidden
 file layers. The naming rules recognise test/spec files, test directories,
 snapshots, CSS/SCSS/Sass/Less/Stylus styles, CSS-in-TS, dependency lockfiles,
 generated artifacts, source maps and minified JavaScript. Ordinary source,
 entry points, configuration and handwritten type declarations remain visible.
-This is path filtering, not semantic ranking. The toggle lasts for the current
-review session, preserves the selected source file and its scroll, and does not
-change commits, snapshots or review checkpoints.
+This is path filtering, not semantic ranking. The temporary show-all toggle
+lasts for the current review session. Filtering preserves the selected source
+file and its scroll and does not change commits, snapshots or review checkpoints.
+
+Press `v` to toggle the displayed file reviewed; `u`/`U` jumps to the next/previous
+unreviewed file. Marks retain both reviewed blob identities, so unrelated edits
+preserve them and a change to either side resets them. Progress is local to this
+worktree and branch/explicit PR. A dot marks a file changed since it was last
+viewed. `d` compares its last-viewed target tree with its current target; the
+saved version is retained across Git GC. Leaving a file records the viewed
+version. These per-file marks do not approve a PR or advance the `m` checkpoint.
+
+`{`/`}` jumps between hunks. Old/new line gutters identify source positions.
+`C` cycles 3, 12 and 40 context lines. `c` toggles complete file context and `e`
+switches before/after versions. `b` opens a clickable, keyboard-navigable
+base/target revision picker; its direction is always base → target.
+
+In the `/` search prompt, Tab/Shift-Tab selects the scope: current diff, visible
+file paths, changed lines across visible files, or complete reviewed files.
+Ctrl-F starts cross-file changed-line search directly. Results are clickable
+and open the corresponding version and line. Search is plain text, bounded to
+200 file layers, 100 hits and 16 MiB; incomplete results are labelled.
+
+`L` applies logic-first ordering with reasons above the preview. This is a
+text heuristic by default; an optional compatible TypeScript compiler API adds
+syntax evidence when available. It does not claim semantic references. `A`
+explicitly chooses Codex, Claude or Antigravity for read-only agent ranking of
+up to 60 captured patches. This can use provider quota; it never runs
+automatically. Ctrl-G cancels agent analysis. Live updates keep the chosen
+order stable, label stale rankings and append newly seen files; press `L` to
+refresh stale rankings or restore Git order when the ranking is current.
 
 Local directory events are debounced for 180 ms, with a 2.5-second Git/status
 polling fallback. Worktree-specific HEAD/index and shared refs are watched
@@ -245,8 +287,14 @@ truncation notice. A live update keeps the selected commit/file and scroll where
 possible and increments the visible update counter.
 
 Quit cancels background Git and GitHub reads, disables mouse reporting and
-drains in-flight terminal input before returning control to the shell. A
-checkpoint save already in progress finishes before exit.
+drains in-flight terminal input before returning control to the shell. Terminal
+attributes are saved and restored explicitly; the previous shell screen is
+revealed only after input is ready. Starting review also repairs inherited raw
+or no-echo input left by a crashed terminal application. A
+checkpoint save already in progress gets a bounded grace period; if it needs
+longer, its isolated worker completes the atomic save after terminal handoff.
+Private freeze-ref cleanup also retries independently when Git is too slow
+for the terminal handoff deadline.
 
 Press `f` to freeze the captured source/index trees. Temporary private
 `refs/rl/live-freeze` refs retain them across Git GC and are removed on unfreeze
@@ -257,7 +305,10 @@ target as a review checkpoint, then `s` to compare its source and index with the
 current snapshot. These live checkpoints are scoped to worktree and branch (and
 explicit PR number), retained under private `refs/rl/live-review` refs across Git
 GC, and stored in the existing repository state directory under `live-review`.
-They are separate from the legacy feature approval/checkpoint actions below.
+For registered RL instances, new marks also appear in `--checkpoints` and the
+review queue. Command checkpoints update the live comparison checkpoint too;
+`s` can import an existing command checkpoint. Marking reviewed does not submit
+or grant an approval.
 Missing checkpoints are errors; rewritten history compares the saved trees with
 an explicit notice. No branch checkout, staging, commit or file edit occurs.
 
@@ -991,9 +1042,9 @@ and subdirectories.
 | `RL_REPO` | Optional repository alias |
 | `RL_PR_OFFLINE` | Set to `1` to disable PR queries |
 
-Environment variables can also come from trusted zsh configuration selected by
-`RL_CONFIG`, defaulting to `~/.config/rl/config.zsh`. See
-[config.example.zsh](config.example.zsh). Registration supplies repository/base
+Defaults can also come from declarative configuration selected by `RL_CONFIG`,
+defaulting to `~/.config/rl/config.toml` (or `config.json`). See
+[config.example.toml](config.example.toml). Registration supplies repository/base
 settings; `rl help` and individual `--help` show command options.
 
 ## Development

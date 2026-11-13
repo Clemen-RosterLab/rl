@@ -1,26 +1,31 @@
+import { createHash, randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
-import { createHash, randomUUID } from "node:crypto";
-import { git, gitRaw, now, object, sessionId, writeJson } from "./common.js";
-import { readJsonObject } from "./json.js";
+import { isDeepStrictEqual } from "node:util";
+import { agentAdapter } from "./agent-registry.js";
 import {
-  validateAutomation,
   type AutomationConfig,
   type ReviewPolicy,
   type WorkflowStep,
 } from "./automation-config.js";
+import { git, gitRaw, now, object, sessionId, writeJson } from "./common.js";
+import { isExcludedUntrackedPath } from "./core/protected-paths.js";
+import { readJsonObject } from "./json.js";
+import {
+  pruneTerminalWorkflowRuns,
+  readWorkflowRunsIndex,
+  updateWorkflowRunsIndex,
+} from "./orchestration/run-index.js";
 import {
   evaluate,
-  validateResult,
   type Evaluation,
   type ReviewResult,
 } from "./review-policy.js";
-import type { Store, Instance } from "./store.js";
-import { agentAdapter } from "./agent-registry.js";
+import { WorkflowRunDiskSchema } from "./schemas/orchestration.js";
+import type { Instance, Store } from "./store.js";
 import {
   collaborationAssessment,
   initializeCollaboration,
-  validateCollaborationState,
   type CollaborationState,
 } from "./workflow-collaboration.js";
 
@@ -29,13 +34,15 @@ export interface Usage {
   outputTokens: number | null;
   costUsd: number | null;
 }
-interface Scope {
+
+export interface Scope {
   base: string;
   baseCommit: string;
   head: string;
   fingerprint: string;
   files: string[];
 }
+
 export interface Stage extends WorkflowStep {
   claim?: string;
   startedAt?: string;
@@ -50,6 +57,7 @@ export interface Stage extends WorkflowStep {
   check?: { stdout: string; stderr: string; exitCode: number };
   leads?: ReviewResult["routingLeads"];
 }
+
 export interface WorkflowRun {
   version: 1;
   execution?: "native";
@@ -78,12 +86,16 @@ export interface WorkflowRun {
   }[];
   collaboration?: CollaborationState;
 }
+
+const MAX_SCOPE_BYTES = 4 * 1024 * 1024;
+
 export function captureScope(
   cwd: string,
   base: string,
 ): { scope: Scope; context: string } {
-  if (!base || base.startsWith("-") || /[\x00-\x20\x7f]/.test(base))
+  if (!base || base.startsWith("-") || /[\x00-\x20\x7f]/.test(base)) {
     throw new Error("Expected a literal base ref");
+  }
   const baseCommit = git(
     cwd,
     "rev-parse",
@@ -93,6 +105,7 @@ export function captureScope(
   );
   const head = git(cwd, "rev-parse", "HEAD");
   const ancestor = git(cwd, "merge-base", head, baseCommit);
+
   const patch = gitRaw(
     cwd,
     "diff",
@@ -140,7 +153,7 @@ export function captureScope(
     "-z",
   )
     .split("\0")
-    .filter(Boolean);
+    .filter((file) => Boolean(file) && !isExcludedUntrackedPath(file));
   const stagedFiles = gitRaw(
     cwd,
     "diff",
@@ -165,30 +178,45 @@ export function captureScope(
   )
     .split("\0")
     .filter(Boolean);
+
   let size =
     Buffer.byteLength(patch) +
     Buffer.byteLength(stagedPatch) +
     Buffer.byteLength(unstagedPatch);
-  const additional = untracked.map((file) => {
-    const absolute = path.join(cwd, file),
-      stat = fs.lstatSync(absolute);
+
+  const visibleUntracked: string[] = [];
+  const additional = untracked.flatMap((file) => {
+    const absolute = path.join(cwd, file);
+    const stat = fs.lstatSync(absolute, { throwIfNoEntry: false });
+    if (!stat) {
+      return [];
+    }
     size += stat.size;
-    if (size > 4 * 1024 * 1024)
+    if (size > MAX_SCOPE_BYTES) {
       throw new Error(
         "Review scope exceeds 4 MiB; narrow the changes before running this workflow",
       );
-    if (!stat.isFile() && !stat.isSymbolicLink())
+    }
+    if (!stat.isFile() && !stat.isSymbolicLink()) {
       throw new Error(`Unsupported untracked path: ${file}`);
-    return {
-      file,
-      mode: stat.mode & 0o777,
-      kind: stat.isSymbolicLink() ? "symlink" : "file",
-      content: stat.isSymbolicLink()
-        ? fs.readlinkSync(absolute)
-        : fs.readFileSync(absolute).toString("base64"),
-    };
+    }
+    visibleUntracked.push(file);
+    return [
+      {
+        file,
+        mode: stat.mode & 0o777,
+        kind: stat.isSymbolicLink() ? "symlink" : "file",
+        content: stat.isSymbolicLink()
+          ? fs.readlinkSync(absolute)
+          : fs.readFileSync(absolute).toString("base64"),
+      },
+    ];
   });
-  if (size > 4 * 1024 * 1024) throw new Error("Review scope exceeds 4 MiB");
+
+  if (size > MAX_SCOPE_BYTES) {
+    throw new Error("Review scope exceeds 4 MiB");
+  }
+
   const context = JSON.stringify({
     head,
     base,
@@ -199,6 +227,7 @@ export function captureScope(
     unstagedPatch,
     untracked: additional,
   });
+
   return {
     scope: {
       base,
@@ -210,157 +239,139 @@ export function captureScope(
           ...changed,
           ...stagedFiles,
           ...unstagedFiles,
-          ...untracked,
+          ...visibleUntracked,
         ]),
       ],
     },
     context,
   };
 }
+
+function runsParentDirectory(instanceFile: string): string {
+  const parent = path.join(path.dirname(instanceFile), "workflow-runs");
+  if (fs.lstatSync(parent, { throwIfNoEntry: false })?.isSymbolicLink()) {
+    throw new Error("Workflow state must not be a symlink");
+  }
+  return parent;
+}
+
 function runDirectory(instanceFile: string, id: string): string {
   sessionId(id);
-  const parent = path.join(path.dirname(instanceFile), "workflow-runs");
+  const parent = runsParentDirectory(instanceFile);
   const directory = path.join(parent, id);
-  for (const file of [parent, directory, path.join(directory, "run.json")])
-    if (fs.lstatSync(file, { throwIfNoEntry: false })?.isSymbolicLink())
+  for (const file of [directory, path.join(directory, "run.json")]) {
+    if (fs.lstatSync(file, { throwIfNoEntry: false })?.isSymbolicLink()) {
       throw new Error("Workflow state must not be a symlink");
+    }
+  }
   return directory;
 }
+
 function load(directory: string): WorkflowRun {
   const raw = readJsonObject(path.join(directory, "run.json"));
-  if (
-    raw.version !== 1 ||
-    typeof raw.id !== "string" ||
-    typeof raw.key !== "string" ||
-    typeof raw.workspace !== "string" ||
-    typeof raw.branch !== "string" ||
-    typeof raw.workflow !== "string" ||
-    typeof raw.createdAt !== "string" ||
-    typeof raw.updatedAt !== "string" ||
-    !["running", "paused", "cancelled", "completed"].includes(
-      String(raw.status),
-    ) ||
-    (raw.controlRequested !== null &&
-      raw.controlRequested !== "pause" &&
-      raw.controlRequested !== "cancel") ||
-    typeof raw.routed !== "boolean" ||
-    typeof raw.prompt !== "string" ||
-    !object(raw.scope) ||
-    typeof raw.scope.fingerprint !== "string" ||
-    typeof raw.scope.base !== "string" ||
-    typeof raw.scope.head !== "string" ||
-    typeof raw.scope.baseCommit !== "string" ||
-    !Array.isArray(raw.scope.files) ||
-    raw.scope.files.some((file) => typeof file !== "string") ||
-    !Array.isArray(raw.stages) ||
-    !Array.isArray(raw.assessments)
-  )
-    throw new Error("Invalid workflow run metadata");
-  sessionId(raw.id);
-  if (raw.execution !== undefined && raw.execution !== "native")
-    throw new Error("Invalid workflow execution mode");
-  if (raw.execution === "native") {
-    if (
-      !object(raw.owner) ||
-      !["codex", "claude", "agy"].includes(String(raw.owner.agent))
-    )
-      throw new Error("Invalid workflow parent");
-    agentAdapter(raw.owner.agent as "codex" | "claude" | "agy").observedId(
-      raw.owner.sessionId,
-    );
-    if (raw.requestId !== undefined) sessionId(raw.requestId);
+  const parsed = WorkflowRunDiskSchema.safeParse(raw);
+  if (!parsed.success) {
+    const issue = parsed.error.issues[0];
+    throw new Error(issue?.message || "Invalid workflow run metadata");
   }
-  validateAutomation(raw.config);
-  if (!Object.hasOwn(raw.config.workflows, raw.workflow))
+
+  const data = parsed.data;
+  if (data.execution === "native") {
+    if (!data.owner) {
+      throw new Error("Invalid workflow parent");
+    }
+    agentAdapter(data.owner.agent).observedId(data.owner.sessionId);
+  }
+
+  if (!Object.hasOwn(data.config.workflows, data.workflow)) {
     throw new Error("Invalid saved workflow");
-  const definition = raw.config.workflows[raw.workflow];
-  if (definition.collaboration) validateCollaborationState(raw.collaboration);
+  }
+  const definition = data.config.workflows[data.workflow];
+  if (definition.collaboration && !data.collaboration) {
+    throw new Error("Invalid collaborative workflow state");
+  }
+
   const seen = new Set<string>();
-  for (const stage of raw.stages) {
-    if (
-      !object(stage) ||
-      typeof stage.id !== "string" ||
-      !/^(?:followup-)?[a-z][a-z0-9_-]{0,63}$/.test(stage.id) ||
-      !["pending", "running", "completed", "failed", "blocked"].includes(
-        String(stage.status),
-      ) ||
-      !Number.isSafeInteger(stage.attempts) ||
-      Number(stage.attempts) < 0 ||
-      typeof stage.durationMs !== "number" ||
-      stage.durationMs < 0 ||
-      !Array.isArray(stage.after)
-    )
-      throw new Error("Invalid workflow stage metadata");
-    if (seen.has(stage.id)) throw new Error("Duplicate saved workflow stage");
+  for (const stage of data.stages) {
+    if (seen.has(stage.id)) {
+      throw new Error("Duplicate saved workflow stage");
+    }
     seen.add(stage.id);
+
     const original = definition.steps.find(
       (step) => step.id === stage.id || `followup-${step.id}` === stage.id,
     );
+    const expectedAfter = stage.id.startsWith("followup-")
+      ? [original?.id]
+      : original?.after;
     if (
       !original ||
-      JSON.stringify(stage.command) !== JSON.stringify(original.command) ||
+      !isDeepStrictEqual(stage.command, original.command) ||
       stage.agent !== original.agent ||
-      JSON.stringify(stage.after) !==
-        JSON.stringify(
-          stage.id.startsWith("followup-") ? [original.id] : original.after,
-        )
-    )
+      !isDeepStrictEqual(stage.after, expectedAfter)
+    ) {
       throw new Error("Saved workflow stage does not match its configuration");
-    if (stage.claim !== undefined) sessionId(stage.claim);
+    }
     if (
-      stage.scopeFingerprint !== undefined &&
-      typeof stage.scopeFingerprint !== "string"
-    )
-      throw new Error("Invalid stage scope fingerprint");
-    if (
-      stage.startedAt !== undefined &&
-      (typeof stage.startedAt !== "string" ||
-        !Number.isFinite(Date.parse(stage.startedAt)))
-    )
-      throw new Error("Invalid stage start time");
-    if (
-      raw.execution === "native" &&
+      data.execution === "native" &&
       stage.status === "running" &&
       (stage.claim === undefined || stage.startedAt === undefined)
-    )
+    ) {
       throw new Error("Running native stage is missing its claim");
-    if (stage.result !== undefined) validateResult(stage.result);
+    }
   }
+
   if (
-    raw.scope.files.length &&
+    data.scope.files.length > 0 &&
     definition.steps.some((step) => !seen.has(step.id))
-  )
+  ) {
     throw new Error("Saved workflow is missing configured steps");
-  return raw as unknown as WorkflowRun;
+  }
+
+  return data as unknown as WorkflowRun;
 }
+
 export function readRun(
   store: Store,
   requested?: string,
 ): { run: WorkflowRun; directory: string } {
   const [file, data] = store.current();
   let id = requested;
+
   if (!id || id === "latest") {
-    const parent = path.dirname(
-      runDirectory(file, "00000000-0000-0000-0000-000000000000"),
-    );
-    const entries = fs.existsSync(parent)
-      ? fs
-          .readdirSync(parent)
-          .filter((id) => /^[a-f0-9-]{36}$/.test(id))
-          .map((id) => load(runDirectory(file, id)))
-      : [];
-    id = entries.sort((a, b) => b.createdAt.localeCompare(a.createdAt))[0]?.id;
-    if (!id) throw new Error("No workflow runs in this RL workspace");
+    const parent = runsParentDirectory(file);
+    const indexed = readWorkflowRunsIndex(parent)?.latestRunId;
+    if (
+      indexed &&
+      /^[a-f0-9-]{36}$/.test(indexed) &&
+      fs.existsSync(path.join(parent, indexed, "run.json"))
+    ) {
+      id = indexed;
+    } else {
+      const entries = fs.existsSync(parent)
+        ? fs
+            .readdirSync(parent)
+            .filter((entryId) => /^[a-f0-9-]{36}$/.test(entryId))
+            .map((entryId) => load(runDirectory(file, entryId)))
+        : [];
+      id = entries.toSorted((a, b) => b.createdAt.localeCompare(a.createdAt))[0]
+        ?.id;
+    }
+    if (!id) {
+      throw new Error("No workflow runs in this RL workspace");
+    }
   }
-  const directory = runDirectory(file, id),
-    run = load(directory);
+
+  const directory = runDirectory(file, id);
+  const run = load(directory);
   if (
     run.id !== id ||
     run.key !== data.key ||
     run.workspace !== data.worktree ||
     run.branch !== data.branch
-  )
+  ) {
     throw new Error("Workflow run belongs to a different RL workspace");
+  }
   return { run, directory };
 }
 
@@ -369,15 +380,15 @@ export function boundAntigravityPeer(
   instanceFile: string,
   data: Instance,
   conversation: string,
-) {
-  const parent = path.dirname(
-    runDirectory(instanceFile, "00000000-0000-0000-0000-000000000000"),
-  );
-  if (!fs.existsSync(parent)) return undefined;
-  for (const id of fs
-    .readdirSync(parent)
-    .filter((id) => /^[a-f0-9-]{36}$/.test(id))) {
-    const directory = runDirectory(instanceFile, id);
+): { run: WorkflowRun; stage: Stage } | undefined {
+  const parent = runsParentDirectory(instanceFile);
+  if (!fs.existsSync(parent)) {
+    return undefined;
+  }
+
+  const verifyRunPeer = (
+    directory: string,
+  ): { run: WorkflowRun; stage: Stage } | undefined => {
     const candidate = readJsonObject(path.join(directory, "run.json"));
     if (
       !object(candidate.owner) ||
@@ -387,23 +398,47 @@ export function boundAntigravityPeer(
       !candidate.stages.some(
         (stage) => object(stage) && stage.childId === conversation,
       )
-    )
-      continue;
+    ) {
+      return undefined;
+    }
     const run = load(directory);
     if (
       run.key !== data.key ||
       run.workspace !== data.worktree ||
       run.branch !== data.branch ||
       run.execution !== "native"
-    )
+    ) {
       throw new Error(
         "Native peer binding belongs to a different RL workspace",
       );
-    const stage = run.stages.find((stage) => stage.childId === conversation)!;
+    }
+    const stage = run.stages.find((s) => s.childId === conversation)!;
     return { run, stage };
+  };
+
+  const indexed = readWorkflowRunsIndex(parent)?.peerBindings[conversation];
+  if (
+    indexed &&
+    /^[a-f0-9-]{36}$/.test(indexed.runId) &&
+    fs.existsSync(path.join(parent, indexed.runId, "run.json"))
+  ) {
+    const matched = verifyRunPeer(runDirectory(instanceFile, indexed.runId));
+    if (matched) {
+      return matched;
+    }
+  }
+
+  for (const id of fs
+    .readdirSync(parent)
+    .filter((entryId) => /^[a-f0-9-]{36}$/.test(entryId))) {
+    const matched = verifyRunPeer(runDirectory(instanceFile, id));
+    if (matched) {
+      return matched;
+    }
   }
   return undefined;
 }
+
 export async function controlRun(
   store: Store,
   id: string | undefined,
@@ -411,16 +446,19 @@ export async function controlRun(
 ): Promise<WorkflowRun> {
   return store.locked(() => {
     const { run, directory } = readRun(store, id);
-    if (run.status === "completed")
+    if (run.status === "completed") {
       throw new Error("Workflow has already completed");
+    }
     run.controlRequested = action;
-    if (run.execution === "native" || run.status !== "running")
+    if (run.execution === "native" || run.status !== "running") {
       run.status = action === "pause" ? "paused" : "cancelled";
+    }
     run.updatedAt = now();
     writeJson(path.join(directory, "run.json"), run);
     return run;
   });
 }
+
 export function evaluation(
   run: WorkflowRun,
   policy = run.config.policies[run.config.workflows[run.workflow].policy],
@@ -428,6 +466,7 @@ export function evaluation(
   const currentScope = (stage: Stage) =>
     stage.scopeFingerprint === undefined ||
     stage.scopeFingerprint === run.scope.fingerprint;
+
   const reports = run.stages
     .filter(
       (stage): stage is Stage & { result: ReviewResult } =>
@@ -436,55 +475,70 @@ export function evaluation(
         currentScope(stage),
     )
     .map((stage) => ({ owner: stage.id, result: stage.result }));
+
   const collaboration = collaborationAssessment(run);
   reports.push(...collaboration.reports);
+
   const limitations = run.stages
     .filter((stage) => stage.status !== "completed")
     .map((stage) => `${stage.id}: ${stage.error ?? stage.status}`);
-  if (run.status !== "completed") limitations.push(`Run ${run.status}`);
+  if (run.status !== "completed") {
+    limitations.push(`Run ${run.status}`);
+  }
   limitations.push(...collaboration.limitations);
+
   for (const stage of run.stages.filter(
-    (stage) => stage.status === "completed" && !currentScope(stage),
+    (s) => s.status === "completed" && !currentScope(s),
   )) {
     if (
       stage.agent &&
       run.config.agents[stage.agent].access === "workspace-write"
-    )
+    ) {
       continue;
+    }
     const refreshed = run.stages.some(
       (other) =>
         other.status === "completed" &&
         currentScope(other) &&
         (stage.agent
           ? other.agent === stage.agent
-          : JSON.stringify(other.command) === JSON.stringify(stage.command)),
+          : isDeepStrictEqual(other.command, stage.command)),
     );
-    if (!refreshed)
+    if (!refreshed) {
       limitations.push(
         `${stage.id}: result predates workspace changes; rerun this role/check after writing`,
       );
+    }
   }
-  for (const stage of run.stages)
-    if (stage.id.startsWith("followup-") && stage.result?.routingLeads.length)
+
+  for (const stage of run.stages) {
+    if (stage.id.startsWith("followup-") && stage.result?.routingLeads.length) {
       limitations.push(`${stage.id}: further routing leads require review`);
-  for (const { owner, result } of reports)
+    }
+  }
+
+  for (const { owner, result } of reports) {
     for (const requested of result.checkRequests) {
       const check = run.stages.find(
         (step) => step.id === requested && step.command,
       );
-      if (!check || check.status !== "completed" || !currentScope(check))
+      if (!check || check.status !== "completed" || !currentScope(check)) {
         limitations.push(
           `${owner}: requested check ${requested} was not completed`,
         );
+      }
     }
+  }
+
   const result = evaluate(policy, reports, limitations);
-  if (!run.scope.files.length) {
+  if (run.scope.files.length === 0) {
     result.score = null;
     result.verdict = "incomplete";
     result.limitations.push("No changes to review");
   }
   return result;
 }
+
 export function runMetrics(run: WorkflowRun) {
   const agents = run.stages.filter((stage) => stage.agent && stage.attempts);
   const reported = agents.flatMap((stage) =>
@@ -493,10 +547,11 @@ export function runMetrics(run: WorkflowRun) {
   const total = (key: keyof Usage) =>
     reported.length === agents.length &&
     agents.every((stage) => stage.attempts === 1) &&
-    reported.length &&
+    reported.length > 0 &&
     reported.every((item) => item[key] !== null)
       ? reported.reduce((sum, item) => sum + item[key]!, 0)
       : null;
+
   return {
     execution: run.execution ?? "legacy",
     usageSource:
@@ -513,7 +568,7 @@ export function runMetrics(run: WorkflowRun) {
     inputTokens: total("inputTokens"),
     outputTokens: total("outputTokens"),
     costUsd: total("costUsd"),
-    usageCoverage: `${reported.length}/${run.stages.filter((step) => step.agent && step.attempts).length} agent stages`,
+    usageCoverage: `${reported.length}/${agents.length} agent stages`,
     ...(run.collaboration
       ? {
           collaboration: {
@@ -526,9 +581,8 @@ export function runMetrics(run: WorkflowRun) {
               (item) => !item.supersededBy && item.review?.accepted,
             ).length,
             latestRating:
-              [...run.collaboration.submissions]
-                .reverse()
-                .find((item) => item.review)?.review?.rating ?? null,
+              run.collaboration.submissions.findLast((item) => item.review)
+                ?.review?.rating ?? null,
           },
         }
       : {}),
@@ -541,18 +595,21 @@ export function runMetrics(run: WorkflowRun) {
     })),
   };
 }
+
 export async function rescoreRun(
   store: Store,
   id: string | undefined,
   policy: string,
   config: AutomationConfig,
 ): Promise<WorkflowRun> {
-  if (!Object.hasOwn(config.policies, policy))
+  if (!Object.hasOwn(config.policies, policy)) {
     throw new Error(`Unknown policy: ${policy}`);
+  }
   return store.locked(() => {
     const { run, directory } = readRun(store, id);
-    if (run.status === "running")
+    if (run.status === "running") {
       throw new Error("Wait for the run to stop before rescoring");
+    }
     run.evaluation = evaluation(run, config.policies[policy]);
     run.assessments.push({
       at: now(),
@@ -565,6 +622,7 @@ export async function rescoreRun(
     return run;
   });
 }
+
 export function createRunLocked(
   store: Store,
   config: AutomationConfig,
@@ -572,12 +630,15 @@ export function createRunLocked(
   base: string,
   prompt: string,
 ): { run: WorkflowRun; directory: string } {
-  if (!Object.hasOwn(config.workflows, workflow))
+  if (!Object.hasOwn(config.workflows, workflow)) {
     throw new Error(`Unknown workflow: ${workflow}`);
+  }
   const [file, data] = store.current();
-  const { scope, context } = captureScope(data.worktree, base),
-    id = randomUUID();
+  const { scope, context } = captureScope(data.worktree, base);
+  const id = randomUUID();
   const directory = runDirectory(file, id);
+  const created = now();
+
   const run: WorkflowRun = {
     version: 1,
     id,
@@ -585,8 +646,8 @@ export function createRunLocked(
     workspace: data.worktree,
     branch: data.branch,
     workflow,
-    createdAt: now(),
-    updatedAt: now(),
+    createdAt: created,
+    updatedAt: created,
     status: "paused",
     controlRequested: null,
     config: structuredClone(config),
@@ -601,22 +662,30 @@ export function createRunLocked(
       durationMs: 0,
     })),
   };
+
   initializeCollaboration(run);
   fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
   fs.writeFileSync(path.join(directory, "scope.json"), context, {
     mode: 0o600,
   });
   writeJson(path.join(directory, "run.json"), run);
+
+  const parent = path.dirname(directory);
+  updateWorkflowRunsIndex(parent, { latestRunId: id });
+  pruneTerminalWorkflowRuns(parent);
+
   return { run, directory };
 }
+
 export function planRun(
   store: Store,
   config: AutomationConfig,
   workflow: string,
   base: string,
 ) {
-  if (!Object.hasOwn(config.workflows, workflow))
+  if (!Object.hasOwn(config.workflows, workflow)) {
     throw new Error(`Unknown workflow: ${workflow}`);
+  }
   const [, data] = store.current();
   return {
     workspace: data.worktree,
@@ -626,6 +695,7 @@ export function planRun(
     policy: config.workflows[workflow].policy,
   };
 }
+
 export interface RunSummary {
   id: string;
   workflow: string;
@@ -637,16 +707,21 @@ export interface RunSummary {
   execution?: "native";
   owner?: WorkflowRun["owner"];
 }
+
 export function workflowSummary(store: Store): RunSummary | null {
   const [file] = store.current();
-  const parent = path.dirname(
-    runDirectory(file, "00000000-0000-0000-0000-000000000000"),
-  );
-  if (
-    !fs.existsSync(parent) ||
-    !fs.readdirSync(parent).some((id) => /^[a-f0-9-]{36}$/.test(id))
-  )
+  const parent = runsParentDirectory(file);
+  if (!fs.existsSync(parent)) {
     return null;
+  }
+  const indexed = readWorkflowRunsIndex(parent)?.latestRunId;
+  const hasAnyRun =
+    (indexed && fs.existsSync(path.join(parent, indexed, "run.json"))) ||
+    fs.readdirSync(parent).some((id) => /^[a-f0-9-]{36}$/.test(id));
+  if (!hasAnyRun) {
+    return null;
+  }
+
   const { run } = readRun(store);
   return {
     id: run.id,

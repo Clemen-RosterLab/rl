@@ -1,6 +1,12 @@
 import fs from "node:fs";
 import path from "node:path";
-import { stripVTControlCharacters } from "node:util";
+import { lastAccessed } from "./access.js";
+import { protectedCleanupName } from "./cleanup-path.js";
+import {
+  commandContext,
+  contextOptions,
+  type CommandContext,
+} from "./command-context.js";
 import {
   args,
   arity,
@@ -12,44 +18,22 @@ import {
   message,
 } from "./common.js";
 import {
-  commandContext,
-  contextOptions,
-  type CommandContext,
-} from "./command-context.js";
-import { lastAccessed } from "./access.js";
-import { protectedCleanupName } from "./cleanup-path.js";
-import { containedPath, readWorkflowConfig } from "./workflow-config.js";
-import { worktrees } from "./repos.js";
+  BUILD_AND_CACHE_DIRECTORIES,
+  DEPENDENCY_DIRECTORIES,
+} from "./core/protected-paths.js";
+import { UsageError } from "./errors.js";
 import {
   assertReady,
   GIT_WORKFLOW_DIRECTORY,
   GIT_WORKFLOW_LOCK,
 } from "./git-safety.js";
+import { worktrees } from "./repos.js";
 import type { Instance } from "./store.js";
+import { sanitizeTerminalText } from "./tui/ansi.js";
+import { containedPath, readWorkflowConfig } from "./workflow-config.js";
 
-const DEPENDENCIES = new Set(["node_modules", ".venv", "venv"]);
-const BUILDS = new Set([
-  ".next",
-  ".nuxt",
-  ".turbo",
-  ".cache",
-  ".tmp",
-  "tmp",
-  "temp",
-  "dist",
-  "build",
-  "coverage",
-  ".vite",
-  "out",
-  "target",
-  "__pycache__",
-  ".pytest_cache",
-  ".mypy_cache",
-  ".ruff_cache",
-  ".parcel-cache",
-  ".svelte-kit",
-]);
-type Category = "dependenciesBytes" | "buildsBytes" | "otherBytes";
+type UsageCategory = "dependenciesBytes" | "buildsBytes" | "otherBytes";
+
 interface Usage {
   allocatedBytes: number;
   logicalBytes: number;
@@ -61,40 +45,44 @@ interface Usage {
   symlinks: number;
   largestPaths: { path: string; allocatedBytes: number }[];
 }
-interface Target {
+
+interface CleanupTarget {
   path: string;
   relative: string;
   dev: number;
   ino: number;
-  usage: Usage;
 }
-const visible = (value: string) =>
-  stripVTControlCharacters(value).replace(/[\x00-\x1f\x7f-\x9f]/g, " ");
+
 export function size(bytes: number): string {
   const units = ["B", "KiB", "MiB", "GiB", "TiB"];
-  let i = 0;
-  while (bytes >= 1024 && i < units.length - 1) {
-    bytes /= 1024;
-    i++;
+  let index = 0;
+  let scaled = bytes;
+  while (scaled >= 1024 && index < units.length - 1) {
+    scaled /= 1024;
+    index++;
   }
-  return `${i ? bytes.toFixed(1) : bytes} ${units[i]}`;
+  return `${index > 0 ? scaled.toFixed(1) : scaled} ${units[index]}`;
 }
-function category(relative: string, clean: string[]): Category {
+
+function classifyCategory(relative: string, clean: string[]): UsageCategory {
   const parts = relative.split(path.sep);
-  if (parts.some((part) => DEPENDENCIES.has(part))) return "dependenciesBytes";
+  if (parts.some((part) => DEPENDENCY_DIRECTORIES.has(part))) {
+    return "dependenciesBytes";
+  }
   if (
-    parts.some((part) => BUILDS.has(part)) ||
+    parts.some((part) => BUILD_AND_CACHE_DIRECTORIES.has(part)) ||
     clean.some(
       (item) => relative === item || relative.startsWith(item + path.sep),
     )
-  )
+  ) {
     return "buildsBytes";
+  }
   return "otherBytes";
 }
 
 /** Read only this directory tree. Never follow symlinks or enter Git metadata. */
-function measure(
-  roots: { path: string; relative: string }[],
+function measureTree(
+  initialRoots: { path: string; relative: string }[],
   clean: string[],
   protect = false,
 ): Usage {
@@ -114,29 +102,39 @@ function measure(
     string,
     { bytes: number; seen: number; count: number }
   >();
-  const pending = [...roots];
-  while (pending.length) {
+  const pending = [...initialRoots];
+
+  while (pending.length > 0) {
     const item = pending.pop()!;
     const name = path.basename(item.path);
-    if (protect && protectedCleanupName(name))
+    if (protect && protectedCleanupName(name)) {
       throw new Error(
         `Cleanup contains protected metadata or credentials: ${item.relative}`,
       );
-    if (!protect && name === ".git") continue;
+    }
+    if (!protect && name === ".git") {
+      continue;
+    }
+
     const stat = fs.lstatSync(item.path);
     const bytes = stat.blocks * 512;
-    const kind = category(item.relative, clean);
+    const kind = classifyCategory(item.relative, clean);
     let counted = true;
+
     if (stat.isDirectory()) {
-      for (const child of fs.readdirSync(item.path).sort().reverse())
+      for (const child of fs.readdirSync(item.path).toSorted().toReversed()) {
         pending.push({
           path: path.join(item.path, child),
           relative: path.join(item.relative, child),
         });
+      }
       usage.estimatedBytes += bytes;
     } else if (stat.isFile() || stat.isSymbolicLink()) {
-      if (stat.isSymbolicLink()) usage.symlinks++;
-      else usage.files++;
+      if (stat.isSymbolicLink()) {
+        usage.symlinks++;
+      } else {
+        usage.files++;
+      }
       usage.logicalBytes += stat.size;
       if (stat.nlink > 1) {
         const key = `${stat.dev}:${stat.ino}`;
@@ -144,36 +142,52 @@ function measure(
         if (previous) {
           previous.seen++;
           counted = false;
-        } else links.set(key, { bytes, seen: 1, count: stat.nlink });
-      } else usage.estimatedBytes += bytes;
-    } else if (protect)
+        } else {
+          links.set(key, { bytes, seen: 1, count: stat.nlink });
+        }
+      } else {
+        usage.estimatedBytes += bytes;
+      }
+    } else if (protect) {
       throw new Error(`Cleanup contains a special file: ${item.relative}`);
+    }
+
     if (counted) {
       usage.allocatedBytes += bytes;
       usage[kind] += bytes;
       const top = item.relative.split(path.sep)[0];
-      if (top) largest.set(top, (largest.get(top) ?? 0) + bytes);
+      if (top) {
+        largest.set(top, (largest.get(top) ?? 0) + bytes);
+      }
     }
   }
-  for (const link of links.values())
-    if (link.seen >= link.count) usage.estimatedBytes += link.bytes;
+
+  for (const link of links.values()) {
+    if (link.seen >= link.count) {
+      usage.estimatedBytes += link.bytes;
+    }
+  }
+
   usage.largestPaths = [...largest]
-    .map(([path, allocatedBytes]) => ({ path, allocatedBytes }))
-    .sort(
+    .map(([entryPath, allocatedBytes]) => ({ path: entryPath, allocatedBytes }))
+    .toSorted(
       (a, b) =>
         b.allocatedBytes - a.allocatedBytes || a.path.localeCompare(b.path),
     );
+
   return usage;
 }
-function roots(clean: string[]): string[] {
-  const sorted = [...new Set(clean)].sort(
+
+function deduplicateCleanRoots(clean: string[]): string[] {
+  const sorted = [...new Set(clean)].toSorted(
     (a, b) => a.length - b.length || a.localeCompare(b),
   );
   return sorted.filter(
     (item, index) =>
-      !sorted.slice(0, index).some((parent) => item.startsWith(parent + "/")),
+      !sorted.slice(0, index).some((parent) => item.startsWith(`${parent}/`)),
   );
 }
+
 function validateIgnored(workspace: string, relative: string): void {
   if (
     git(
@@ -185,10 +199,11 @@ function validateIgnored(workspace: string, relative: string): void {
       "--",
       relative,
     )
-  )
+  ) {
     throw new Error(`Cleanup path contains tracked files: ${relative}`);
+  }
   try {
-    git(workspace, "check-ignore", "--no-index", "--", relative + "/");
+    git(workspace, "check-ignore", "--no-index", "--", `${relative}/`);
   } catch {
     throw new Error(`Cleanup path must be ignored by Git: ${relative}`);
   }
@@ -203,47 +218,77 @@ function validateIgnored(workspace: string, relative: string): void {
       "--",
       relative,
     )
-  )
+  ) {
     throw new Error(`Cleanup path contains non-ignored files: ${relative}`);
+  }
 }
-function plan(workspace: string, clean: string[]): Target[] {
-  return roots(clean).flatMap((relative) => {
+
+function buildCleanupPlan(
+  workspace: string,
+  clean: string[],
+): { targets: CleanupTarget[]; estimatedBytes: number } {
+  const targets = deduplicateCleanRoots(clean).flatMap((relative) => {
     const target = containedPath(workspace, relative);
-    if (!fs.existsSync(target)) return [];
+    if (!fs.existsSync(target)) {
+      return [];
+    }
     const stat = fs.lstatSync(target);
-    if (!stat.isDirectory())
+    if (!stat.isDirectory()) {
       throw new Error(`Cleanup target must be a directory: ${relative}`);
+    }
     validateIgnored(workspace, relative);
     const cwd = canonical(process.cwd());
-    if (cwd === target || inside(cwd, target))
+    if (cwd === target || inside(cwd, target)) {
       throw new Error(
         `Cleanup would remove the current directory: ${relative}. Change to the workspace root first`,
       );
+    }
     return [
       {
         path: target,
         relative,
         dev: stat.dev,
         ino: stat.ino,
-        usage: measure([{ path: target, relative }], clean, true),
       },
     ];
   });
+
+  // Measure all targets together in a single traversal so hard-link deduplication
+  // across targets is exact without walking node_modules multiple times.
+  const estimatedBytes =
+    targets.length > 0
+      ? measureTree(
+          targets.map((target) => ({
+            path: target.path,
+            relative: target.relative,
+          })),
+          clean,
+          true,
+        ).estimatedBytes
+      : 0;
+
+  return { targets, estimatedBytes };
 }
-function verifyTarget(workspace: string, target: Target): void {
+
+function verifyTargetIdentity(workspace: string, target: CleanupTarget): void {
   const current = containedPath(workspace, target.relative);
   const stat = fs.lstatSync(current);
-  if (!stat.isDirectory() || stat.dev !== target.dev || stat.ino !== target.ino)
+  if (
+    !stat.isDirectory() ||
+    stat.dev !== target.dev ||
+    stat.ino !== target.ino
+  ) {
     throw new Error(
       `Cleanup directory changed during inspection: ${target.relative}`,
     );
+  }
   validateIgnored(workspace, target.relative);
 }
 
 /** Stage within the current workspace before deletion; validation failures restore artifacts. */
-function remove(
+function stageAndRemove(
   workspace: string,
-  targets: Target[],
+  targets: CleanupTarget[],
   recheck: () => void,
 ): string[] {
   const holding = fs.mkdtempSync(path.join(workspace, ".rl-clean-"));
@@ -261,101 +306,125 @@ function remove(
       return false;
     }
   };
-  const staged: { target: Target; path: string }[] = [];
+
+  const staged: { target: CleanupTarget; path: string }[] = [];
   const removed: string[] = [];
+
   try {
     for (const target of targets) {
       recheck();
-      verifyTarget(workspace, target);
+      verifyTargetIdentity(workspace, target);
       const destination = path.join(holding, String(staged.length));
       fs.renameSync(target.path, destination);
       staged.push({ target, path: destination });
+
       const stat = fs.lstatSync(destination);
       if (
         stat.dev !== target.dev ||
         stat.ino !== target.ino ||
         !stat.isDirectory()
-      )
+      ) {
         throw new Error("Cleanup directory changed while staging");
+      }
       // Recheck credentials/metadata added while the initial plan was being built.
-      measure([{ path: destination, relative: target.relative }], [], true);
+      measureTree([{ path: destination, relative: target.relative }], [], true);
     }
+
     recheck();
-    for (const item of staged) validateIgnored(workspace, item.target.relative);
+    for (const item of staged) {
+      validateIgnored(workspace, item.target.relative);
+    }
+
     for (const item of staged) {
       recheck();
-      if (!holdingValid()) throw new Error("Cleanup staging directory changed");
+      if (!holdingValid()) {
+        throw new Error("Cleanup staging directory changed");
+      }
       const stagedIdentity = fs.lstatSync(item.path);
       if (
         !stagedIdentity.isDirectory() ||
         stagedIdentity.dev !== item.target.dev ||
         stagedIdentity.ino !== item.target.ino
-      )
+      ) {
         throw new Error("Cleanup artifact changed before removal");
+      }
       fs.rmSync(item.path, { recursive: true });
       removed.push(item.target.relative);
     }
     return removed;
   } catch (error) {
-    // A replaced staging path must never redirect rollback into another directory.
-    if (!holdingValid())
+    if (!holdingValid()) {
       throw new Error(
         `${message(error)}. Staging path changed; inspect retained artifacts in the current workspace`,
+        { cause: error },
       );
-    for (const item of staged.reverse()) {
+    }
+    for (const item of staged.toReversed()) {
       if (!fs.existsSync(item.path)) continue;
       try {
         containedPath(workspace, item.target.relative);
-        if (!fs.existsSync(item.target.path))
+        if (!fs.existsSync(item.target.path)) {
           fs.renameSync(item.path, item.target.path);
+        }
       } catch {
-        /* Preserve artifacts in the staging directory on restore failure. */
+        // Preserve artifacts in the staging directory on restore failure.
       }
     }
-    throw new Error(
-      `${message(error)}${fs.readdirSync(holding).length ? `. Remaining artifacts retained at ${holding}` : ""}`,
-    );
+    const retainedSuffix = fs.readdirSync(holding).length
+      ? `. Remaining artifacts retained at ${holding}`
+      : "";
+    throw new Error(`${message(error)}${retainedSuffix}`, { cause: error });
   } finally {
-    if (holdingValid() && !fs.readdirSync(holding).length)
+    if (holdingValid() && fs.readdirSync(holding).length === 0) {
       fs.rmdirSync(holding);
+    }
   }
 }
-function suggestions(
+
+function buildStorageSuggestions(
   data: Instance,
   usage: Usage,
   estimatedBytes: number,
   days: number,
 ): string[] {
   const result: string[] = [];
-  if (estimatedBytes)
+  if (estimatedBytes > 0) {
     result.push(
       `Run rl storage clean --dry-run to preview ${size(estimatedBytes)} of configured generated files.`,
     );
-  else if (usage.dependenciesBytes || usage.buildsBytes)
+  } else if (usage.dependenciesBytes > 0 || usage.buildsBytes > 0) {
     result.push(
       "Add generated directory paths to the clean list in this workspace's .rl/workflows.json.",
     );
+  }
+
   const accessed = lastAccessed(data);
-  if (accessed && Date.now() - Date.parse(accessed) >= days * 86_400_000)
+  if (accessed && Date.now() - Date.parse(accessed) >= days * 86_400_000) {
     result.push(`This workspace has not been used for at least ${days} days.`);
-  if (String(data.pr?.state).toUpperCase() === "MERGED")
+  }
+  if (String(data.pr?.state).toUpperCase() === "MERGED") {
     result.push(
       "The cached PR is merged. Consider deleting this workspace when finished.",
     );
+  }
   return result;
 }
 
 /** Standard top-level artifacts are eligible only when ignored by this checkout. */
 function defaultCleanupPaths(workspace: string): string[] {
-  return [...BUILDS, ...DEPENDENCIES].filter((relative) => {
-    if (!fs.existsSync(path.join(workspace, relative))) return false;
-    try {
-      git(workspace, "check-ignore", "--no-index", "--", relative + "/");
-      return true;
-    } catch {
-      return false;
-    }
-  });
+  return [...BUILD_AND_CACHE_DIRECTORIES, ...DEPENDENCY_DIRECTORIES].filter(
+    (relative) => {
+      if (!fs.existsSync(path.join(workspace, relative))) {
+        return false;
+      }
+      try {
+        git(workspace, "check-ignore", "--no-index", "--", `${relative}/`);
+        return true;
+      } catch {
+        return false;
+      }
+    },
+  );
 }
 
 export interface CleanupReport {
@@ -366,7 +435,7 @@ export interface CleanupReport {
   removedPaths: string[];
 }
 
-/** The caller holds GIT_WORKFLOW_LOCK for mutation. A preview writes nothing. */
+/** The caller holds `GIT_WORKFLOW_LOCK` for mutation. A preview writes nothing. */
 export function cleanWorkspace(
   context: CommandContext,
   requested: string,
@@ -374,25 +443,32 @@ export function cleanWorkspace(
   useDefaults = false,
 ): CleanupReport {
   const [root, branch] = context.store.worktree(requested);
-  if (root !== requested)
+  if (root !== requested) {
     throw new Error("Cleanup requires an RL worktree root");
-  const owned = () =>
+  }
+
+  const findOwned = () =>
     context.store
       .records()
       .find(
         ([, instance]) =>
           instance.status === "active" && instance.worktree === root,
       );
-  const original = owned();
-  if (!original && !inside(root, context.managedDir))
+
+  const original = findOwned();
+  if (!original && !inside(root, context.managedDir)) {
     throw new Error("Cleanup target is not an RL worktree");
-  if (original && original[1].branch !== branch)
+  }
+  if (original && original[1].branch !== branch) {
     throw new Error(
       `Instance owns branch ${original[1].branch}; current branch is ${branch}`,
     );
+  }
+
   const identity = fs.lstatSync(root);
   const fallbackClean = useDefaults ? defaultCleanupPaths(root) : undefined;
   const clean = readWorkflowConfig(root, fallbackClean).clean;
+
   const recheck = () => {
     const currentIdentity = fs.lstatSync(root);
     if (
@@ -400,22 +476,27 @@ export function cleanWorkspace(
       currentIdentity.dev !== identity.dev ||
       currentIdentity.ino !== identity.ino ||
       canonical(root) !== root
-    )
+    ) {
       throw new Error("Workspace directory changed during cleanup");
-    const current = owned();
-    if (current?.[1].key !== original?.[1].key)
+    }
+    const current = findOwned();
+    if (current?.[1].key !== original?.[1].key) {
       throw new Error("RL workspace changed during cleanup");
-    if (context.store.worktree(root)[0] !== root)
+    }
+    if (context.store.worktree(root)[0] !== root) {
       throw new Error("Worktree identity changed during cleanup");
+    }
     assertReady(root, false, branch);
     if (
       JSON.stringify(readWorkflowConfig(root, fallbackClean).clean) !==
       JSON.stringify(clean)
-    )
+    ) {
       throw new Error("Cleanup configuration changed; retry");
+    }
   };
+
   recheck();
-  const targets = plan(root, clean);
+  const { targets, estimatedBytes } = buildCleanupPlan(root, clean);
   const registered = worktrees(context.repo);
   if (
     targets.some((target) =>
@@ -424,20 +505,13 @@ export function cleanWorkspace(
         return otherRoot === target.path || inside(otherRoot, target.path);
       }),
     )
-  )
+  ) {
     throw new Error("Cleanup contains another registered worktree");
-  const estimatedBytes = targets.length
-    ? measure(
-        targets.map((target) => ({
-          path: target.path,
-          relative: target.relative,
-        })),
-        clean,
-        true,
-      ).estimatedBytes
-    : 0;
+  }
+
   const removedPaths =
-    !dryRun && targets.length ? remove(root, targets, recheck) : [];
+    !dryRun && targets.length > 0 ? stageAndRemove(root, targets, recheck) : [];
+
   return {
     workspace: { id: original?.[1].id ?? branch, branch, path: root },
     dryRun,
@@ -459,49 +533,49 @@ export async function main(argv: string[]): Promise<number> {
     rest = rest.slice(1);
   }
   arity(rest, 0);
+
   if (
-    !["storage", "clean"].includes(command) ||
+    (command !== "storage" && command !== "clean") ||
     (command === "storage" && values["dry-run"]) ||
     (command === "clean" && values["older-than"] !== undefined)
-  )
-    throw new Error(
+  ) {
+    throw new UsageError(
       "Usage: rl storage [--json] [--older-than 14d] | rl storage clean [--dry-run] [--json] (current workspace only)",
     );
+  }
+
   const context = commandContext(values);
-  // Resolve from the caller's cwd before any scan, lock creation, or mutation.
   const [, data] = context.store.current();
   const clean = readWorkflowConfig(data.worktree).clean;
   const workspace = { id: data.id, branch: data.branch, path: data.worktree };
+
   const days = Number(String(values["older-than"] ?? "14d").replace(/d$/, ""));
-  if (!Number.isInteger(days) || days < 1 || days > 36500)
-    throw new Error(
+  if (!Number.isInteger(days) || days < 1 || days > 36500) {
+    throw new UsageError(
       "--older-than must be a positive number of days, such as 14d",
     );
+  }
+
   if (command === "storage") {
-    const usage = measure(
+    const usage = measureTree(
       fs.readdirSync(data.worktree).map((name) => ({
         path: path.join(data.worktree, name),
         relative: name,
       })),
       clean,
     );
-    let targets: Target[] = [],
-      cleanupError: string | null = null;
+
+    let targets: CleanupTarget[] = [];
+    let estimatedBytes = 0;
+    let cleanupError: string | null = null;
     try {
-      targets = plan(data.worktree, clean);
+      const planned = buildCleanupPlan(data.worktree, clean);
+      targets = planned.targets;
+      estimatedBytes = planned.estimatedBytes;
     } catch (error) {
       cleanupError = message(error);
     }
-    const estimatedBytes = targets.length
-      ? measure(
-          targets.map((target) => ({
-            path: target.path,
-            relative: target.relative,
-          })),
-          clean,
-          true,
-        ).estimatedBytes
-      : 0;
+
     const report = {
       workspace,
       usage,
@@ -512,56 +586,70 @@ export async function main(argv: string[]): Promise<number> {
         error: cleanupError,
       },
       lastAccessedAt: lastAccessed(data) ?? null,
-      suggestions: suggestions(data, usage, estimatedBytes, days),
+      suggestions: buildStorageSuggestions(data, usage, estimatedBytes, days),
     };
-    if (values.json) json(report);
-    else {
+
+    if (values.json) {
+      json(report);
+    } else {
       console.log(
-        `Storage: ${visible(data.id)} (${visible(data.branch)})\n${visible(data.worktree)}\n\nTotal: ${size(usage.allocatedBytes)}\nDependencies: ${size(usage.dependenciesBytes)}\nBuilds / caches: ${size(usage.buildsBytes)}\nOther: ${size(usage.otherBytes)}\nConfigured cleanup: ${size(estimatedBytes)} estimated`,
+        `Storage: ${sanitizeTerminalText(data.id)} (${sanitizeTerminalText(data.branch)})\n${sanitizeTerminalText(data.worktree)}\n\nTotal: ${size(usage.allocatedBytes)}\nDependencies: ${size(usage.dependenciesBytes)}\nBuilds / caches: ${size(usage.buildsBytes)}\nOther: ${size(usage.otherBytes)}\nConfigured cleanup: ${size(estimatedBytes)} estimated`,
       );
       console.log("\nLargest paths:");
-      for (const item of usage.largestPaths.slice(0, 8))
+      for (const item of usage.largestPaths.slice(0, 8)) {
         console.log(
-          `  ${size(item.allocatedBytes).padStart(12)}  ${visible(item.path)}`,
+          `  ${size(item.allocatedBytes).padStart(12)}  ${sanitizeTerminalText(item.path)}`,
         );
-      if (cleanupError)
-        console.log(`\nCleanup unavailable: ${visible(cleanupError)}`);
-      for (const item of report.suggestions) console.log(`\n${item}`);
+      }
+      if (cleanupError) {
+        console.log(
+          `\nCleanup unavailable: ${sanitizeTerminalText(cleanupError)}`,
+        );
+      }
+      for (const item of report.suggestions) {
+        console.log(`\n${item}`);
+      }
       console.log(
         "\nApproximate sizes; filesystem sharing can reduce the space actually freed.",
       );
     }
     return 0;
   }
+
+  const dryRun = Boolean(values["dry-run"]);
   const perform = () => {
-    const report = cleanWorkspace(context, data.worktree, !!values["dry-run"]);
-    if (values.json) json(report);
-    else {
+    const report = cleanWorkspace(context, data.worktree, dryRun);
+    if (values.json) {
+      json(report);
+    } else {
       console.log(
-        `${values["dry-run"] ? "Cleanup preview" : "Cleanup"}: ${visible(data.id)}\n${visible(data.worktree)}`,
+        `${dryRun ? "Cleanup preview" : "Cleanup"}: ${sanitizeTerminalText(data.id)}\n${sanitizeTerminalText(data.worktree)}`,
       );
-      for (const relative of report.paths)
+      for (const relative of report.paths) {
         console.log(
-          `  ${values["dry-run"] ? "Would remove" : "Removed"} ${visible(relative)}`,
+          `  ${dryRun ? "Would remove" : "Removed"} ${sanitizeTerminalText(relative)}`,
         );
+      }
       console.log(
-        `Estimated ${values["dry-run"] ? "space to free" : "cleanup size"}: ${size(report.estimatedBytes)}`,
+        `Estimated ${dryRun ? "space to free" : "cleanup size"}: ${size(report.estimatedBytes)}`,
       );
-      if (!clean.length)
+      if (clean.length === 0) {
         console.log(
           'Configure "clean": ["node_modules", ".next", ".turbo"] in this workspace\'s .rl/workflows.json first.',
         );
-      else if (!report.paths.length)
+      } else if (report.paths.length === 0) {
         console.log("No configured generated directories exist.");
+      }
     }
     return 0;
   };
-  // A preview does not create locks or write RL state.
-  return values["dry-run"] || !clean.length
-    ? perform()
-    : locked(
-        path.join(context.store.root, GIT_WORKFLOW_DIRECTORY),
-        GIT_WORKFLOW_LOCK,
-        perform,
-      );
+
+  if (dryRun || clean.length === 0) {
+    return perform();
+  }
+  return locked(
+    path.join(context.store.root, GIT_WORKFLOW_DIRECTORY),
+    GIT_WORKFLOW_LOCK,
+    perform,
+  );
 }

@@ -1,10 +1,11 @@
 import {
-  fields,
   SEVERITIES,
   type ReviewPolicy,
   type Severity,
 } from "./automation-config.js";
-import path from "node:path";
+import type { JsonObject } from "./json.js";
+import { ReviewResultSchema } from "./schemas/automation.js";
+import { toCleanJsonSchema } from "./schemas/common.js";
 
 export interface Finding {
   title: string;
@@ -17,6 +18,7 @@ export interface Finding {
   recommendation: string;
   confidence: "observed" | "inferred";
 }
+
 export interface ReviewResult {
   summary: string;
   complete: boolean;
@@ -25,115 +27,23 @@ export interface ReviewResult {
   checkRequests: string[];
   routingLeads: { owner: string; file: string; reason: string }[];
 }
-const string = { type: "string" };
-const findingProperties = {
-  title: string,
-  severity: { type: "string", enum: [...SEVERITIES] },
-  required: { type: "boolean" },
-  rootCause: string,
-  file: string,
-  line: { type: "integer", minimum: 1 },
-  evidence: string,
-  recommendation: string,
-  confidence: { type: "string", enum: ["observed", "inferred"] },
-};
-export const RESULT_SCHEMA = {
-  type: "object",
-  additionalProperties: false,
-  properties: {
-    summary: string,
-    complete: { type: "boolean" },
-    findings: {
-      type: "array",
-      items: {
-        type: "object",
-        additionalProperties: false,
-        properties: findingProperties,
-        required: Object.keys(findingProperties),
-      },
-    },
-    limitations: { type: "array", items: string },
-    checkRequests: { type: "array", items: string },
-    routingLeads: {
-      type: "array",
-      items: {
-        type: "object",
-        additionalProperties: false,
-        properties: { owner: string, file: string, reason: string },
-        required: ["owner", "file", "reason"],
-      },
-    },
-  },
-  required: [
-    "summary",
-    "complete",
-    "findings",
-    "limitations",
-    "checkRequests",
-    "routingLeads",
-  ],
-};
-function prose(value: unknown): asserts value is string {
-  if (
-    typeof value !== "string" ||
-    !value.trim() ||
-    value.length > 16000 ||
-    /[\x00-\x08\x0b-\x1f\x7f]/.test(value)
-  )
-    throw new Error("Expected nonempty review text (up to 16000 characters)");
-}
-function sourcePath(value: unknown): asserts value is string {
-  prose(value);
-  if (
-    path.isAbsolute(value) ||
-    value.includes("\\") ||
-    value.split("/").some((part) => !part || part === "." || part === "..") ||
-    /[\r\n]/.test(value)
-  )
-    throw new Error(
-      "Evidence paths must be relative to the reviewed workspace",
-    );
-}
+
+export const RESULT_SCHEMA = toCleanJsonSchema(
+  ReviewResultSchema,
+) as JsonObject;
+
 export function validateResult(value: unknown): asserts value is ReviewResult {
-  fields(value, Object.keys(RESULT_SCHEMA.properties));
-  prose(value.summary);
-  if (
-    typeof value.complete !== "boolean" ||
-    !Array.isArray(value.findings) ||
-    value.findings.length > 100
-  )
-    throw new Error("Invalid review completeness or findings");
-  for (const finding of value.findings) {
-    fields(finding, Object.keys(findingProperties));
-    for (const key of ["title", "rootCause", "evidence", "recommendation"])
-      prose(finding[key]);
-    sourcePath(finding.file);
-    if (
-      !SEVERITIES.includes(finding.severity as Severity) ||
-      typeof finding.required !== "boolean" ||
-      !Number.isSafeInteger(finding.line) ||
-      Number(finding.line) < 1 ||
-      !["observed", "inferred"].includes(String(finding.confidence))
-    )
-      throw new Error("Invalid finding severity, line or confidence");
-  }
-  for (const key of ["limitations", "checkRequests"] as const) {
-    if (!Array.isArray(value[key]) || value[key].length > 100)
-      throw new Error(`Invalid ${key}`);
-    for (const item of value[key]) prose(item);
-  }
-  if (!Array.isArray(value.routingLeads) || value.routingLeads.length > 32)
-    throw new Error("Invalid routing leads");
-  for (const lead of value.routingLeads) {
-    fields(lead, ["owner", "file", "reason"]);
-    prose(lead.owner);
-    sourcePath(lead.file);
-    prose(lead.reason);
+  const parsed = ReviewResultSchema.safeParse(value);
+  if (!parsed.success) {
+    const issue = parsed.error.issues[0];
+    throw new Error(issue?.message || "Invalid review result");
   }
 }
+
 export interface OwnedFinding extends Finding {
   owners: string[];
 }
+
 export interface Evaluation {
   score: number | null;
   verdict: "ready" | "fix-required" | "incomplete";
@@ -145,14 +55,19 @@ export interface Evaluation {
 /** Scoring belongs to RL. Agents supply evidence and qualitative classifications. */
 export function evaluate(
   policy: ReviewPolicy,
-  reports: { owner: string; result: ReviewResult }[],
-  limitations: string[] = [],
+  reports: readonly { owner: string; result: ReviewResult }[],
+  initialLimitations: readonly string[] = [],
 ): Evaluation {
+  const limitations = [...initialLimitations];
   const unique = new Map<string, OwnedFinding>();
+
   for (const { owner, result } of reports) {
-    if (!result.complete)
+    if (!result.complete) {
       limitations.push(`${owner}: review coverage is incomplete`);
-    limitations.push(...result.limitations.map((note) => `${owner}: ${note}`));
+    }
+    for (const note of result.limitations) {
+      limitations.push(`${owner}: ${note}`);
+    }
     for (const finding of result.findings) {
       // Deliberately conservative: distinct descriptions/locations remain separate.
       const key = JSON.stringify([
@@ -161,19 +76,22 @@ export function evaluate(
         finding.rootCause.toLowerCase().replace(/\s+/g, " ").trim(),
       ]);
       const previous = unique.get(key);
-      if (!previous) unique.set(key, { ...finding, owners: [owner] });
-      else {
+      if (!previous) {
+        unique.set(key, { ...finding, owners: [owner] });
+      } else {
         previous.owners = [...new Set([...previous.owners, owner])];
         previous.required ||= finding.required;
         if (
           SEVERITIES.indexOf(finding.severity) <
           SEVERITIES.indexOf(previous.severity)
-        )
+        ) {
           previous.severity = finding.severity;
+        }
       }
     }
   }
-  const findings = [...unique.values()].sort(
+
+  const findings = [...unique.values()].toSorted(
     (a, b) => SEVERITIES.indexOf(a.severity) - SEVERITIES.indexOf(b.severity),
   );
   const deductions: Record<Severity, number> = {
@@ -182,20 +100,28 @@ export function evaluate(
     medium: 0,
     low: 0,
   };
-  for (const finding of findings)
+  for (const finding of findings) {
     deductions[finding.severity] += policy.weights[finding.severity];
-  const score = reports.length
-    ? Math.max(0, 100 - Object.values(deductions).reduce((a, b) => a + b, 0))
-    : null;
+  }
+
+  const totalDeduction = Object.values(deductions).reduce((a, b) => a + b, 0);
+  const score = reports.length > 0 ? Math.max(0, 100 - totalDeduction) : null;
+
+  let verdict: Evaluation["verdict"];
+  if (limitations.length > 0 || score === null) {
+    verdict = "incomplete";
+  } else if (
+    (policy.blockRequired && findings.some((f) => f.required)) ||
+    score < policy.minimumScore
+  ) {
+    verdict = "fix-required";
+  } else {
+    verdict = "ready";
+  }
+
   return {
     score,
-    verdict:
-      limitations.length || score === null
-        ? "incomplete"
-        : (policy.blockRequired && findings.some((f) => f.required)) ||
-            score < policy.minimumScore
-          ? "fix-required"
-          : "ready",
+    verdict,
     findings,
     limitations: [...new Set(limitations)],
     deductions,

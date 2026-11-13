@@ -210,7 +210,7 @@ test("the built-in team is active in adopted workspaces without initialization a
 });
 
 test("work cannot begin until all three peers have distinct native bindings", async (t) => {
-  const { claim, peer, team } = await setup(t);
+  const { claim, peer } = await setup(t);
   await claim("writer");
   await peer("writer", "bind", { childId: "native-writer" });
   await assert.rejects(
