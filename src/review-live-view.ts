@@ -233,6 +233,7 @@ export interface ReviewView {
   menu?: ReviewMenu;
   composer?: { title: string; detail: string; body: string };
   draftCount?: number;
+  workflowChanged?: Set<string>;
   activeLine?: number;
   reviewed?: Set<string>;
   changedSinceViewed?: Set<string>;
@@ -610,7 +611,7 @@ export function reviewFrame(view: ReviewView): ReviewFrame {
       line(
         rect,
         y + 1,
-        `${file.layer} · ${file.binary ? "binary" : `+${file.additions} −${file.deletions}`} · ${path.dirname(file.path)}`,
+        `${view.workflowChanged?.has(file.path) ? "CHANGED AFTER AI REVIEW · " : ""}${file.layer} · ${file.binary ? "binary" : `+${file.additions} −${file.deletions}`} · ${path.dirname(file.path)}`,
         palette.muted,
         active,
       );
@@ -1036,6 +1037,7 @@ export function reviewFrame(view: ReviewView): ReviewFrame {
     { text: "1 Commits", key: "1" },
     { text: "2 Files", key: "2" },
     { text: "3 Diff", key: "3" },
+    ...(!view.remoteOnly ? [{ text: "W Workflow", key: "W" }] : []),
     ...(view.pr
       ? [
           { text: "i Comment", key: "i" },

@@ -25,6 +25,7 @@ import {
 import {
   atomicWrite,
   canonical,
+  execute,
   git,
   inside,
   now,
@@ -33,7 +34,7 @@ import {
   sessionId,
   writeJson,
 } from "./common.js";
-import type { JsonObject } from "./json.js";
+import { parseJsonObject, type JsonObject } from "./json.js";
 import {
   buildClaimedRolePrompt,
   buildCoordinatorInstructions,
@@ -46,12 +47,41 @@ import {
   WorkflowEventsFileSchema,
 } from "./schemas/orchestration.js";
 import { currentSessionId } from "./session.js";
+import {
+  QUALITY_TOOLS,
+  WorkflowLevelSchema,
+  selectWorkflowLevel,
+  leveledConfig,
+  initializeQuality,
+  preflightBlockers,
+  qualityBlockers,
+  qualityAction,
+  QUALITY_SCHEMAS,
+  CriterionSchema,
+  type WorkflowLevel,
+} from "./orchestration/quality.js";
+import {
+  CaptureSchema,
+  checkScope,
+  plannedCheck,
+  saveReceipt,
+} from "./orchestration/evidence.js";
+import {
+  assertBudget,
+  assertOrientation,
+  BudgetsSchema,
+  GOVERNANCE_SCHEMAS,
+  oriented,
+  reviewerStage,
+} from "./orchestration/governance.js";
+import { toCleanJsonSchema } from "./schemas/common.js";
 import type { Instance, Store } from "./store.js";
 import {
   assertCollaborationCompletion,
   COLLABORATION_TOOLS,
   collaborationPrompt,
   collaborationTool,
+  initializeCollaboration,
 } from "./workflow-collaboration.js";
 
 interface Owner {
@@ -181,6 +211,24 @@ function ownedRun(store: Store, id: unknown, parent: Owner) {
 function persist(run: WorkflowRun, directory: string): void {
   run.updatedAt = now();
   writeJson(path.join(directory, "run.json"), run);
+}
+
+function finalizeEvidenceRun(
+  run: WorkflowRun,
+  current: string,
+): WorkflowRun["status"] {
+  const ready =
+    run.stages.every((s) => s.status === "completed") &&
+    run.scope.fingerprint === current &&
+    !qualityBlockers(run, current).length;
+  run.status = ready ? "completed" : "paused";
+  run.evaluation = evaluation(run);
+  if (run.evaluation.verdict !== "ready") {
+    run.status = "paused";
+    run.controlRequested = "pause";
+    run.evaluation = evaluation(run);
+  } else run.controlRequested = null;
+  return run.status;
 }
 
 function assertScope(run: WorkflowRun): void {
@@ -459,6 +507,13 @@ export const WORKFLOW_TOOLS: {
       requestId: { type: "string" },
       base: { type: "string" },
       prompt: { type: "string" },
+      level: { type: "string", enum: ["auto", "light", "standard", "deep"] },
+      criteria: {
+        type: "array",
+        items: parseJsonObject(
+          JSON.stringify(toCleanJsonSchema(CriterionSchema)),
+        ),
+      },
     },
     required: [],
     readOnly: false,
@@ -514,6 +569,7 @@ export const WORKFLOW_TOOLS: {
     readOnly: false,
   },
   ...COLLABORATION_TOOLS,
+  ...QUALITY_TOOLS,
 ];
 
 export function workflowToolSchema(tool: (typeof WORKFLOW_TOOLS)[number]) {
@@ -536,14 +592,15 @@ export function workflowToolSchema(tool: (typeof WORKFLOW_TOOLS)[number]) {
 function workflowProtocol() {
   const identity = { agent: "--agent", sessionId: "--session" };
   return {
-    version: 1,
+    version: 2,
+    defaultLevel: "auto",
     coordinator: "current-session",
     requiresMcp: false,
     requiresRlLauncher: false,
     requiresNativeSubagents: true,
     discovery: "rl workflow context --json",
     instruction:
-      "Use your current session's native subagent and messaging tools. RL supplies roles and coordination state. CLI operations below use the same inputSchema as MCP; tools with stdin: json accept the entire input object via --file -. These are coordination commands, never instructions to start a second provider process.",
+      "Use your current session's native subagent and messaging tools. RL supplies roles and coordination state. CLI tools with stdin: json accept their entire input via --file -. Start maps scalar inputs to flags; its optional cli.jsonPlan accepts only {level,criteria} through --file -, with identity/base/prompt/request remaining flags. These commands never start another provider process.",
     tools: WORKFLOW_TOOLS.map((tool) => {
       const action = tool.name.slice("rl_workflow_".length);
       const usesStdin = ![
@@ -560,6 +617,7 @@ function workflowProtocol() {
               base: "--base",
               prompt: "--prompt",
               requestId: "--request",
+              level: "--level",
             }
           : {
               ...identity,
@@ -590,6 +648,15 @@ function workflowProtocol() {
                 : [],
           flags: usesStdin ? {} : flags,
           output: "json",
+          ...(action === "start"
+            ? {
+                jsonPlan: {
+                  option: "--file",
+                  stdin: "-",
+                  fields: ["level", "criteria"],
+                },
+              }
+            : {}),
         },
       };
     }),
@@ -645,6 +712,166 @@ export async function callWorkflowTool(
   }
 
   const parent = owner(input);
+  if (name === "rl_workflow_check") {
+    const { agent: _agent, sessionId: _session, ...raw } = input;
+    const request = CaptureSchema.parse(raw);
+    // Reserve under the metadata lock; never hold that lock while a check runs.
+    const prepared = await store.locked(() => {
+      const [file] = store.current();
+      store.assertSessionOwner(file, parent.agent, parent.sessionId);
+      const { run, directory } = ownedRun(store, request.run, parent);
+      if (
+        !run.quality?.governance ||
+        ["completed", "cancelled"].includes(run.status)
+      )
+        throw new Error("Captured checks require an active leveled run");
+      assertBudget(run);
+      if (run.quality.capture)
+        throw new Error("A validation command is already running for this run");
+      if (run.quality.receipts.length >= 128)
+        throw new Error("Validation receipt limit reached");
+      const { criterion, check } = plannedCheck(run, request.check);
+      if (!check.command || !isDeepStrictEqual(check.command, request.command))
+        throw new Error(
+          "Capture requires the exact command in the frozen validation plan",
+        );
+      if (
+        !path.isAbsolute(request.cwd) ||
+        (canonical(request.cwd) !== run.workspace &&
+          !inside(canonical(request.cwd), run.workspace))
+      )
+        throw new Error(
+          "Validation cwd must remain inside this run's exact workspace",
+        );
+      if (
+        (check.mode !== "any" && check.mode !== request.mode) ||
+        (criterion.validation !== "any" &&
+          criterion.validation !== request.mode)
+      )
+        throw new Error(
+          "Validation mode does not match the planned criterion/check",
+        );
+      const fingerprint = captureScope(run.workspace, run.scope.base).scope
+        .fingerprint;
+      const remaining =
+        run.quality.governance.budgets.checkMs -
+        run.quality.receipts.reduce((n, r) => n + r.durationMs, 0);
+      const runRemaining =
+        run.quality.governance.budgets.runMs -
+        (Date.now() - Date.parse(run.createdAt));
+      if (remaining <= 0 || runRemaining <= 0)
+        throw new Error("Validation/run time budget exhausted");
+      const capture = {
+        ...request,
+        id: randomUUID(),
+        startedAt: now(),
+        fingerprint,
+        scoped: checkScope(run, check),
+        timeoutMs: Math.min(request.timeoutMs, remaining, runRemaining),
+      };
+      const { run: _run, ...pending } = capture;
+      run.quality.capture = pending;
+      persist(run, directory);
+      return { capture, workspace: run.workspace, criterion: criterion.id };
+    });
+    const started = Date.now();
+    let output: { code: number; stdout: string; stderr: string };
+    try {
+      output = await execute(request.command, request.cwd, {
+        timeoutMs: prepared.capture.timeoutMs,
+        maxOutputBytes: 128000,
+        processGroup: true,
+        abortGraceMs: 250,
+      });
+    } catch (cause) {
+      output = {
+        code: 125,
+        stdout: "",
+        stderr: cause instanceof Error ? cause.message : String(cause),
+      };
+    }
+    return store.locked(() => {
+      const { run, directory } = ownedRun(store, request.run, parent);
+      if (run.quality?.capture?.id !== prepared.capture.id)
+        throw new Error(
+          "Validation capture was superseded; output cannot be attached to a different run",
+        );
+      delete run.quality.capture;
+      if (["completed", "cancelled"].includes(run.status)) {
+        persist(run, directory);
+        return {
+          saved: false,
+          reason: "Run stopped while command was executing",
+          output,
+        };
+      }
+      const before = prepared.capture;
+      let after: string,
+        scoped = before.scoped,
+        invalidated = false;
+      try {
+        after = captureScope(run.workspace, run.scope.base).scope.fingerprint;
+        if (before.scoped) {
+          const currentScope = checkScope(
+            run,
+            plannedCheck(run, request.check).check,
+          );
+          invalidated = currentScope?.fingerprint !== before.scoped.fingerprint;
+        } else invalidated = after !== before.fingerprint;
+      } catch {
+        after = "";
+        invalidated = true;
+      }
+      if (invalidated) scoped = undefined;
+      const receipt = saveReceipt(
+        run,
+        {
+          check: request.check,
+          criteria: [prepared.criterion],
+          command: request.command,
+          cwd: canonical(request.cwd),
+          exitCode: output.code,
+          mode: request.mode,
+          fingerprint: before.fingerprint,
+          files: before.scoped?.files ?? [],
+          artifacts: [],
+          stdout: output.stdout,
+          stderr: output.stderr,
+          durationMs: Date.now() - started,
+        },
+        before.fingerprint,
+        "command-captured",
+        scoped,
+      );
+      if (invalidated) Object.assign(receipt, { invalidated: true });
+      if (
+        run.stages.every((stage) =>
+          ["completed", "failed", "blocked"].includes(stage.status),
+        )
+      ) {
+        if (finalizeEvidenceRun(run, after) === "completed") {
+          const policyName = run.config.workflows[run.workflow].policy;
+          run.assessments.push({
+            at: now(),
+            policyName,
+            policy: structuredClone(run.config.policies[policyName]),
+            evaluation: structuredClone(run.evaluation!),
+          });
+        }
+        const [file, data] = store.current();
+        settleRequest(file, data, run);
+      }
+      persist(run, directory);
+      return {
+        receipt,
+        invalidated,
+        modeSource: "host-reported",
+        instruction: invalidated
+          ? "Source changed during the check; rerun it against stable inputs"
+          : "Captured argv/output/exit status; execution mode and dependency coverage remain host-reported",
+      };
+    });
+  }
   return store.locked(() => {
     const [file, data] = store.current();
     store.assertSessionOwner(file, parent.agent, parent.sessionId);
@@ -708,7 +935,7 @@ export async function callWorkflowTool(
         return ownedRun(store, request.runId, parent).run;
       }
 
-      const config = readAutomation(data.worktree);
+      let config = readAutomation(data.worktree);
       const workflow =
         input.workflow === undefined
           ? (request?.workflow ?? defaultWorkflow(config))
@@ -716,6 +943,32 @@ export async function callWorkflowTool(
       if (request && request.workflow !== workflow) {
         throw new Error("Request is for a different workflow");
       }
+      const template = structuredClone(config.workflows[workflow]);
+      let selectedLevel: { level: WorkflowLevel; reason: string } | undefined;
+      const requestedLevel =
+        input.level ?? (input.criteria !== undefined ? "auto" : undefined);
+      if (requestedLevel !== undefined) {
+        const level = WorkflowLevelSchema.parse(requestedLevel);
+        const scope = captureScope(
+          data.worktree,
+          input.base === undefined
+            ? defaultBase(data)
+            : text(input.base, "base"),
+        ).scope;
+        selectedLevel = selectWorkflowLevel(
+          level,
+          scope.files,
+          String(input.prompt ?? request?.event ?? ""),
+        );
+        config = leveledConfig(config, workflow, selectedLevel.level);
+      }
+      const quality = selectedLevel
+        ? initializeQuality(
+            selectedLevel.level,
+            selectedLevel.reason,
+            input.criteria,
+          )
+        : undefined;
 
       const created = createRunLocked(
         store,
@@ -730,6 +983,18 @@ export async function callWorkflowTool(
       );
       created.run.execution = "native";
       created.run.owner = parent;
+      if (quality) {
+        quality.template = template;
+        quality.governance = {
+          version: 1,
+          requested: WorkflowLevelSchema.parse(requestedLevel),
+          baseline: quality.level,
+          budgets: BudgetsSchema.parse({}),
+          orientations: [],
+          resolutions: [],
+        };
+        created.run.quality = quality;
+      }
       created.run.status = "running";
       if (request) {
         created.run.requestId = request.id;
@@ -742,8 +1007,156 @@ export async function callWorkflowTool(
     }
 
     const { run, directory } = ownedRun(store, input.run, parent);
+    if (name === "rl_workflow_escalate") {
+      const { agent: _agent, sessionId: _session, ...raw } = input;
+      const escalation = GOVERNANCE_SCHEMAS.escalate.parse(raw),
+        quality = run.quality;
+      if (
+        !quality?.governance ||
+        !quality.template ||
+        run.status === "completed" ||
+        quality.governance.successor
+      )
+        throw new Error(
+          "Only an unfinished leveled run without a successor can escalate",
+        );
+      if (quality.governance.requested !== "auto")
+        throw new Error(
+          "Explicit user-selected level is pinned; obtain a new user-selected level in a separate run",
+        );
+      const ranks = { light: 0, standard: 1, deep: 2 };
+      if (ranks[escalation.level] <= ranks[quality.level])
+        throw new Error("Escalation requires a higher effort level");
+      const config = structuredClone(run.config);
+      config.workflows[run.workflow] = structuredClone(quality.template);
+      const next = createRunLocked(
+        store,
+        leveledConfig(config, run.workflow, escalation.level),
+        run.workflow,
+        run.scope.base,
+        run.prompt,
+      );
+      next.run.execution = "native";
+      next.run.owner = parent;
+      next.run.status = "running";
+      const nextQuality = initializeQuality(
+        escalation.level,
+        escalation.rationale,
+        quality.criteria,
+      );
+      nextQuality.template = structuredClone(quality.template);
+      nextQuality.governance = {
+        version: 1,
+        requested: "auto",
+        baseline: escalation.level,
+        budgets: structuredClone(quality.governance.budgets),
+        orientations: [],
+        resolutions: [],
+        previousRun: run.id,
+      };
+      nextQuality.receipts = quality.receipts.map((receipt) => ({
+        ...structuredClone(receipt),
+        inheritedFrom: receipt.inheritedFrom ?? run.id,
+      }));
+      next.run.quality = nextQuality;
+      if (run.requestId) {
+        next.run.requestId = run.requestId;
+        const values = requests(file),
+          request = values.find(
+            (value) => value.id === run.requestId && sameOwner(value, parent),
+          );
+        if (request) {
+          request.runId = next.run.id;
+          saveRequests(file, values);
+        }
+      }
+      // stopped:true explicitly confirms the host has stopped children/checks. Never kill them from RL.
+      for (const stage of run.stages.filter((s) => s.status === "running")) {
+        stage.durationMs += Math.max(
+          0,
+          Date.now() - Date.parse(stage.startedAt ?? now()),
+        );
+        stage.status = "blocked";
+        stage.error = "Host-confirmed stop for effort escalation";
+        delete stage.claim;
+        delete stage.childId;
+      }
+      delete quality.capture;
+      quality.governance.successor = next.run.id;
+      quality.events.push({
+        at: now(),
+        step: "coordinator",
+        message: `Escalated to ${escalation.level}: ${escalation.rationale}; successor ${next.run.id}`,
+      });
+      quality.events = quality.events.slice(-256);
+      run.status = "cancelled";
+      run.controlRequested = "cancel";
+      persist(run, directory);
+      persist(next.run, next.directory);
+      return next.run;
+    }
+    if (QUALITY_TOOLS.some((tool) => tool.name === name)) {
+      if (
+        (run.status === "completed" || run.status === "cancelled") &&
+        name !== "rl_workflow_outcome"
+      )
+        throw new Error("Terminal workflow runs cannot be mutated");
+      const action = name.slice(
+        "rl_workflow_".length,
+      ) as keyof typeof QUALITY_SCHEMAS;
+      const scope = captureScope(run.workspace, run.scope.base).scope;
+      const previousLevel = run.quality?.level;
+      const result = qualityAction(run, action, input, scope.fingerprint);
+      if (
+        action === "assess" &&
+        run.quality?.template &&
+        previousLevel !== run.quality.level
+      ) {
+        const templateConfig = structuredClone(run.config);
+        templateConfig.workflows[run.workflow] = structuredClone(
+          run.quality.template,
+        );
+        run.config = leveledConfig(
+          templateConfig,
+          run.workflow,
+          run.quality.level,
+        );
+        run.stages = run.config.workflows[run.workflow].steps.map((step) => ({
+          ...step,
+          status: "pending",
+          attempts: 0,
+          durationMs: 0,
+        }));
+        delete run.collaboration;
+        initializeCollaboration(run);
+        // A changed topology can change model requirements; verify capabilities again.
+        delete run.quality.capabilities;
+        delete run.quality.preflightAt;
+        delete run.quality.capabilitySource;
+      }
+      if (
+        run.stages.every((s) =>
+          ["completed", "failed", "blocked"].includes(s.status),
+        )
+      ) {
+        if (finalizeEvidenceRun(run, scope.fingerprint) === "completed") {
+          const policyName = run.config.workflows[run.workflow].policy;
+          run.assessments.push({
+            at: now(),
+            policyName,
+            policy: structuredClone(run.config.policies[policyName]),
+            evaluation: structuredClone(run.evaluation!),
+          });
+        }
+        settleRequest(file, data, run);
+      }
+      persist(run, directory);
+      return result;
+    }
 
     if (COLLABORATION_TOOLS.some((tool) => tool.name === name)) {
+      if (name === "rl_workflow_bind" && parent.agent === "agy")
+        store.assertSessionOwner(file, "agy", sessionId(input.childId));
       const result = collaborationTool(run, directory, name, input);
       if (name !== "rl_workflow_inbox") {
         persist(run, directory);
@@ -761,6 +1174,10 @@ export async function callWorkflowTool(
               },
             ],
           });
+          if (parent.agent === "agy") {
+            store.markAntigravityChild(data, input.childId);
+            store.save(file, data);
+          }
         }
       }
       return result;
@@ -779,6 +1196,9 @@ export async function callWorkflowTool(
     const collaboration = workflow.collaboration;
 
     if (name === "rl_workflow_claim") {
+      assertBudget(run);
+      const blockers = preflightBlockers(run);
+      if (blockers.length) throw new Error(blockers.join("; "));
       if (input.step !== undefined) {
         text(input.step, "step");
       }
@@ -806,6 +1226,26 @@ export async function callWorkflowTool(
         throw new Error(
           "No ready stage; dependencies may be unfinished or failed",
         );
+      }
+      if (
+        stage.agent &&
+        run.config.agents[stage.agent].access === "workspace-write" &&
+        stage.attempts === 0 &&
+        run.quality &&
+        run.stages.some((s) => s.id === "research" && s.agent === "researcher")
+      ) {
+        const research = run.quality?.research;
+        if (!research?.decision)
+          throw new Error(
+            "Coordinator must choose a saved research approach before the writer starts",
+          );
+        if (
+          captureScope(run.workspace, run.scope.base).scope.fingerprint !==
+          research.brief.fingerprint
+        )
+          throw new Error(
+            "Research source changed before implementation; start a new research run",
+          );
       }
 
       const writes = (step: Stage) =>
@@ -837,6 +1277,7 @@ export async function callWorkflowTool(
       delete stage.error;
       delete stage.childId;
       stage.startedAt = now();
+      stage.heartbeatAt = stage.startedAt;
       stage.attempts++;
       stage.status = "running";
       persist(run, directory);
@@ -844,8 +1285,11 @@ export async function callWorkflowTool(
       const profile = stage.agent
         ? resolveAgentProfile(run.config.agents[stage.agent], parent.agent)
         : undefined;
+      const modelOverride = run.quality?.capabilities?.modelOverrides[stage.id];
+      if (profile && modelOverride) profile.model = modelOverride;
+      const blind = reviewerStage(run, stage) && !oriented(run, stage);
       const dependencies = run.stages
-        .filter((step) => stage.after.includes(step.id))
+        .filter((step) => !blind && stage.after.includes(step.id))
         .map((step) => ({
           id: step.id,
           result: step.result,
@@ -869,10 +1313,23 @@ export async function callWorkflowTool(
               policyInstructions:
                 run.config.policies[workflow.policy].instructions,
               writable: profile.access === "workspace-write",
-              collaborative: Boolean(collaboration),
+              collaborative: Boolean(
+                collaboration &&
+                [
+                  collaboration.writer,
+                  collaboration.reviewer,
+                  collaboration.dry,
+                ].includes(stage.id),
+              ),
               collaborationSection: collaborationPrompt(run, stage),
               workspace: run.workspace,
               userPrompt: run.prompt,
+              validationPlan: run.quality?.criteria,
+              independentFirstPass: blind,
+              research:
+                blind || stage.agent === "researcher"
+                  ? undefined
+                  : run.quality?.research,
               dependenciesJson: JSON.stringify(dependencies),
               routedLeadsJson: stage.leads
                 ? JSON.stringify(stage.leads)
@@ -903,6 +1360,34 @@ export async function callWorkflowTool(
 
     const elapsed = Date.now() - Date.parse(stage.startedAt!);
     if (
+      run.quality &&
+      stage.id === "research" &&
+      stage.agent === "researcher" &&
+      input.error === undefined
+    ) {
+      validateResult(input.result);
+      if (
+        !input.result.complete ||
+        input.result.findings.length ||
+        input.result.checkRequests.length ||
+        input.result.routingLeads.length
+      )
+        throw new Error(
+          "Research must finish with a complete seed brief; record facts/risks in that brief rather than unreviewed code findings or pending checks",
+        );
+      if (!run.quality?.research || run.quality.research.claim !== stage.claim)
+        throw new Error(
+          "Save the multi-approach research brief before reporting researcher completion",
+        );
+      if (
+        captureScope(run.workspace, run.scope.base).scope.fingerprint !==
+        run.quality.research.brief.fingerprint
+      )
+        throw new Error(
+          "Research source changed before the research report; start a new run",
+        );
+    }
+    if (
       input.error !== undefined &&
       (input.result !== undefined || input.check !== undefined)
     ) {
@@ -929,6 +1414,14 @@ export async function callWorkflowTool(
       assertCollaborationCompletion(run, stage, writtenScope?.scope.files);
     }
     if (input.childId !== undefined) {
+      if (parent.agent === "agy") {
+        const child = sessionId(input.childId);
+        if (child === parent.sessionId)
+          throw new Error(
+            "The main Antigravity conversation cannot be reported as its own subagent",
+          );
+        store.assertSessionOwner(file, "agy", child);
+      }
       if (collaboration && stage.childId !== input.childId) {
         throw new Error("The report must use the bound native child identity");
       }
@@ -936,6 +1429,7 @@ export async function callWorkflowTool(
     }
 
     if (!failure && stage.agent) {
+      assertOrientation(run, stage);
       validateResult(input.result);
       for (const finding of input.result.findings) {
         const absolute = path.join(run.workspace, finding.file);
@@ -1059,7 +1553,8 @@ export async function callWorkflowTool(
     }
 
     if (run.status === "running" && allTerminal()) {
-      run.status = "completed";
+      if (run.quality) finalizeEvidenceRun(run, run.scope.fingerprint);
+      else run.status = "completed";
     }
     run.evaluation = evaluation(run);
     if (run.status === "completed") {
@@ -1072,6 +1567,10 @@ export async function callWorkflowTool(
     }
 
     persist(run, directory);
+    if (parent.agent === "agy" && stage.childId) {
+      store.markAntigravityChild(data, stage.childId);
+      store.save(file, data);
+    }
     settleRequest(file, data, run);
     return {
       ...run,
@@ -1109,6 +1608,16 @@ export async function resumeNativeRun(
       ? "completed"
       : "running";
     run.controlRequested = null;
+    if (
+      run.quality &&
+      run.stages.every((s) =>
+        ["completed", "failed", "blocked"].includes(s.status),
+      )
+    )
+      finalizeEvidenceRun(
+        run,
+        captureScope(run.workspace, run.scope.base).scope.fingerprint,
+      );
     run.evaluation = evaluation(run);
     if (run.status === "completed") {
       const policyName = run.config.workflows[run.workflow].policy;

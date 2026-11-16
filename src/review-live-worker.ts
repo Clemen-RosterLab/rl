@@ -25,6 +25,8 @@ import { searchReviewFiles } from "./review-search.js";
 import { rankReviewFiles } from "./review-ranking.js";
 import type { ViewedFile } from "./review-progress.js";
 import { changedFiles } from "./review-git.js";
+import { workflowReviewState } from "./agent-runner.js";
+import { Store } from "./store.js";
 const [root, workspaceRepo = root, temporaryRoot, freezeId, remotePr] =
   process.argv.slice(2);
 if (remotePr) {
@@ -96,7 +98,21 @@ process.on("message", async (request: Request) => {
     else if (request.op === "history")
       result = repository.history(request.head!, request.base);
     else if (request.op === "identity") result = true;
-    else if (request.op === "freeze") {
+    else if (request.op === "workflow") {
+      if (remotePr) result = null;
+      else {
+        const store = new Store(
+          workspaceRepo,
+          path.dirname(request.directory!),
+        );
+        if (store.root !== request.directory)
+          throw new Error(
+            "Workflow state directory does not match the selected repository",
+          );
+        const [file] = store.instanceForWorktree(...store.worktree(root));
+        result = workflowReviewState(path.dirname(file), root, request.branch!);
+      }
+    } else if (request.op === "freeze") {
       repository.freeze(
         request.state!.snapshot,
         request.target!,

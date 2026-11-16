@@ -17,6 +17,7 @@ export interface Finding {
   evidence: string;
   recommendation: string;
   confidence: "observed" | "inferred";
+  disposition?: { status: "rejected"; reason: string; evidence: string };
 }
 
 export interface ReviewResult {
@@ -81,6 +82,9 @@ export function evaluate(
       } else {
         previous.owners = [...new Set([...previous.owners, owner])];
         previous.required ||= finding.required;
+        // An open report must never be erased by another reviewer's rejection.
+        if (!finding.disposition || !previous.disposition)
+          delete previous.disposition;
         if (
           SEVERITIES.indexOf(finding.severity) <
           SEVERITIES.indexOf(previous.severity)
@@ -101,6 +105,7 @@ export function evaluate(
     low: 0,
   };
   for (const finding of findings) {
+    if (finding.disposition?.status === "rejected") continue;
     deductions[finding.severity] += policy.weights[finding.severity];
   }
 
@@ -111,7 +116,9 @@ export function evaluate(
   if (limitations.length > 0 || score === null) {
     verdict = "incomplete";
   } else if (
-    (policy.blockRequired && findings.some((f) => f.required)) ||
+    findings.some(
+      (f) => !f.disposition && (f.required || f.severity === "critical"),
+    ) ||
     score < policy.minimumScore
   ) {
     verdict = "fix-required";

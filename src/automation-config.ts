@@ -79,7 +79,7 @@ export interface AgentWorkflow {
   collaboration?: {
     writer: string;
     reviewer: string;
-    dry: string;
+    dry?: string;
     maxRounds: number;
     rules: { from: string; event: string; to: string; required: boolean }[];
   };

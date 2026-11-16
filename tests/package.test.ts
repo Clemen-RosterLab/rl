@@ -114,6 +114,13 @@ test("npm tarball ships built JavaScript and bundled runtime dependencies, with 
     "review-rank-agent",
     "agent-launch",
     "agent-desktop",
+    "orchestration/quality",
+    "orchestration/research",
+    "orchestration/evidence",
+    "orchestration/governance",
+    "orchestration/evaluation",
+    "orchestration/status",
+    "orchestration/lean-protocol",
     "agent-agy",
     "mcp",
     "mcp-setup",
@@ -391,12 +398,15 @@ test("global npm installation leaves dotfiles untouched until rl setup install c
     archive,
   ]);
   assert.ok(
-    !fs.existsSync(path.join(home, ".zshrc")),
+    !fs.existsSync(path.join(home, ".zshrc")) &&
+      !fs.existsSync(path.join(home, ".bashrc")),
     "npm install must not modify shell dotfiles before rl setup install",
   );
   const cli = path.join(prefix, "bin/rl");
   w.command([cli, "setup", "install"]);
-  assert.match(read(path.join(home, ".zshrc")), /rl shell integration/);
+  assert.match(read(path.join(home, ".zshrc")), /setup shell zsh/);
+  assert.match(read(path.join(home, ".bashrc")), /setup shell bash/);
+  assert.match(read(path.join(home, ".bash_profile")), /setup shell bash/);
   const shim = path.join(home, ".local/share/rl/bin/rl");
   assert.ok(fs.existsSync(shim));
   assert.match(read(shim), /global npm prefix/);

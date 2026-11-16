@@ -151,7 +151,21 @@ test("MCP negotiates, lists tools and shares locked append/read with CLI", (t) =
     .map((line) => JSON.parse(line));
   assert.equal(replies.length, 8);
   assert.equal(replies[0].result.protocolVersion, "2025-11-25");
-  assert.equal(replies[1].result.tools.length, 20);
+  assert.equal(replies[1].result.tools.length, 34);
+  for (const name of [
+    "assess",
+    "orient",
+    "check",
+    "budget",
+    "resolve",
+    "escalate",
+    "outcome",
+  ])
+    assert.ok(
+      replies[1].result.tools.some(
+        (tool: { name: string }) => tool.name === `rl_workflow_${name}`,
+      ),
+    );
   assert.match(replies[3].result.content[0].text, /MCP milestone/);
   assert.equal(
     JSON.parse(replies[4].result.content[0].text).branch,

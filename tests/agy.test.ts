@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
-import { Workspace, read, readJson, write } from "./helpers.js";
+import { Workspace, read, readJson, write, sessionPicker } from "./helpers.js";
 
 function hook(
   w: Workspace,
@@ -336,6 +336,11 @@ test("Antigravity receives native workflow gates and can own configurable writer
       claim: claims[i].claim,
       childId: children[i],
     });
+  // No post-bind child hook is needed to remove the premature session.
+  assert.deepEqual(
+    w.status().sessions.agy.map((session: { id: string }) => session.id),
+    [sid],
+  );
   const peer = JSON.parse(hook(w, "PreInvocation", children[0]).stdout);
   assert.match(
     peer.injectSteps[0].ephemeralMessage,
@@ -375,6 +380,145 @@ test("Antigravity receives native workflow gates and can own configurable writer
     !fs.existsSync(w.log),
     "Native workflow coordination must not launch provider processes",
   );
+});
+
+test("Antigravity resume repairs premature child sessions and keeps parents across hook and workflow retention", (t) => {
+  const w = new Workspace(t),
+    parent = randomUUID(),
+    olderParent = randomUUID(),
+    child = randomUUID();
+  stub(w);
+  hook(w, "SessionStart", olderParent);
+  hook(w, "SessionStart", parent);
+  const run = rpc(w, "rl_workflow_start", {
+    agent: "agy",
+    sessionId: parent,
+    base: "develop",
+  });
+  const claimed = rpc(w, "rl_workflow_claim", {
+    agent: "agy",
+    sessionId: parent,
+    run: run.id,
+    step: "writer",
+  });
+  hook(w, "SessionStart", child);
+  rpc(w, "rl_workflow_bind", {
+    agent: "agy",
+    sessionId: parent,
+    run: run.id,
+    step: "writer",
+    claim: claimed.claim,
+    childId: child,
+  });
+  const directory = w.status().stateDirectory,
+    file = path.join(directory, "instance.json");
+  // Reproduce an older RL record: the child was bound, but never sent another hook.
+  const polluted = readJson(file);
+  polluted.activity.agy = polluted.activity.agy.filter(
+    (entry: { sessionId: string }) => entry.sessionId !== child,
+  );
+  polluted.sessions.agy.push({
+    id: child,
+    createdAt: "2099-01-01T00:00:00Z",
+    lastUsedAt: "2099-01-01T00:00:00Z",
+  });
+  write(file, JSON.stringify(polluted));
+  w.rl(["resume", "agy", "--latest"], { cwd: w.a });
+  assert.deepEqual(readJson(w.env.AGY_CAPTURE!).args, [
+    "--conversation",
+    parent,
+  ]);
+  const capture = sessionPicker(w);
+  w.env.RESUME_PICKER_ID = olderParent;
+  w.rl(["resume", "agy"], { cwd: w.a });
+  assert.ok(!readJson(capture).input.includes(child));
+  assert.ok(readJson(capture).input.includes(parent));
+  assert.deepEqual(readJson(w.env.AGY_CAPTURE!).args, [
+    "--conversation",
+    olderParent,
+  ]);
+  // A later hook after the bound run has been pruned cannot resurrect a child.
+  fs.rmSync(path.join(directory, "workflow-runs", run.id), { recursive: true });
+  hook(w, "SessionStart", child);
+  hook(w, "PreInvocation", child);
+  assert.ok(
+    !w
+      .status()
+      .sessions.agy.some((entry: { id: string }) => entry.id === child),
+  );
+  w.rl(["agent", "save", "agy", child], { cwd: w.a, ok: false });
+  assert.deepEqual(readJson(w.env.AGY_CAPTURE!).args, [
+    "--conversation",
+    olderParent,
+  ]);
+});
+
+test("a child classified while the resume picker is open cannot be launched", (t) => {
+  const w = new Workspace(t),
+    parent = randomUUID(),
+    child = randomUUID();
+  hook(w, "SessionStart", parent);
+  hook(w, "SessionStart", child);
+  const file = path.join(w.status().stateDirectory, "instance.json");
+  w.env.RESUME_INSTANCE_FILE = file;
+  w.env.RESUME_CHILD = child;
+  w.stub(
+    "fzf",
+    `const fs=require('node:fs');fs.readFileSync(0,'utf8');const file=process.env.RESUME_INSTANCE_FILE;const data=JSON.parse(fs.readFileSync(file,'utf8'));for(const activity of data.activity.agy){if(activity.sessionId===process.env.RESUME_CHILD){activity.childId=activity.sessionId;activity.resumable=false;}}fs.writeFileSync(file,JSON.stringify(data));console.log('agy:'+process.env.RESUME_CHILD);`,
+  );
+  assert.match(
+    w.rl(["resume", "agy"], { cwd: w.a, ok: false }).stderr,
+    /No agy session recorded/,
+  );
+  assert.ok(!fs.existsSync(w.log));
+  assert.deepEqual(
+    w.status().sessions.agy.map((entry: { id: string }) => entry.id),
+    [parent],
+  );
+});
+
+test("AGY binding rejects the parent and conversations owned by another worktree", (t) => {
+  const w = new Workspace(t),
+    parent = randomUUID(),
+    foreign = randomUUID();
+  hook(w, "SessionStart", parent);
+  hook(w, "SessionStart", foreign, {}, w.b);
+  const run = rpc(w, "rl_workflow_start", {
+    agent: "agy",
+    sessionId: parent,
+    base: "develop",
+  });
+  const claim = rpc(w, "rl_workflow_claim", {
+    agent: "agy",
+    sessionId: parent,
+    run: run.id,
+    step: "writer",
+  });
+  for (const childId of [parent, foreign, "friendly-role-name"])
+    w.rl(
+      [
+        "workflow",
+        "bind",
+        run.id,
+        "--file",
+        "-",
+        "--agent",
+        "agy",
+        "--session",
+        parent,
+      ],
+      {
+        cwd: w.a,
+        input: JSON.stringify({ step: "writer", claim: claim.claim, childId }),
+        ok: false,
+      },
+    );
+  assert.equal(w.status().sessions.agy[0].id, parent);
+  assert.equal(w.status(w.b).sessions.agy[0].id, foreign);
+  const saved = readJson(
+    path.join(w.status().stateDirectory, "workflow-runs", run.id, "run.json"),
+  );
+  assert.equal(saved.stages[0].childId, undefined);
 });
 
 test("Antigravity feedback uses the exact saved conversation, validates native completion, and retains failed requests", (t) => {

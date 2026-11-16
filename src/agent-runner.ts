@@ -24,7 +24,13 @@ import {
 import { WorkflowRunDiskSchema } from "./schemas/orchestration.js";
 import type { Instance, Store } from "./store.js";
 import {
+  qualityBlockers,
+  qualitySnapshot,
+  type WorkflowQuality,
+} from "./orchestration/quality.js";
+import {
   collaborationAssessment,
+  collaborationFileReviews,
   initializeCollaboration,
   type CollaborationState,
 } from "./workflow-collaboration.js";
@@ -44,6 +50,8 @@ export interface Scope {
 }
 
 export interface Stage extends WorkflowStep {
+  heartbeatAt?: string;
+  progress?: string;
   claim?: string;
   startedAt?: string;
   childId?: string;
@@ -59,6 +67,7 @@ export interface Stage extends WorkflowStep {
 }
 
 export interface WorkflowRun {
+  quality?: WorkflowQuality;
   version: 1;
   execution?: "native";
   owner?: { agent: "codex" | "claude" | "agy"; sessionId: string };
@@ -375,6 +384,48 @@ export function readRun(
   return { run, directory };
 }
 
+/** Review reads only records belonging to this exact registered worktree and branch. */
+export function workflowReviewState(
+  directory: string,
+  workspace: string,
+  branch: string,
+) {
+  const instancePath = path.join(directory, "instance.json");
+  if (!fs.existsSync(instancePath)) return null;
+  if (
+    fs.lstatSync(instancePath).isSymbolicLink() ||
+    fs.lstatSync(directory).isSymbolicLink()
+  )
+    throw new Error("Workflow review metadata must not traverse symlinks");
+  const instance = readJsonObject(instancePath);
+  if (instance.worktree !== workspace || instance.branch !== branch)
+    return null;
+  if (git(workspace, "branch", "--show-current") !== branch)
+    throw new Error(
+      "Worktree branch changed; refresh review before viewing workflow evidence",
+    );
+  const parent = runsParentDirectory(instancePath),
+    id = readWorkflowRunsIndex(parent)?.latestRunId;
+  if (!id) return null;
+  const run = load(runDirectory(instancePath, id));
+  if (
+    run.workspace !== workspace ||
+    run.branch !== branch ||
+    run.key !== instance.key
+  )
+    throw new Error("Workflow evidence belongs to a different worktree");
+  const current = captureScope(workspace, run.scope.base).scope.fingerprint;
+  return {
+    ...qualitySnapshot(run, current),
+    fileReviews: collaborationFileReviews(run),
+    stale: current !== run.scope.fingerprint,
+    metrics: runMetrics(run, current),
+  };
+}
+export type WorkflowReviewState = NonNullable<
+  ReturnType<typeof workflowReviewState>
+>;
+
 /** Resolve only explicit native bindings in this instance, never inferred peers. */
 export function boundAntigravityPeer(
   instanceFile: string,
@@ -439,6 +490,29 @@ export function boundAntigravityPeer(
   return undefined;
 }
 
+/** Repair sessions recorded before a child binding, including older RL records.
+ * Call under the instance lock before presenting or launching resume choices. */
+export function reconcileAntigravitySessions(
+  store: Store,
+  file: string,
+  data: Instance,
+): void {
+  let changed = false;
+  for (const session of data.sessions.agy ?? []) {
+    const knownChild = data.activity?.agy?.some(
+      (entry) =>
+        entry.sessionId === session.id &&
+        entry.childId === session.id &&
+        !entry.resumable,
+    );
+    if (knownChild || boundAntigravityPeer(file, data, session.id)) {
+      store.markAntigravityChild(data, session.id);
+      changed = true;
+    }
+  }
+  if (changed) store.save(file, data);
+}
+
 export async function controlRun(
   store: Store,
   id: string | undefined,
@@ -464,6 +538,9 @@ export function evaluation(
   policy = run.config.policies[run.config.workflows[run.workflow].policy],
 ): Evaluation {
   const currentScope = (stage: Stage) =>
+    (Boolean(run.quality) &&
+      stage.id === "research" &&
+      stage.agent === "researcher") ||
     stage.scopeFingerprint === undefined ||
     stage.scopeFingerprint === run.scope.fingerprint;
 
@@ -486,6 +563,7 @@ export function evaluation(
     limitations.push(`Run ${run.status}`);
   }
   limitations.push(...collaboration.limitations);
+  limitations.push(...qualityBlockers(run));
 
   for (const stage of run.stages.filter(
     (s) => s.status === "completed" && !currentScope(s),
@@ -539,7 +617,8 @@ export function evaluation(
   return result;
 }
 
-export function runMetrics(run: WorkflowRun) {
+export function runMetrics(run: WorkflowRun, current = run.scope.fingerprint) {
+  const quality = qualitySnapshot(run, current);
   const agents = run.stages.filter((stage) => stage.agent && stage.attempts);
   const reported = agents.flatMap((stage) =>
     stage.status === "completed" && stage.usage ? [stage.usage] : [],
@@ -569,6 +648,50 @@ export function runMetrics(run: WorkflowRun) {
     outputTokens: total("outputTokens"),
     costUsd: total("costUsd"),
     usageCoverage: `${reported.length}/${agents.length} agent stages`,
+    quality: {
+      level: run.quality?.level ?? "legacy",
+      wallTimeMs: Math.max(
+        0,
+        Date.parse(
+          run.status === "completed" || run.status === "cancelled"
+            ? run.updatedAt
+            : now(),
+        ) - Date.parse(run.createdAt),
+      ),
+      reportedCheckDurationMs:
+        run.quality?.receipts.reduce((sum, r) => sum + r.durationMs, 0) ?? 0,
+      coordinationEvents: run.quality?.events.length ?? 0,
+      checkpointReviewWaitMs:
+        run.collaboration?.submissions.reduce(
+          (sum, s) =>
+            sum +
+            (s.review
+              ? Math.max(0, Date.parse(s.review.at) - Date.parse(s.createdAt))
+              : 0),
+          0,
+        ) ?? 0,
+      rejectedCheckpoints:
+        run.collaboration?.submissions.filter(
+          (s) => s.review && !s.review.accepted,
+        ).length ?? 0,
+      reportedObservedDefects: quality.findings.filter(
+        (f) => f.confidence === "observed" && !f.disposition,
+      ).length,
+      rejectedFindings: quality.findings.filter(
+        (f) => f.disposition?.status === "rejected",
+      ).length,
+      requiredCriteriaPassed: quality.criteria.filter(
+        (c) => c.required && c.status === "passed",
+      ).length,
+      validationSource:
+        "parent-reported or command-captured; execution mode is host-reported; unknown usage is not estimated",
+      capturedChecks:
+        run.quality?.receipts.filter((r) => r.source === "command-captured")
+          .length ?? 0,
+      reportedChecks:
+        run.quality?.receipts.filter((r) => r.source === "parent-reported")
+          .length ?? 0,
+    },
     ...(run.collaboration
       ? {
           collaboration: {

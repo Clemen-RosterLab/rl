@@ -233,27 +233,20 @@ export async function handleHook(
           ? boundAntigravityPeer(file, data, event.sessionId)
           : undefined;
 
-      if (peer) {
+      const knownChild =
+        adapter.name === "agy" &&
+        data.activity?.agy?.some(
+          (entry) =>
+            entry.sessionId === event.sessionId &&
+            entry.childId === event.sessionId &&
+            !entry.resumable,
+        );
+      if (peer || knownChild) {
         event.childId = event.sessionId;
         event.resumable = false;
         // SessionStart can arrive before the parent has received and bound the
         // new handle. Reclassify only when the persisted binding proves it.
-        if (data.sessions.agy) {
-          const remaining = data.sessions.agy.filter(
-            (session) => session.id !== event.sessionId,
-          );
-          if (remaining.length > 0) {
-            data.sessions.agy = remaining;
-          } else {
-            delete data.sessions.agy;
-          }
-        }
-        for (const activity of data.activity?.agy ?? []) {
-          if (activity.sessionId === event.sessionId) {
-            activity.childId = event.childId;
-            activity.resumable = false;
-          }
-        }
+        store.markAntigravityChild(data, event.sessionId);
         scrubPrematurePeerRequests(file, "agy", event.sessionId);
       }
 

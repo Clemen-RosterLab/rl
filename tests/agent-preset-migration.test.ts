@@ -15,12 +15,23 @@ test("RL supplies the migrated team, rubric and coordinator without home agent d
   assert.equal(context.configured, false);
   assert.equal(context.agents.dry.model, "gpt-6-astra");
   assert.equal(context.agents.dry.reasoning, "low");
-  assert.match(context.agents.dry.instructions, /NEW_FUNCTION_SCRUTINY/);
+  assert.equal(context.agents.researcher.access, "read-only");
+  assert.match(
+    context.agents.researcher.instructions,
+    /two to five credible candidates/,
+  );
+  assert.match(
+    context.agents.dry.instructions,
+    /focused semantic-similarity evidence/,
+  );
   assert.match(
     context.agents.writer.instructions,
-    /WRITER_IMPLEMENTATION_REQUEST/,
+    /one implementation proposal/,
   );
-  assert.match(context.agents.reviewer.instructions, /OPTIONAL_RERESCORE/);
+  assert.match(
+    context.agents.reviewer.instructions,
+    /Incomplete review must remain incomplete/,
+  );
   assert.equal(context.agents["regression-qa"].access, "read-only");
   assert.deepEqual(context.policies.review.rating, {
     min: 0,
@@ -28,18 +39,18 @@ test("RL supplies the migrated team, rubric and coordinator without home agent d
     minimum: 6,
     instructions: context.policies.review.rating.instructions,
   });
-  assert.match(context.policies.review.instructions, /non-compounding/);
   assert.match(
     context.policies.review.instructions,
-    /STRICT_CHANGED_PRODUCTION_LINES/,
+    /without automatic style\/type multipliers/,
   );
-  assert.equal(context.policies.review.blockRequired, false);
-  assert.match(context.instructions, /TASK_BRIEF_REVISION/);
   assert.match(
-    context.instructions,
-    /Never select locally defined custom agent types/,
+    context.policies.review.instructions,
+    /Critical or required unresolved findings block acceptance/,
   );
-  assert.match(context.instructions, /REVIEW_EXTENSION_STATE_MACHINE/);
+  assert.equal(context.policies.review.blockRequired, true);
+  assert.match(context.instructions, /acceptance criteria/);
+  assert.match(context.instructions, /this session's native children/);
+  assert.match(context.instructions, /workflow preflight/);
   assert.equal(
     context.workflows[context.defaultWorkflow].collaboration.maxRounds,
     4,
@@ -94,12 +105,9 @@ for (const host of ["codex", "claude", "agy"] as const) {
           : undefined,
       );
       assert.equal(profile.hosts, undefined);
-      assert.equal(
-        claimed.prompt.includes("Claude harness notes"),
-        host === "claude",
-      );
+      assert.equal(claimed.prompt.includes("Claude host:"), host === "claude");
       if (host === "claude" && role === "dry")
-        assert.match(claimed.prompt, /6 dispatched requests/);
+        assert.match(claimed.prompt, /focused reuse evidence/);
     }
     assert.equal(
       context.agents["regression-qa"].model,

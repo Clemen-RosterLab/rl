@@ -27,6 +27,7 @@ import {
   type ReviewTextPoint,
   type ReviewMenu,
   reviewLineNumbers,
+  terminalText,
 } from "./review-live-view.js";
 export { terminalText } from "./review-live-view.js";
 import {
@@ -70,6 +71,8 @@ import type {
 } from "./review-search.js";
 import { installTerminalCrashGuard } from "./review/terminal-guard.js";
 import type { RemoteReviewTarget } from "./review-remote.js";
+import type { WorkflowReviewState } from "./agent-runner.js";
+import type { Finding } from "./review-policy.js";
 import {
   GhReviewComments,
   ReviewDraftStore,
@@ -89,7 +92,12 @@ interface ActionMenu extends ReviewMenu {
     | "drafts"
     | "draft-actions"
     | "review-confirm"
-    | "review-recovery";
+    | "review-recovery"
+    | "workflow"
+    | "workflow-finding"
+    | "workflow-detail";
+  workflow?: WorkflowReviewState;
+  finding?: Finding;
   reviewEvent?: ReviewEvent;
   reviewPr?: PullRequest;
   draftRevision?: string;
@@ -389,6 +397,7 @@ const help = [
   "Click a preview line, or scroll it to the top, then press i.",
   "D    Edit / delete saved local PR review drafts",
   "R    Review summary and submit: Comment / Approve / Request changes",
+  "W    Live workflow: roles, blockers, criteria, validation and findings",
   "Composer: Enter saves locally · Ctrl-j adds a newline · Esc cancels",
   "/    Search file paths and selected diff",
   "n / N    Next / previous match",
@@ -592,6 +601,11 @@ export async function liveReview(options: LiveOptions): Promise<void> {
         ? { filters: fileFilters, index: filterMenuIndex, settings }
         : undefined,
       menu,
+      workflowChanged: new Set(
+        workflowSnapshot?.fileReviews
+          .filter((f) => f.changedAfterReview)
+          .map((f) => f.path) ?? [],
+      ),
       composer:
         prompt === "comment" || prompt === "review-body"
           ? {
@@ -634,7 +648,9 @@ export async function liveReview(options: LiveOptions): Promise<void> {
         ? "Changes since you last viewed this file · d returns to comparison"
         : fullFile
           ? `${beforeFile ? "Base" : "Target"} file content · c returns to diff`
-          : undefined,
+          : workflowSnapshot?.stale
+            ? "Workflow evidence is stale or unavailable · W Inspect"
+            : undefined,
       branch: options.remote
         ? `${options.remote.repository} · PR #${options.pr}${pr ? " / " + pr.headRefName : ""}`
         : (state?.snapshot.branch ?? path.basename(options.root)),
@@ -924,6 +940,10 @@ export async function liveReview(options: LiveOptions): Promise<void> {
   async function chooseMenu(index: number): Promise<void> {
     const current = menu;
     if (!current) return;
+    if (current.kind.startsWith("workflow")) {
+      await chooseWorkflow(current, index);
+      return;
+    }
     if (
       [
         "review",
@@ -1516,6 +1536,7 @@ export async function liveReview(options: LiveOptions): Promise<void> {
           state = result;
           updates++;
           if (branchChanged) {
+            workflowSnapshot = undefined;
             mode = { kind: "working" };
             commitIndex = 0;
             status =
@@ -1837,6 +1858,385 @@ export async function liveReview(options: LiveOptions): Promise<void> {
     setStatus(
       `Marked inspected snapshot ${point.label} reviewed · s compares later changes`,
     );
+  }
+  let workflowBusy = false;
+  let workflowSnapshot: WorkflowReviewState | undefined;
+  async function showWorkflow(poll = false): Promise<void> {
+    if (workflowBusy || stopped) return;
+    if (options.remote) {
+      setStatus(
+        "Remote-only review has no local workflow records · open its local worktree to inspect agent evidence",
+      );
+      return;
+    }
+    if (!state) return;
+    workflowBusy = true;
+    try {
+      const capturedBranch = state.snapshot.branch;
+      const report = await git.request<WorkflowReviewState | null>("workflow", {
+        directory: options.directory,
+        branch: capturedBranch,
+      });
+      if (stopped || state.snapshot.branch !== capturedBranch) return;
+      if (!report) {
+        workflowSnapshot = undefined;
+        if (!poll)
+          setStatus(
+            "No workflow run recorded for this exact worktree and branch",
+          );
+        return;
+      }
+      workflowSnapshot = report;
+      if (poll && menu?.kind !== "workflow") {
+        render();
+        return;
+      }
+      const values: string[] = [],
+        items: { label: string; detail?: string }[] = [];
+      const add = (value: string, label: string, detail: string) => {
+        values.push(value);
+        items.push({ label, detail });
+      };
+      for (const role of report.roles)
+        add(
+          `role:${role.id}`,
+          `${role.id} · ${role.stale ? "STALLED" : role.status} · ${role.state.toUpperCase()} · ${Math.floor(role.elapsedMs / 1000)}s`,
+          role.progress ??
+            role.error ??
+            role.detail ??
+            `Requested model: ${role.requestedModel ?? "inherit"} · host-reported capabilities`,
+        );
+      add(
+        "capabilities",
+        `HOST CAPABILITIES · ${!report.capabilities ? "UNVERIFIED" : report.capabilities.degradedReason ? "DEGRADED" : "HOST-REPORTED"}`,
+        report.capabilities?.degradedReason ??
+          "Inspect declared delegation, messaging, read-only controls and available models",
+      );
+      if (report.governance) {
+        add(
+          "effort",
+          `EFFORT · ${report.level.toUpperCase()} · ${report.governance.assessment ? "ASSESSED" : "AWAITING ASSESSMENT"}`,
+          report.governance.assessment?.rationale ??
+            `Automatic baseline: ${report.governance.baseline}; requested: ${report.governance.requested}`,
+        );
+        add(
+          "budgets",
+          "BUDGETS / STOPPING CONDITIONS",
+          `${report.governance.budgets.researchMs / 1000}s research · ${report.governance.budgets.runMs / 1000}s run · ${report.governance.budgets.reviewRounds} review rounds`,
+        );
+      }
+      if (report.capture)
+        add(
+          "capture",
+          "VALIDATION COMMAND RUNNING",
+          `${report.capture.check} · ${report.capture.command.join(" ")}`,
+        );
+      for (const [i, blocker] of report.blockers.entries())
+        add(`blocker:${i}`, "BLOCKER", blocker);
+      for (const criterion of report.criteria) {
+        add(
+          `criterion:${criterion.id}`,
+          `${criterion.status.toUpperCase()} · ${criterion.id}${criterion.stale ? " · SOURCE CHANGED" : ""}`,
+          criterion.text,
+        );
+        for (const check of criterion.checks)
+          add(
+            `check:${check.id}`,
+            `${check.status.toUpperCase()} · ${check.id}${check.stale ? " · SOURCE CHANGED" : ""}`,
+            `${check.expected} · ${check.source} · ${check.scope.kind} scope`,
+          );
+      }
+      for (const approach of report.research?.brief.approaches ?? [])
+        add(
+          `approach:${approach.id}`,
+          `APPROACH · ${approach.title}`,
+          `${report.research?.decision?.approach === approach.id ? "SELECTED · " : report.research?.brief.recommendation === approach.id ? "RECOMMENDED · " : ""}${approach.viability} · ${approach.mechanism}`,
+        );
+      for (const receipt of report.receipts)
+        add(
+          `receipt:${receipt.id}`,
+          `${receipt.mode.toUpperCase()} · exit ${receipt.exitCode} · ${receipt.command.join(" ")}`,
+          `${receipt.criteria.join(", ")} · ${receipt.source} · ${receipt.fingerprint.slice(0, 10)}`,
+        );
+      for (const [i, finding] of report.findings.entries())
+        add(
+          `finding:${i}`,
+          `${finding.disposition ? "REJECTED" : finding.severity.toUpperCase()} · ${finding.title}`,
+          `${finding.file}:${finding.line} · ${finding.required ? "required" : "advisory"}`,
+        );
+      add(
+        "metrics",
+        "METRICS / EVIDENCE COVERAGE",
+        `${report.metrics.attempts} attempts · usage ${report.metrics.usageCoverage} · checks show reported/captured provenance`,
+      );
+      const previous =
+        menu?.kind === "workflow" ? menu.values?.[menu.index] : undefined;
+      const next: ActionMenu = {
+        kind: "workflow",
+        title: `WORKFLOW · ${report.level.toUpperCase()} · ${report.status}`,
+        subtitle: `${report.run.slice(0, 8)} · ${report.stale ? "SOURCE CHANGED · evidence needs revalidation" : (report.reason ?? "Legacy run · no acceptance checklist")}`,
+        items,
+        values,
+        index: Math.max(0, previous ? values.indexOf(previous) : 0),
+        workflow: report,
+        hint: "Enter Inspect / open finding · W Refresh · Escape Close · updates every 3s",
+      };
+      if (poll) {
+        menu = next;
+        render();
+      } else openMenu(next);
+    } catch (cause) {
+      if (poll && workflowSnapshot) {
+        workflowSnapshot = {
+          ...workflowSnapshot,
+          stale: true,
+          blockers: [
+            ...workflowSnapshot.blockers.filter(
+              (blocker) => !blocker.startsWith("Refresh unavailable:"),
+            ),
+            `Refresh unavailable: ${message(cause)}`,
+          ],
+        };
+        if (menu?.kind === "workflow")
+          menu = {
+            ...menu,
+            workflow: workflowSnapshot,
+            subtitle: `UNVERIFIED · ${message(cause)}`,
+          };
+        render();
+      } else if (!poll) error(cause);
+    } finally {
+      workflowBusy = false;
+    }
+  }
+  async function openWorkflowFinding(finding: Finding): Promise<void> {
+    const file = allFiles.find(
+      (f) => f.path === finding.file || f.oldPath === finding.file,
+    );
+    if (!file)
+      throw new Error(
+        "Finding's file is outside this comparison · select w or p, then reopen W",
+      );
+    closeMenu();
+    fullFile = false;
+    sinceViewed = false;
+    beforeFile = false;
+    if (!files.some((f) => f.key === file.key)) files.push(file);
+    fileIndex = files.findIndex((f) => f.key === file.key);
+    pendingPosition = { key: file.key, source: finding.line };
+    focus = 2;
+    await patch();
+  }
+  async function chooseWorkflow(
+    current: ActionMenu,
+    index: number,
+  ): Promise<void> {
+    const report = current.workflow,
+      action = current.values?.[index];
+    if (!report || !action) return;
+    if (current.kind === "workflow-finding" && current.finding) {
+      const finding = current.finding;
+      if (action === "back") {
+        await showWorkflow();
+        return;
+      }
+      if (action === "comment" && report.stale)
+        throw new Error(
+          "Workflow finding predates current source · inspect and revalidate before drafting a PR comment",
+        );
+      if (action === "comment") {
+        const fresh = await git.request<WorkflowReviewState | null>(
+          "workflow",
+          { directory: options.directory, branch: state?.snapshot.branch },
+        );
+        if (
+          !fresh ||
+          fresh.run !== report.run ||
+          fresh.stale ||
+          fresh.fingerprint !== report.fingerprint ||
+          !fresh.findings.some(
+            (f) => JSON.stringify(f) === JSON.stringify(finding),
+          )
+        )
+          throw new Error(
+            "Workflow evidence changed; refresh W and inspect the current finding before drafting",
+          );
+      }
+      await openWorkflowFinding(finding);
+      if (action === "comment") {
+        const position = reviewLineNumbers(lines).findIndex(([old, next]) =>
+          selected()?.status.startsWith("D")
+            ? old === finding.line
+            : next === finding.line,
+        );
+        if (position < 0)
+          throw new Error(
+            "Finding line is outside the displayed PR diff; no comment was drafted",
+          );
+        commentPoint = { lines, line: position };
+        await beginInlineComment();
+        if (prompt === "comment") {
+          input = `${finding.title}\n\n${finding.evidence}\n\n${finding.recommendation}`;
+          render();
+        }
+      } else
+        setStatus(
+          `${finding.file}:${finding.line} · AI finding${report.stale ? " · evidence predates current source" : ""}`,
+        );
+      return;
+    }
+    if (action.startsWith("finding:")) {
+      const finding = report.findings[Number(action.slice(8))];
+      if (!finding) return;
+      openMenu({
+        kind: "workflow-finding",
+        title: `AI FINDING · ${finding.severity.toUpperCase()}`,
+        subtitle: `${finding.file}:${finding.line}${report.stale ? " · STALE SOURCE" : ""}`,
+        workflow: report,
+        finding,
+        index: 0,
+        items: [
+          { label: "Open file and source line", detail: finding.title },
+          {
+            label: "Draft GitHub inline comment",
+            detail:
+              "Requires current PR comparison and a valid GitHub diff location",
+          },
+          {
+            label: "Back to workflow",
+            detail: `${finding.evidence} · ${finding.recommendation}`,
+          },
+        ],
+        values: ["open", "comment", "back"],
+      });
+      return;
+    }
+    let detail: string[] = [];
+    if (action.startsWith("receipt:")) {
+      const receipt = report.receipts.find((r) => r.id === action.slice(8));
+      if (receipt)
+        detail = [
+          `${receipt.mode} · exit ${receipt.exitCode} · ${receipt.source}`,
+          receipt.command.join(" "),
+          `cwd: ${receipt.cwd}`,
+          `source: ${receipt.fingerprint}`,
+          `criteria: ${receipt.criteria.join(", ")}`,
+          ...receipt.artifacts.map((a) => `Artifact: ${a}`),
+          "STDOUT",
+          ...receipt.stdout.split("\n").slice(0, 100),
+          "STDERR",
+          ...receipt.stderr.split("\n").slice(0, 50),
+        ];
+    } else if (action.startsWith("approach:")) {
+      const approach = report.research?.brief.approaches.find(
+        (a) => a.id === action.slice(9),
+      );
+      if (approach)
+        detail = [
+          approach.title,
+          `Viability: ${approach.viability}`,
+          `Mechanism: ${approach.mechanism}`,
+          `Distinct from other seeds: ${approach.distinction}`,
+          ...approach.advantages.map((x) => `Advantage: ${x}`),
+          ...approach.tradeoffs.map((x) => `Tradeoff: ${x}`),
+          ...approach.risks.map((x) => `Risk: ${x}`),
+          ...approach.assumptions.map((x) => `Assumption: ${x}`),
+          ...approach.validation.map((x) => `Validation: ${x}`),
+          ...approach.sources.map((s) =>
+            s.kind === "repository"
+              ? `Source: ${s.path}${s.line ? ":" + s.line : ""}`
+              : `Source: ${s.url}`,
+          ),
+          `Comparison: ${report.research?.brief.comparison}`,
+          `Recommended: ${report.research?.brief.recommendation}`,
+          `Selected: ${report.research?.decision?.approach ?? "awaiting coordinator"}`,
+          `Decision rationale: ${report.research?.decision?.rationale ?? "not yet selected"}`,
+          `Research source: ${report.research?.brief.fingerprint}`,
+          approach.exclusionReason
+            ? `Ruled out: ${approach.exclusionReason}`
+            : "",
+          ...(report.research?.brief.uncertainties ?? []).map(
+            (x) => `Uncertainty: ${x}`,
+          ),
+        ];
+    } else if (action.startsWith("check:")) {
+      const check = report.criteria
+        .flatMap((c) => c.checks)
+        .find((c) => c.id === action.slice(6));
+      if (check) detail = JSON.stringify(check, null, 2).split("\n");
+    } else if (action === "effort" || action === "budgets") {
+      detail = JSON.stringify(
+        action === "effort"
+          ? {
+              requested: report.governance?.requested,
+              baseline: report.governance?.baseline,
+              assessment: report.governance?.assessment,
+            }
+          : report.governance,
+        null,
+        2,
+      ).split("\n");
+    } else if (action === "capture") {
+      detail = JSON.stringify(report.capture, null, 2).split("\n");
+    } else if (action === "capabilities")
+      detail = JSON.stringify(
+        {
+          source: report.capabilitySource ?? "unverified",
+          ...report.capabilities,
+        },
+        null,
+        2,
+      ).split("\n");
+    else if (action === "metrics")
+      detail = JSON.stringify(report.metrics, null, 2).split("\n");
+    else if (action.startsWith("role:")) {
+      const role = report.roles.find((r) => r.id === action.slice(5));
+      if (role)
+        detail = [
+          `Status: ${role.stale ? "STALLED" : role.status}`,
+          `Requested model: ${role.requestedModel ?? "inherit"}`,
+          `Declared model: ${role.declaredModel ?? "inherit / unverified"} (host-reported)`,
+          `Claim: ${role.claim ?? "none"}`,
+          `Native child: ${role.childId ?? "not bound"}`,
+          `Idle: ${Math.floor(role.idleMs / 1000)}s`,
+          `Activity: ${role.state} · ${role.detail}`,
+          `Waiting on: ${role.waitingOn.join(", ") || "nothing recorded"}`,
+          role.stateSource,
+          role.progress ?? role.error ?? "No progress reported",
+          ...report.events
+            .filter((e) => e.step === role.id)
+            .slice(-20)
+            .map((e) => `${e.at} ${e.message}`),
+          "Recovery: stop the native child, then rl workflow recover --file - with run, step, claim, stopped:true and reason. RL never silently replaces a running writer.",
+        ];
+    } else {
+      const item = current.items[index];
+      detail = [item.label, item.detail ?? ""];
+    }
+    const width = Math.max(16, geometry().diff.width - 2);
+    detail = detail.flatMap((text) => {
+      const chunks: string[] = [];
+      for (
+        let offset = 0;
+        offset < Math.max(1, reviewTextColumn(text, Infinity));
+        offset += width
+      )
+        chunks.push(terminalText(text, width, offset).trimEnd());
+      return chunks;
+    });
+    openMenu({
+      kind: "workflow-detail",
+      title: "WORKFLOW EVIDENCE",
+      subtitle: report.stale
+        ? "Source changed · prior evidence is stale"
+        : "Evidence labels distinguish reported and captured execution; mode and coverage are host-reported",
+      workflow: report,
+      index: 0,
+      items: detail.map((label) => ({ label })),
+      values: detail.map(() => "back"),
+      hint: "j/k Scroll evidence · Enter Back · Escape Close",
+    });
+    if (current.kind === "workflow-detail") await showWorkflow();
   }
   function reviewDraft(reload = false): ReviewDraft {
     if (!pr)
@@ -2317,6 +2717,10 @@ export async function liveReview(options: LiveOptions): Promise<void> {
       return;
     }
     if (menu) {
+      if (text === "W" && menu.kind.startsWith("workflow")) {
+        void showWorkflow();
+        return;
+      }
       if (name === "escape") {
         searchVersion++;
         closeMenu();
@@ -2386,6 +2790,10 @@ export async function liveReview(options: LiveOptions): Promise<void> {
     }
     if (text === "T") {
       toggleFilterMenu();
+      return;
+    }
+    if (text === "W" && !keypress.ctrl && !keypress.meta) {
+      void showWorkflow();
       return;
     }
     if (text === "i" && !keypress.ctrl && !keypress.meta) {
@@ -2843,6 +3251,10 @@ export async function liveReview(options: LiveOptions): Promise<void> {
     () => void discover(),
     options.remoteInterval ?? 60000,
   );
+  const workflowTimer = setInterval(() => {
+    if ((workflowSnapshot || menu?.kind === "workflow") && !prompt)
+      void showWorkflow(true);
+  }, 3000);
   const disarmCrashGuard = installTerminalCrashGuard({
     restoreTerminalSettings,
     getWorkerPid: () => git.pid,
@@ -2883,6 +3295,7 @@ export async function liveReview(options: LiveOptions): Promise<void> {
     remoteAbort.abort();
     clearTimeout(renderTimer);
     clearInterval(remoteTimer);
+    clearInterval(workflowTimer);
     // Mouse reports already in flight can arrive after mouse-off. Keep the
     // terminal raw and consume them until background cleanup and input settle.
     const releaseInput = drainReviewInput(process.stdin);

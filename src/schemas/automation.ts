@@ -132,7 +132,7 @@ export const CollaborationRuleSchema = z.strictObject({
 export const CollaborationConfigSchema = z.strictObject({
   writer: IdentifierSchema,
   reviewer: IdentifierSchema,
-  dry: IdentifierSchema,
+  dry: IdentifierSchema.optional(),
   maxRounds: boundedInt(1, 20),
   rules: z.array(CollaborationRuleSchema).max(32),
 });
@@ -226,12 +226,19 @@ export const AutomationConfigSchema = z
 
       if (workflow.collaboration) {
         const collab = workflow.collaboration;
-        const roles = [collab.writer, collab.reviewer, collab.dry];
-        if (new Set(roles).size !== 3 || workflow.concurrency < 3) {
+        const roles = [
+          collab.writer,
+          collab.reviewer,
+          ...(collab.dry ? [collab.dry] : []),
+        ];
+        if (
+          new Set(roles).size !== roles.length ||
+          workflow.concurrency < roles.length
+        ) {
           ctx.addIssue({
             code: "custom",
             message:
-              "Collaborative roles require three distinct steps and concurrency of at least three",
+              "Collaborative roles require distinct steps and sufficient concurrency",
           });
           return;
         }
@@ -239,11 +246,18 @@ export const AutomationConfigSchema = z
           const step = workflow.steps.find(
             (candidate) => candidate.id === role,
           );
-          if (!step?.agent || step.after.length > 0) {
+          const shared =
+            workflow.steps.find((candidate) => candidate.id === collab.writer)
+              ?.after ?? [];
+          if (
+            !step?.agent ||
+            step.after.some((dep) => roles.includes(dep)) ||
+            [...step.after].sort().join("\0") !== [...shared].sort().join("\0")
+          ) {
             ctx.addIssue({
               code: "custom",
               message:
-                "Collaborative roles must be agent steps ready together at startup",
+                "Collaborative roles must be agent steps ready together after the same prephase dependencies",
             });
             return;
           }
@@ -342,6 +356,13 @@ export const FindingSchema = z.strictObject({
   evidence: proseSchema(16000, "finding evidence"),
   recommendation: proseSchema(16000, "finding recommendation"),
   confidence: z.enum(["observed", "inferred"]),
+  disposition: z
+    .strictObject({
+      status: z.literal("rejected"),
+      reason: proseSchema(16000, "disposition reason"),
+      evidence: proseSchema(16000, "disposition evidence"),
+    })
+    .optional(),
 });
 
 export const RoutingLeadSchema = z.strictObject({

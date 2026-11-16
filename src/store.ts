@@ -529,6 +529,31 @@ export class Store {
   }
 
   /** Mutate the supplied record; callers persist session and activity together. */
+  markAntigravityChild(data: Instance, id: string): void {
+    const sid = sessionId(id);
+    const sessions = data.sessions.agy?.filter((session) => session.id !== sid);
+    if (sessions?.length) data.sessions.agy = sessions;
+    else delete data.sessions.agy;
+    const activity = ((data.activity ??= {}).agy ??= []);
+    const existing = activity.filter((entry) => entry.sessionId === sid);
+    for (const entry of existing) {
+      entry.childId = sid;
+      entry.resumable = false;
+    }
+    // Retain classification independently of workflow retention/recovery. A
+    // later hook must not turn a formerly bound child into a main conversation.
+    if (!existing.length)
+      activity.push({
+        sessionId: sid,
+        childId: sid,
+        resumable: false,
+        state: "idle",
+        lastEvent: "workflow.bind",
+        observedAt: now(),
+      });
+  }
+
+  /** Mutate the supplied record; callers persist session and activity together. */
   associateSession(
     file: string,
     data: Instance,
@@ -538,6 +563,16 @@ export class Store {
   ): void {
     const sid = sessionId(id);
     this.assertSessionOwner(file, agent, sid);
+    if (
+      agent === "agy" &&
+      data.activity?.agy?.some(
+        (entry) =>
+          entry.sessionId === sid && entry.childId === sid && !entry.resumable,
+      )
+    )
+      throw new Error(
+        "This Antigravity conversation is a native subagent; resume its main conversation instead",
+      );
     const sessions = (data.sessions[agent] ??= []);
     const existing = sessions.find((s) => s.id === sid);
     if (!existing) {

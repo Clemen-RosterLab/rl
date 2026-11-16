@@ -153,6 +153,7 @@ const topics: Record<string, Topic> = {
       "Default: live commits/files/diff for the current worktree. 1/2/3 focus; Tab cycles; j/k navigate; w working; p branch; r range; f freeze; m mark; s since; / search; o VS Code; ? help; q quit.",
       "Local review watches source, HEAD and index. --pr uses an isolated bare Git cache and remote polling; no checkout is created. m/s retain exact reviewed revisions.",
       "In PR mode: i drafts an inline comment, D manages local drafts, and R submits a GitHub review after confirmation. Git files remain read-only.",
+      "W opens live local workflow roles, blockers, criteria, check receipts and findings. Select a finding to open its diff or prepare a GitHub comment draft.",
       "Queue: Enter review, Alt-S summary, Alt-D diff, Alt-F feedback, Alt-A approve, Alt-O editor, Ctrl-R refresh, Esc quit.",
       "New rl switch -c branches record a fixed baseline. Older worktrees require explicit --base; no feature baseline is guessed.",
       "Temporary Git indexes capture committed, staged, unstaged and non-ignored untracked source without changing your real index or branch.",
@@ -376,6 +377,8 @@ const topics: Record<string, Topic> = {
     options: [
       "--base <ref>     Local comparison ref (default: repository setting)",
       "--prompt <text>  Feature intent for the reviewers",
+      "--level auto|light|standard|deep  Select execution depth (default auto for unnamed built-in runs)",
+      "--file <plan.json|->  Acceptance criteria and optional level; see workflow context schemas",
       "--dry-run        Preview scope and steps without launching agents",
       "--json           Print structured results",
       "--agent codex|claude|agy  Parent session provider",
@@ -383,7 +386,9 @@ const topics: Record<string, Topic> = {
       "--request <UUID>     Start a queued workflow request instead of choosing a name",
     ],
     notes: [
-      "Default workflow: writer-reviewer-dry. The parent spawns all three native peers in parallel and binds their handles; RL never launches agent processes.",
+      "Light runs writer then reviewer; Standard runs them concurrently; Deep also retains DRY. Auto considers sensitive behavior and scope, not just line count.",
+      "Standard and Deep first run a read-only researcher that seeds multiple approaches. The coordinator records workflow decide before the writer starts.",
+      "Leveled runs require host preflight and current evidence for required acceptance criteria. Explicit named/custom runs without --level retain their declared plan.",
       "The parent claims ready steps, spawns native subagents and reports evidence. RL applies the policy; provider usage is parent-reported.",
     ],
     examples: ["rl workflow run --base origin/test --dry-run"],
@@ -458,8 +463,11 @@ const topics: Record<string, Topic> = {
       "rl workflow review <run> --file <review.json|-> [--agent codex|claude|agy] [--session <UUID>]",
   },
   "workflow status": {
-    description: "Inspect a saved run",
-    usage: "rl workflow status [UUID|latest] [--json]",
+    description: "Inspect each agent's state, progress and waiting conditions",
+    usage: "rl workflow status [UUID|latest] [--json|--watch]",
+    notes: [
+      "--watch refreshes per-agent activity every second in the current terminal. j/k or arrows scroll; q, Escape or Ctrl-C closes it. Recorded claims and heartbeats do not independently establish native process liveness.",
+    ],
   },
   "workflow metrics": {
     description: "Inspect measured duration and provider usage",
@@ -470,6 +478,115 @@ const topics: Record<string, Topic> = {
     usage: "rl workflow pause [UUID|latest] [--json]",
     notes: [
       "Stops new step claims. The parent session owns and stops native child processes; existing claims may still report while paused.",
+    ],
+  },
+  "workflow preflight": {
+    description:
+      "Record actual native host capabilities before claiming leveled work",
+    usage:
+      "rl workflow preflight [UUID] --file <json|-> [--agent codex|claude|agy] [--session <UUID>]",
+    notes: [
+      "Input: run and capabilities {delegation,messaging,readOnly,models,degradedReason?}. Capabilities are host-reported; unavailable delegation blocks execution.",
+    ],
+  },
+  "workflow assess": {
+    description: "Record coordinator effort reasoning before claiming roles",
+    usage: "rl workflow assess [UUID] --file <json|->",
+    notes: [
+      "Input: run and assessment {level,rationale,uncertainty,systems,consequences}. Auto is a baseline; the coordinator assesses complexity. Explicit user-selected levels remain pinned. A changed level rebuilds unclaimed roles and requires renewed host preflight.",
+    ],
+  },
+  "workflow budget": {
+    description: "Set bounded research, execution and review budgets",
+    usage: "rl workflow budget [UUID] --file <json|->",
+    notes: [
+      "Input: run and budgets {researchMs,runMs,checkMs,submissions,consultations,reviewRounds}. Defaults apply to omitted budget fields. Budgets freeze after roles start and cannot be changed while a captured command is running.",
+    ],
+  },
+  "workflow orient": {
+    description: "Record the reviewer's independent first-pass risks",
+    usage: "rl workflow orient [UUID] --file <json|->",
+    notes: [
+      "Input: run, step, claim, fingerprint, risks, checksToChallenge and assumptions. Research recommendations and writer rationale are withheld from claimed prompts/inboxes until this pass is saved; this is a protocol, not an access-control boundary.",
+    ],
+  },
+  "workflow resolve": {
+    description: "Resolve a rejected checkpoint disagreement with evidence",
+    usage: "rl workflow resolve [UUID] --file <json|->",
+    notes: [
+      "Input: run, submission, decision (fix/reject/blocked), rationale and evidence. A resolution directs the next action; it does not accept a checkpoint, dismiss findings or bypass a fresh review.",
+    ],
+  },
+  "workflow escalate": {
+    description: "Create a higher-effort successor after host-confirmed stop",
+    usage: "rl workflow escalate [UUID] --file <json|->",
+    notes: [
+      "Input: run, higher level, rationale and stopped:true. Stop all native children/checks before confirming. Auto runs may escalate; pinned user levels require a new user-selected run. Original records remain intact; successor evidence retains provenance and is revalidated by source identity.",
+    ],
+  },
+  "workflow check": {
+    description:
+      "Execute a planned validation command and capture actual results",
+    usage: "rl workflow check [UUID] --file <json|->",
+    notes: [
+      "Input: run, check, exact command argv, absolute cwd, mode (static/mocked/live) and optional timeoutMs. Runs within the worktree and current host permissions, without adding a shell. Output/time are bounded. Captured execution does not certify the reported mode or dependency coverage.",
+    ],
+  },
+  "workflow outcome": {
+    description: "Record a benchmark trial using captured outcome graders",
+    usage: "rl workflow outcome [UUID] --file <json|->",
+    notes: [
+      "Input: run, suiteVersion:1, case, trial, kind (native/synthetic), acceptance and regression receipt UUIDs, observedDefects and notes. Requires current captured results from the suite's exact graders.",
+    ],
+  },
+  "workflow eval": {
+    description: "List representative tasks or compare saved outcome trials",
+    usage: "rl workflow eval [--file <json|->] [--json]",
+    notes: [
+      "Without --file, prints versioned task fixtures and acceptance/regression commands. With {runs:[UUID,...]}, compares recorded trials by case, level and native/synthetic kind. This command never launches models, runs graders or changes source.",
+    ],
+  },
+  "workflow criteria": {
+    description: "Record explicit acceptance criteria before work begins",
+    usage: "rl workflow criteria [UUID] --file <json|->",
+    notes: [
+      "Input: run and criteria [{id,text,required,validation:any|mocked|live,checks:[{id,expected,command?,mode?,source?,scope?}]}]. Required criteria need individually planned checks. IDs are unique across the run; every required check must pass. Criteria freeze once a role is claimed.",
+    ],
+  },
+  "workflow research": {
+    description: "Save multiple distinct approach seeds before implementation",
+    usage: "rl workflow research [UUID] --file <json|->",
+    notes: [
+      "Requires the current researcher step/claim and a source-bound brief with 2–5 distinct mechanisms, evidence, tradeoffs, risks, validation and a viable recommendation. Aim for three credible alternatives; never invent viable choices.",
+    ],
+  },
+  "workflow decide": {
+    description: "Select a research approach before the writer starts",
+    usage: "rl workflow decide [UUID] --file <json|->",
+    notes: [
+      "Input: run, approach ID and coordinator rationale. The selection must be a saved viable seed; recommendation alone does not authorize implementation.",
+    ],
+  },
+  "workflow validation": {
+    description: "Save actual check output against an exact source fingerprint",
+    usage: "rl workflow validation [UUID] --file <json|->",
+    notes: [
+      "Input: run and receipt with check ID, criteria, argv command, cwd, exitCode, mode, fingerprint, files, artifacts, stdout, stderr and durationMs. Parent-reported; this command does not execute checks or satisfy a captured-only check. Use workflow check for command capture.",
+    ],
+  },
+  "workflow heartbeat": {
+    description: "Record progress and renew a current claim's inactivity lease",
+    usage: "rl workflow heartbeat [UUID] --file <json|->",
+    notes: [
+      "Input: run, step, claim and message. Status and W in rl review expose stalled claims.",
+    ],
+  },
+  "workflow recover": {
+    description:
+      "Recover an expired claim after the parent has stopped its native child",
+    usage: "rl workflow recover [UUID] --file <json|->",
+    notes: [
+      "Input: run, step, claim, stopped:true and reason. Recovery invalidates the old claim and binding; it never kills or silently replaces a host-owned agent.",
     ],
   },
   "workflow cancel": {
@@ -709,8 +826,9 @@ const topics: Record<string, Topic> = {
     description: "Complete or repair RL installation and shell integration",
     usage: "rl setup install [--shell zsh|bash]",
     notes: [
-      "Installs missing Git, zsh, fzf and gh, then registers shell integration in your startup file.",
-      "Preserves your settings and updates one RL-owned block. New terminals load RL automatically; reload the installing terminal once.",
+      "Installs missing Git, zsh, fzf and gh, then registers zsh and bash shell integration in your startup files.",
+      "Pass --shell zsh or --shell bash to configure only one shell.",
+      "Preserves your settings and updates one RL-owned block per file. New terminals load RL automatically; reload the installing terminal once.",
       "Run once after npm install --global rl-workspaces, or again at any time to repair setup.",
     ],
   },

@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { WorkflowQualitySchema } from "../orchestration/quality.js";
 import {
   AutomationConfigSchema,
   RelativeWorkspaceFileSchema,
@@ -99,6 +100,11 @@ export const StageCheckOutputSchema = z
   );
 
 export const WorkflowStageDiskSchema = z.looseObject({
+  heartbeatAt: z
+    .string()
+    .refine((v) => Number.isFinite(Date.parse(v)))
+    .optional(),
+  progress: z.string().max(2000).optional(),
   id: z.string().regex(/^(?:followup-)?[a-z][a-z0-9_-]{0,63}$/),
   after: z.array(z.string()),
   agent: z.string().optional(),
@@ -124,6 +130,7 @@ export const WorkflowStageDiskSchema = z.looseObject({
 });
 
 export const WorkflowRunDiskSchema = z.looseObject({
+  quality: WorkflowQualitySchema.optional(),
   version: z.literal(1),
   execution: z.literal("native").optional(),
   owner: z

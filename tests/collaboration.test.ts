@@ -211,11 +211,13 @@ test("the built-in team is active in adopted workspaces without initialization a
   assert.equal(context.source, "built-in");
   assert.equal(context.defaultWorkflow, "writer-reviewer-dry");
   assert.deepEqual(Object.keys(context.agents), [
+    "researcher",
     "writer",
     "reviewer",
     "dry",
     "regression-qa",
   ]);
+  assert.equal(context.agents.researcher.access, "read-only");
   assert.equal(context.agents.writer.access, "workspace-write");
   assert.equal(context.agents.reviewer.access, "read-only");
   assert.equal(context.agents.dry.access, "read-only");
@@ -224,7 +226,7 @@ test("the built-in team is active in adopted workspaces without initialization a
   assert.match(startup, /built-in defaults/);
   assert.match(
     startup,
-    /spawn all three|all writer, reviewer and DRY|writer, reviewer and DRY/,
+    /Light runs writer then reviewer; Standard binds writer\/reviewer together; Deep also retains DRY/,
   );
   await team();
   const inbox = await peer("writer", "inbox");

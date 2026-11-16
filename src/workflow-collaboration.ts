@@ -11,6 +11,12 @@ import {
   type ReviewResult,
 } from "./review-policy.js";
 import { CollaborationStateSchema } from "./schemas/orchestration.js";
+import {
+  assertBudget,
+  assertOrientation,
+  oriented,
+  reviewerStage,
+} from "./orchestration/governance.js";
 
 interface Consultation {
   id: string;
@@ -352,7 +358,11 @@ export function initializeCollaboration(run: WorkflowRun): void {
 
 function peersReady(run: WorkflowRun): void {
   const roles = run.config.workflows[run.workflow].collaboration!;
-  for (const id of [roles.writer, roles.reviewer, roles.dry]) {
+  for (const id of [
+    roles.writer,
+    roles.reviewer,
+    ...(roles.dry ? [roles.dry] : []),
+  ]) {
     if (
       !run.stages.some(
         (stage) =>
@@ -362,7 +372,7 @@ function peersReady(run: WorkflowRun): void {
       )
     ) {
       throw new Error(
-        "Spawn and bind all writer, reviewer and DRY peers before starting work",
+        "Spawn and bind all configured peers before starting work",
       );
     }
   }
@@ -424,7 +434,12 @@ function allReviewed(run: WorkflowRun): void {
     );
   }
   for (const submission of submissions) {
-    if (!submission.review?.accepted) {
+    if (
+      !submission.review?.accepted ||
+      evaluate(run.config.policies[run.config.workflows[run.workflow].policy], [
+        { owner: submission.reviewer, result: submission.review.result },
+      ]).verdict !== "ready"
+    ) {
       throw new Error(
         `Submission ${submission.id} needs an accepted reviewer rating before completion`,
       );
@@ -476,20 +491,33 @@ export function collaborationTool(
       }));
 
   if (name === "rl_workflow_inbox") {
+    const blind = reviewerStage(run, stage) && !oriented(run, stage);
     return {
       status: run.status,
-      ready: roster().every(
-        (peer) =>
-          Boolean(peer.childId) &&
-          ["running", "completed"].includes(peer.status),
-      ),
+      ready:
+        ![config.writer, config.reviewer, config.dry].includes(stage.id) ||
+        roster().every(
+          (peer) =>
+            Boolean(peer.childId) &&
+            ["running", "completed"].includes(peer.status),
+        ),
       peers: roster(),
-      consultations: data.consultations.filter(
-        (item) => item.from === stage.id || item.to === stage.id,
-      ),
+      consultations: blind
+        ? []
+        : data.consultations.filter(
+            (item) => item.from === stage.id || item.to === stage.id,
+          ),
       submissions:
         stage.id === config.writer || stage.id === config.reviewer
-          ? data.submissions
+          ? blind
+            ? data.submissions.map(({ id, files, fingerprint, snapshot }) => ({
+                id,
+                files,
+                fingerprint,
+                snapshot,
+                rationale: "Withheld until independent first pass",
+              }))
+            : data.submissions
           : [],
     };
   }
@@ -506,6 +534,13 @@ export function collaborationTool(
 
   if (name === "rl_workflow_bind") {
     const childId = prose(input.childId, "native child identifier", 200);
+    if (run.owner?.agent === "agy") {
+      sessionId(childId);
+      if (childId === run.owner.sessionId)
+        throw new Error(
+          "The main Antigravity conversation cannot be bound as its own subagent",
+        );
+    }
     if (
       (stage.childId && stage.childId !== childId) ||
       run.stages.some(
@@ -517,17 +552,22 @@ export function collaborationTool(
       );
     }
     stage.childId = childId;
+    const prephase = ![config.writer, config.reviewer, config.dry].includes(
+      stage.id,
+    );
     return {
       peers: roster(),
-      ready: roster().every((peer) => Boolean(peer.childId)),
-      instruction:
-        "After all peers are bound, notify all three using native messaging so they can begin; relay their notifications when direct peer messaging is unavailable.",
+      ready: prephase || roster().every((peer) => Boolean(peer.childId)),
+      instruction: prephase
+        ? "This independent prephase is bound and ready. Complete it before claiming its dependent implementation peers."
+        : "After all configured peers are bound, notify them using native messaging so they can begin; relay notifications when needed.",
     };
   }
 
   peersReady(run);
 
   if (name === "rl_workflow_consult") {
+    assertBudget(run);
     const event = prose(input.event, "consultation event", 64);
     const subject = prose(input.subject, "consultation subject", 512);
     const question = prose(input.question, "consultation question");
@@ -542,7 +582,10 @@ export function collaborationTool(
     if (!run.stages.some((s) => s.id === rule.to && s.status === "running")) {
       throw new Error("The requested peer is no longer running");
     }
-    if (data.consultations.length >= 256) {
+    if (
+      data.consultations.length >=
+      Math.min(256, run.quality?.governance?.budgets.consultations ?? 256)
+    ) {
       throw new Error("Consultation limit reached; start a new workflow run");
     }
     const request: Consultation = {
@@ -588,6 +631,7 @@ export function collaborationTool(
   }
 
   if (name === "rl_workflow_submit") {
+    assertBudget(run);
     if (stage.id !== config.writer) {
       throw new Error(
         "Only the configured writer may submit implementation work",
@@ -643,17 +687,41 @@ export function collaborationTool(
     }
 
     const round = Math.max(0, ...overlapping.map((item) => item.round)) + 1;
-    if (round > config.maxRounds) {
+    if (
+      round >
+      Math.min(
+        config.maxRounds,
+        run.quality?.governance?.budgets.reviewRounds ?? config.maxRounds,
+      )
+    ) {
       throw new Error(
         "Maximum review rounds reached; report the blocker to the parent",
       );
     }
-    if (data.submissions.length >= 128) {
+    if (
+      data.submissions.length >=
+      Math.min(128, run.quality?.governance?.budgets.submissions ?? 128)
+    ) {
       throw new Error("Submission limit reached; start a new workflow run");
     }
 
     const id = randomUUID();
     const snapshot = checkpoint(run, files);
+    if (run.quality?.governance) {
+      const rejected = overlapping
+        .filter((s) => s.review && !s.review.accepted)
+        .at(-1);
+      if (
+        rejected &&
+        rejected.fingerprint === snapshot.fingerprint &&
+        !run.quality.governance.resolutions.some(
+          (r) => r.submission === rejected.id && r.decision !== "blocked",
+        )
+      )
+        throw new Error(
+          "Repeated rejected content requires a coordinator resolution with evidence before resubmission",
+        );
+    }
     const file = snapshotPath(directory, id);
     fs.writeFileSync(file, JSON.stringify(snapshot), {
       flag: "wx",
@@ -687,6 +755,7 @@ export function collaborationTool(
   }
 
   if (name === "rl_workflow_review") {
+    assertOrientation(run, stage);
     if (stage.id !== config.reviewer) {
       throw new Error("Only the configured reviewer may rate submissions");
     }
@@ -769,15 +838,18 @@ export function collaborationTool(
 
 export function collaborationPrompt(run: WorkflowRun, stage: Stage): string {
   const config = run.config.workflows[run.workflow].collaboration;
-  if (!config) {
+  if (
+    !config ||
+    ![config.writer, config.reviewer, config.dry].includes(stage.id)
+  ) {
     return "";
   }
   const policyRating =
     run.config.policies[run.config.workflows[run.workflow].policy].rating;
 
   return [
-    "This is a persistent collaborative team. The parent must claim, spawn and bind all three native peers in parallel before work begins. Keep your role alive for messages; use rl_workflow_inbox and native messaging/wait tools, or ask the parent to relay messages. Never spawn replacement peers or busy-poll.",
-    "Every handoff tool returns a notify destination and native child handle. Send that notification with your host's native messaging tool or ask the parent to relay it. RL persists messages; it cannot wake native agents by itself. The parent announces team readiness after binding all three peers.",
+    "This is a persistent collaborative team. After any prephase completes, the parent claims, spawns and binds the configured implementation peers together before implementation begins. Keep your role alive for messages; use rl_workflow_inbox and native messaging/wait tools, or ask the parent to relay messages. Never silently replace peers or busy-poll.",
+    "Every handoff tool returns a notify destination and native child handle. Send that notification with your host's native messaging tool or ask the parent to relay it. RL persists messages; it cannot wake native agents by itself. The parent announces readiness after binding the configured peers.",
     `You are step ${stage.id}. Use the parent agent=${run.owner!.agent}, sessionId=${run.owner!.sessionId}, run=${run.id}, step=${stage.id}, claim=${stage.claim} for your own workflow tools. The parent supplies your native child ID to rl_workflow_bind. Peer handles are returned by the inbox.`,
     `Writer=${config.writer}; reviewer=${config.reviewer}; DRY=${config.dry}. Rules: ${JSON.stringify(config.rules)}. Maximum review rounds: ${config.maxRounds}. Rating policy: ${JSON.stringify(policyRating)}.`,
     "Writer: before each new function, perform any required new_function consultation with rl_workflow_consult and wait for rl_workflow_answer, then implement. Configured optional routes may also be used. Use rl_workflow_submit with a stable file group and all newFunctions as path#function subjects. Freeze submitted files until a rating arrives, work on unrelated files meanwhile, and fix/resubmit rejected checkpoints. Reviewer: read submitted snapshot versions and current surrounding source; perform any required suspected_duplicate consultation for every suspected duplicate and wait for its answer, then use rl_workflow_review with rating, rationale, result and all duplicateSuspicions. DRY: answer both peers through rl_workflow_answer with evidence and limitations.",
@@ -791,7 +863,10 @@ export function assertCollaborationCompletion(
   changedFiles?: string[],
 ): void {
   const config = run.config.workflows[run.workflow].collaboration;
-  if (!config) {
+  if (
+    !config ||
+    ![config.writer, config.reviewer, config.dry].includes(stage.id)
+  ) {
     return;
   }
   peersReady(run);
@@ -894,6 +969,25 @@ export function collaborationAssessment(run: WorkflowRun) {
     }
   }
   return { reports, limitations };
+}
+
+/** Batch object lookup once for the review UI, even with many file groups. */
+export function collaborationFileReviews(run: WorkflowRun) {
+  if (!run.collaboration) return [];
+  const submissions = latestSubmissions(run);
+  const files = [...new Set(submissions.flatMap((s) => s.files))];
+  if (!files.length) return [];
+  const preloaded = batchGitBlobs(run.workspace, run.scope.baseCommit, files);
+  return submissions.flatMap((submission) => {
+    const changed =
+      checkpoint(run, submission.files, preloaded).fingerprint !==
+      submission.fingerprint;
+    return submission.files.map((file) => ({
+      path: file,
+      accepted: submission.review?.accepted ?? false,
+      changedAfterReview: Boolean(submission.review) && changed,
+    }));
+  });
 }
 
 export function validateCollaborationState(

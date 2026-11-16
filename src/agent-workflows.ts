@@ -2,6 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import {
   controlRun,
+  captureScope,
   planRun,
   readRun,
   rescoreRun,
@@ -21,14 +22,31 @@ import { UsageError } from "./errors.js";
 import { parseJsonObject } from "./json.js";
 import { callWorkflowTool, resumeNativeRun } from "./session-workflows.js";
 import { sanitizeTerminalText } from "./tui/ansi.js";
+import {
+  qualitySnapshot,
+  WorkflowLevelSchema,
+  selectWorkflowLevel,
+  leveledConfig,
+  initializeQuality,
+} from "./orchestration/quality.js";
+
+import {
+  EvalSelectionSchema,
+  WORKFLOW_EVAL_SUITE,
+  evaluateWorkflowRuns,
+} from "./orchestration/evaluation.js";
+import { watchWorkflowStatus } from "./orchestration/status.js";
 
 const visible = (value: unknown): string =>
   sanitizeTerminalText(String(value ?? ""));
 
 function renderRunReport(run: WorkflowRun, asJson: boolean): void {
-  const metrics = runMetrics(run);
+  const fingerprint = captureScope(run.workspace, run.scope.base).scope
+    .fingerprint;
+  const metrics = runMetrics(run, fingerprint);
+  const quality = qualitySnapshot(run, fingerprint);
   if (asJson) {
-    json({ ...run, metrics });
+    json({ ...run, metrics, qualityStatus: quality });
     return;
   }
 
@@ -38,6 +56,30 @@ function renderRunReport(run: WorkflowRun, asJson: boolean): void {
   for (const stage of run.stages) {
     console.log(
       `  ${stage.id.padEnd(22)} ${stage.status.padEnd(10)} ${stage.attempts} attempt(s) · ${(stage.durationMs / 1000).toFixed(1)}s${stage.error ? ` · ${visible(stage.error)}` : ""}`,
+    );
+  }
+  if (run.quality) {
+    console.log(`\nLevel: ${run.quality.level} · ${run.quality.reason}`);
+    if (run.quality.research)
+      console.log(
+        `Research: ${run.quality.research.brief.approaches.length} seeds · recommended ${run.quality.research.brief.recommendation} · selected ${run.quality.research.decision?.approach ?? "awaiting coordinator"}`,
+      );
+    if (run.quality.capabilities?.degradedReason)
+      console.log(
+        `Execution: DEGRADED · ${visible(run.quality.capabilities.degradedReason)}`,
+      );
+    for (const role of quality.roles)
+      console.log(
+        `  ${role.id}: ${role.stale ? "STALLED" : role.status} · ${role.progress ?? role.error ?? "no progress reported"} · ${(role.elapsedMs / 1000).toFixed(0)}s`,
+      );
+    for (const criterion of quality.criteria)
+      console.log(
+        `  [${criterion.status.toUpperCase()}] ${criterion.id}: ${criterion.text}${criterion.stale ? " · source changed" : ""}`,
+      );
+    for (const blocker of quality.blockers)
+      console.log(`  Blocker: ${blocker}`);
+    console.log(
+      "Evidence provenance distinguishes reported and captured checks; execution mode and host capabilities are host-reported. Mocked checks do not verify live integrations.",
     );
   }
   if (run.collaboration) {
@@ -94,6 +136,20 @@ const DIRECT_WORKFLOW_ACTIONS = new Set([
   "answer",
   "submit",
   "review",
+  "preflight",
+  "criteria",
+  "validation",
+  "heartbeat",
+  "recover",
+  "research",
+  "decide",
+  "assess",
+  "budget",
+  "orient",
+  "resolve",
+  "escalate",
+  "check",
+  "outcome",
 ]);
 
 const STDIN_REQUIRED_ACTIONS = new Set([
@@ -105,6 +161,20 @@ const STDIN_REQUIRED_ACTIONS = new Set([
   "answer",
   "submit",
   "review",
+  "preflight",
+  "criteria",
+  "validation",
+  "heartbeat",
+  "recover",
+  "research",
+  "decide",
+  "assess",
+  "budget",
+  "orient",
+  "resolve",
+  "escalate",
+  "check",
+  "outcome",
 ]);
 
 export async function main(argv: string[]): Promise<number> {
@@ -126,8 +196,9 @@ export async function main(argv: string[]): Promise<number> {
       "step",
       "request",
       "claim",
+      "level",
     ],
-    ["json", "dry-run", "default"],
+    ["json", "dry-run", "default", "watch"],
   );
 
   const context = commandContext(values);
@@ -135,6 +206,11 @@ export async function main(argv: string[]): Promise<number> {
   arity(rest, 0, 1);
   const [, data] = context.store.current();
   const asJson = Boolean(values.json);
+  if (
+    values.watch &&
+    (namespace !== "workflow" || action !== "status" || asJson)
+  )
+    throw new UsageError("--watch requires rl workflow status without --json");
 
   if (values.file && values.instructions) {
     throw new UsageError("Choose --file or --instructions, not both");
@@ -169,11 +245,11 @@ export async function main(argv: string[]): Promise<number> {
     );
   }
   if (
-    (values.base || values.prompt || values["dry-run"]) &&
+    (values.base || values.prompt || values["dry-run"] || values.level) &&
     !(namespace === "workflow" && action === "run")
   ) {
     throw new UsageError(
-      "--base, --prompt and --dry-run are only supported by workflow run",
+      "--base, --prompt, --level and --dry-run are only supported by workflow run",
     );
   }
   if (values.policy && !(namespace === "workflow" && action === "score")) {
@@ -267,6 +343,19 @@ export async function main(argv: string[]): Promise<number> {
     return 0;
   }
 
+  if (namespace === "workflow" && action === "eval") {
+    arity(rest, 0);
+    const report = values.file
+      ? evaluateWorkflowRuns(
+          EvalSelectionSchema.parse(loadInput()).runs.map(
+            (id) => readRun(context.store, id).run,
+          ),
+        )
+      : { suite: WORKFLOW_EVAL_SUITE };
+    json(report);
+    return 0;
+  }
+
   const parent = {
     ...(values.agent ? { agent: values.agent } : {}),
     ...(values.session ? { sessionId: values.session } : {}),
@@ -352,9 +441,45 @@ export async function main(argv: string[]): Promise<number> {
     const config = readAutomation(data.worktree);
     const workflow = name ?? defaultWorkflow(config);
     const base = String(values.base ?? context.defaultBase);
+    const plan = values.file ? loadInput() : {};
+    const acceptanceCriteria = plan.criteria;
+    if (Object.keys(plan).some((key) => key !== "level" && key !== "criteria"))
+      throw new UsageError("Workflow plan accepts only level and criteria");
+    const requestedLevel =
+      values.level ??
+      plan.level ??
+      (plan.criteria !== undefined
+        ? "auto"
+        : name || values.request || workflow !== "writer-reviewer-dry"
+          ? undefined
+          : "auto");
+    if (requestedLevel !== undefined) WorkflowLevelSchema.parse(requestedLevel);
 
     if (values["dry-run"]) {
-      const plan = planRun(context.store, config, workflow, base);
+      const initial = planRun(context.store, config, workflow, base);
+      const selection =
+        requestedLevel === undefined
+          ? undefined
+          : selectWorkflowLevel(
+              WorkflowLevelSchema.parse(requestedLevel),
+              initial.scope.files,
+              String(values.prompt ?? ""),
+            );
+      const plan = selection
+        ? {
+            ...initial,
+            definition: leveledConfig(config, workflow, selection.level)
+              .workflows[workflow],
+            level: selection.level,
+            reason: selection.reason,
+          }
+        : initial;
+      if (selection)
+        initializeQuality(
+          selection.level,
+          selection.reason,
+          acceptanceCriteria,
+        );
       if (asJson) {
         json(plan);
       } else {
@@ -379,6 +504,8 @@ export async function main(argv: string[]): Promise<number> {
       ...(values.base || !values.request ? { base } : {}),
       ...(values.request ? { requestId: values.request } : {}),
       ...(values.prompt ? { prompt: values.prompt } : {}),
+      ...(requestedLevel !== undefined ? { level: requestedLevel } : {}),
+      ...(plan.criteria !== undefined ? { criteria: plan.criteria } : {}),
     })) as WorkflowRun;
 
     renderRunReport(run, asJson);
@@ -407,13 +534,21 @@ export async function main(argv: string[]): Promise<number> {
   }
 
   if (action === "status") {
+    if (values.watch) {
+      const selected = readRun(context.store, name).run.id;
+      await watchWorkflowStatus(() => readRun(context.store, selected).run);
+      return 0;
+    }
     renderRunReport(readRun(context.store, name).run, asJson);
     return 0;
   }
 
   if (action === "metrics") {
     const { run } = readRun(context.store, name);
-    const metrics = runMetrics(run);
+    const metrics = runMetrics(
+      run,
+      captureScope(run.workspace, run.scope.base).scope.fingerprint,
+    );
     if (asJson) {
       json(metrics);
     } else {

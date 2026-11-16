@@ -172,7 +172,7 @@ def locate(text):
     for y, row in enumerate(screen()):
         if text in row:
             return row.index(text), y
-    raise AssertionError(f'Cannot click missing label {text!r}')
+    raise AssertionError(f'Cannot click missing label {text!r}: {screen()}')
 
 def mouse(button, x, y, release=False):
     key(f'\x1b[<{button};{x+1};{y+1}{"m" if release else "M"}')
@@ -817,6 +817,60 @@ def pr_comments_scenario():
     expect_screen('Use p for the current PR comparison')
     key('q')
 
+def workflow_scenario():
+    expect_screen('+value one')
+    expect_screen('Updated')
+    key('W')
+    expect_screen('WORKFLOW · STANDARD')
+    expect_screen('Implementing validation')
+    file = os.environ['REVIEW_WORKFLOW_RUN']
+    with open(file) as saved:
+        report = json.load(saved)
+    report['stages'][0]['progress'] = 'Checking acceptance evidence'
+    with open(file + '.next', 'w') as saved:
+        json.dump(report, saved)
+    os.replace(file + '.next', file)
+    expect_screen('Checking acceptance evidence', timeout=15)
+    with open(file, 'w') as invalid:
+        invalid.write('{broken')
+    expect_screen('UNVERIFIED', timeout=15)
+    with open(file + '.next', 'w') as saved:
+        json.dump(report, saved)
+    os.replace(file + '.next', file)
+    deadline = time.monotonic() + 15
+    while any('UNVERIFIED' in row for row in screen()):
+        assert time.monotonic() < deadline, 'Workflow evidence did not recover'
+        pump(.1)
+    click('APPROACH · Introduce a boundary adapter')
+    expect_screen('Distinct from other seeds:')
+    key('\r')
+    expect_screen('WORKFLOW · STANDARD')
+    for _ in range(20):
+        if any('STATIC · exit 0' in row for row in screen()):
+            break
+        key('j')
+        pump(.1)
+    click('STATIC · exit 0')
+    expect_screen('WORKFLOW EVIDENCE')
+    expect_screen('check passed')
+    key('\r')
+    expect_screen('WORKFLOW · STANDARD')
+    for _ in range(20):
+        if any('LOW · Missing edge case' in row for row in screen()):
+            break
+        key('j')
+        pump(.1)
+    click('LOW · Missing edge case')
+    expect_screen('AI FINDING · LOW')
+    key('\r')
+    expect_screen('code.ts:1 · AI finding')
+    expect_screen('+value one')
+    with open(os.path.join(root, 'code.ts'), 'w') as changed:
+        changed.write('value two\n')
+    expect_screen('+value two')
+    expect_screen('CHANGED AFTER AI REVIEW', timeout=15)
+    key('q')
+
 def quit_scenario():
     expect('+version-one', timeout=60)
     expect('Updated')
@@ -912,6 +966,8 @@ try:
         remote_pr_scenario()
     elif scenario == "pr-comments":
         pr_comments_scenario()
+    elif scenario == "workflow":
+        workflow_scenario()
     elif scenario == "quit":
         scratch = quit_scenario()
     elif scenario == "handoff":

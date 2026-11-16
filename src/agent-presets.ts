@@ -11,11 +11,23 @@ import {
   DRY_INSTRUCTIONS,
   QA_INSTRUCTIONS,
   REVIEW_POLICY_INSTRUCTIONS,
-} from "./orchestration/role-instructions.js";
+  RESEARCHER_INSTRUCTIONS,
+} from "./orchestration/lean-protocol.js";
 
 export const PRESET: AutomationConfig = {
   defaultWorkflow: "writer-reviewer-dry",
   agents: {
+    researcher: {
+      provider: "inherit",
+      access: "read-only",
+      hosts: {
+        codex: { model: "gpt-6-astra", reasoning: "high" },
+        claude: { model: "opus", instructions: CLAUDE_REVIEWER_INSTRUCTIONS },
+      },
+      description:
+        "Read-only researcher that seeds structurally distinct approaches, compares evidence and recommends one for a coordinator decision.",
+      instructions: RESEARCHER_INSTRUCTIONS,
+    },
     writer: {
       provider: "inherit",
       hosts: {
@@ -66,13 +78,13 @@ export const PRESET: AutomationConfig = {
       instructions: REVIEW_POLICY_INSTRUCTIONS,
       weights: { critical: 50, high: 20, medium: 10, low: 2 },
       minimumScore: 0,
-      blockRequired: false,
+      blockRequired: true,
       rating: {
         min: 0,
         max: 10,
         minimum: 6,
         instructions:
-          "Use the final 0–10 weighted score after N/A normalization and the single strict 0.5 multiplier. Exactly 6.0 meets the rewrite gate; below 6.0 requires rewrite. Preserve the full arithmetic and terminal decision in the rationale. Missing or incomplete review cannot receive a rating.",
+          "Rate the reviewed source from 0 to 10 with evidence and rationale. A rating of 6 meets the numerical threshold; unresolved critical/required findings and incomplete evidence independently block acceptance. Do not apply automatic style/type multipliers.",
       },
     },
   },

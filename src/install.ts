@@ -80,19 +80,46 @@ function integration(text: string, block: string, shell: string): string {
   );
 }
 
+type ShellName = "zsh" | "bash";
+
+function isSupportedShell(value: string): value is ShellName {
+  return value === "zsh" || value === "bash";
+}
+
+function targetsForShell(
+  home: string,
+  env: NodeJS.ProcessEnv,
+  shell: ShellName,
+): string[] {
+  if (shell === "zsh") {
+    return [
+      path.join(env.ZDOTDIR ? path.resolve(home, env.ZDOTDIR) : home, ".zshrc"),
+    ];
+  }
+  const login = [".bash_profile", ".bash_login", ".profile"]
+    .map((name) => path.join(home, name))
+    .find((file) => fs.existsSync(file));
+  return [
+    path.join(home, ".bashrc"),
+    login ?? path.join(home, ".bash_profile"),
+  ];
+}
+
 export function configureShell(host: InstallHost, requestedShell?: string) {
   const env = host.env ?? process.env;
   const home = canonical(host.home ?? os.homedir());
-  const shell =
-    requestedShell ??
-    path.basename(
-      env.SHELL ??
-        ((host.platform ?? process.platform) === "darwin" ? "zsh" : "bash"),
-    );
-  if (shell !== "zsh" && shell !== "bash")
+  const detected = path.basename(
+    env.SHELL ||
+      ((host.platform ?? process.platform) === "darwin" ? "zsh" : "bash"),
+  );
+  const shell = requestedShell ?? detected;
+  if (!isSupportedShell(shell))
     throw new Error(
       `Automatic RL shell setup supports zsh and bash. Run 'rl setup install --shell zsh' or '--shell bash' for the shell you use.`,
     );
+  const shells: ShellName[] = requestedShell
+    ? [shell]
+    : [shell, shell === "bash" ? "zsh" : "bash"];
   const root = host.packageRoot ?? PACKAGE_ROOT;
   const node = host.node ?? process.execPath;
   const nodeDirectory = path.dirname(node);
@@ -114,32 +141,29 @@ export function configureShell(host: InstallHost, requestedShell?: string) {
       ),
     ]),
   ];
-  const block = [
-    BEGIN,
-    `export PATH=${shellQuote(shimDirectory)}:"$PATH":${toolDirectories.map(shellQuote).join(":")}`,
-    `eval "$(node ${shellQuote(executable)} setup shell ${shell})"`,
-    END,
-  ].join("\n");
-  const targets = [
-    path.join(
-      shell === "zsh" && env.ZDOTDIR ? path.resolve(home, env.ZDOTDIR) : home,
-      shell === "zsh" ? ".zshrc" : ".bashrc",
-    ),
-  ];
-  if (shell === "bash") {
-    const login = [".bash_profile", ".bash_login", ".profile"]
-      .map((name) => path.join(home, name))
-      .find((file) => fs.existsSync(file));
-    targets.push(login ?? path.join(home, ".bash_profile"));
+  const profiles = shells.flatMap((targetShell) => {
+    const block = [
+      BEGIN,
+      `export PATH=${shellQuote(shimDirectory)}:"$PATH":${toolDirectories.map(shellQuote).join(":")}`,
+      `eval "$(node ${shellQuote(executable)} setup shell ${targetShell})"`,
+      END,
+    ].join("\n");
+    return targetsForShell(home, env, targetShell).map((file) =>
+      profileChange(home, file, (text) =>
+        integration(text, block, targetShell),
+      ),
+    );
+  });
+  const byFile = new Map<string, Change>();
+  for (const change of [shim, ...profiles]) {
+    const existing = byFile.get(change.file);
+    if (existing && existing.after !== change.after)
+      throw new Error(
+        `Conflicting shell setup target: ${change.file} cannot serve both zsh and bash`,
+      );
+    byFile.set(change.file, change);
   }
-  const profiles = targets.map((file) =>
-    profileChange(home, file, (text) => integration(text, block, shell)),
-  );
-  const changes = [
-    ...new Map(
-      [shim, ...profiles].map((change) => [change.file, change]),
-    ).values(),
-  ];
+  const changes = [...byFile.values()];
   for (const change of changes) {
     const current = fs.existsSync(change.file)
       ? fs.readFileSync(change.file, "utf8")
@@ -153,7 +177,8 @@ export function configureShell(host: InstallHost, requestedShell?: string) {
   }
   return {
     shell,
-    profiles: profiles.map((change) => change.file),
+    shells,
+    profiles: [...new Set(profiles.map((change) => change.file))],
     shim: shim.file,
   };
 }
@@ -183,9 +208,12 @@ export async function installRl(
   console.log(
     "New terminals can use rl directly. To activate directory switching in this terminal now, run:",
   );
-  console.log(
-    `  eval "$(${shellQuote(configured.shim)} setup shell ${configured.shell})"`,
-  );
+  for (const targetShell of configured.shells) {
+    const suffix = configured.shells.length > 1 ? ` # ${targetShell}` : "";
+    console.log(
+      `  eval "$(${shellQuote(configured.shim)} setup shell ${targetShell})"${suffix}`,
+    );
+  }
   return 0;
 }
 

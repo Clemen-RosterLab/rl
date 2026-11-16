@@ -155,25 +155,45 @@ test("missing package managers report setup requirements without pretending inst
   assert.ok(!fs.existsSync(path.join(f.bin, "git")));
 });
 
-test("global npm setup preserves shell settings, writes a user-owned CLI shim, and remains idempotent", (t) => {
+test("global npm setup configures both zsh and bash by default, preserves shell settings, writes a user-owned CLI shim, and remains idempotent", (t) => {
   const f = fixture(t);
   for (const name of ["git", "zsh", "fzf", "gh"]) f.tool(name);
-  const profile = path.join(f.home, ".zshrc");
-  write(profile, '# Existing settings\nexport MY_SETTING="preserve this"\n');
+  const zshProfile = path.join(f.home, ".zshrc");
+  const bashrc = path.join(f.home, ".bashrc");
+  const bashProfile = path.join(f.home, ".bash_profile");
+  write(zshProfile, '# Existing settings\nexport MY_SETTING="preserve this"\n');
+  write(bashrc, '# Existing bash settings\nexport MY_BASH_SETTING="keep"\n');
   f.call("installRl");
-  const content = read(profile);
-  assert.match(content, /MY_SETTING="preserve this"/);
-  assert.equal(content.split("# >>> rl shell integration >>>").length, 2);
+  const zshContent = read(zshProfile);
+  const bashrcContent = read(bashrc);
+  const bashProfileContent = read(bashProfile);
+  assert.match(zshContent, /MY_SETTING="preserve this"/);
+  assert.match(zshContent, /setup shell zsh\)"/);
+  assert.equal(zshContent.split("# >>> rl shell integration >>>").length, 2);
+  assert.match(bashrcContent, /MY_BASH_SETTING="keep"/);
+  assert.match(bashrcContent, /setup shell bash\)"/);
+  assert.equal(bashrcContent.split("# >>> rl shell integration >>>").length, 2);
+  assert.match(bashProfileContent, /setup shell bash\)"/);
   assert.ok(fs.existsSync(path.join(f.home, ".local/share/rl/bin/rl")));
   f.call("installRl");
-  assert.equal(read(profile), content);
+  assert.equal(read(zshProfile), zshContent);
+  assert.equal(read(bashrc), bashrcContent);
+  assert.equal(read(bashProfile), bashProfileContent);
   assert.ok(!fs.existsSync(f.env.RL_INSTALL_TEST_LOG));
+
+  const zshOnly = fixture(t);
+  for (const name of ["git", "zsh", "fzf", "gh"]) zshOnly.tool(name);
+  zshOnly.call("installRl", ["--shell", "zsh"]);
+  assert.ok(fs.existsSync(path.join(zshOnly.home, ".zshrc")));
+  assert.ok(!fs.existsSync(path.join(zshOnly.home, ".bashrc")));
+  assert.ok(!fs.existsSync(path.join(zshOnly.home, ".bash_profile")));
 });
 
-test("explicit rl setup install fails cleanly on missing tools or malformed managed blocks without mutating dotfiles", (t) => {
+test("explicit rl setup install fails cleanly on missing tools, malformed managed blocks, or shared zsh/bash symlink targets without mutating dotfiles", (t) => {
   const f = fixture(t);
   f.call("installRl", [], { platform: "darwin" }, false);
   assert.ok(!fs.existsSync(path.join(f.home, ".zshrc")));
+  assert.ok(!fs.existsSync(path.join(f.home, ".bashrc")));
   for (const name of ["git", "zsh", "fzf", "gh"]) f.tool(name);
   const profile = path.join(f.home, ".zshrc");
   const before = "# >>> rl shell integration >>>\n# Keep these settings\n";
@@ -181,6 +201,14 @@ test("explicit rl setup install fails cleanly on missing tools or malformed mana
   const blocked = f.call("installRl", [], {}, false);
   assert.match(blocked.stderr, /Malformed RL shell integration block/);
   assert.equal(read(profile), before);
+  assert.ok(!fs.existsSync(path.join(f.home, ".bashrc")));
+  assert.ok(!fs.existsSync(path.join(f.home, ".local/share/rl/bin/rl")));
+
+  write(profile, "# Valid zsh settings\n");
+  fs.symlinkSync(profile, path.join(f.home, ".bashrc"));
+  const shared = f.call("installRl", [], {}, false);
+  assert.match(shared.stderr, /Conflicting shell setup target/);
+  assert.equal(read(profile), "# Valid zsh settings\n");
   assert.ok(!fs.existsSync(path.join(f.home, ".local/share/rl/bin/rl")));
 });
 
@@ -272,6 +300,18 @@ test("a fresh zsh startup loads the installed integration and bare rl changes di
       "-i",
       "-c",
       '[[ $(whence -w rl) == "rl: function" ]] || exit 90; rl; [[ "$PWD" == "$EXPECTED_WORKTREE" ]] || exit 91',
+    ],
+    { cwd: w.repo },
+  );
+  w.command(
+    [
+      "/bin/bash",
+      "--noprofile",
+      "--rcfile",
+      path.join(home, ".bashrc"),
+      "-i",
+      "-c",
+      '[[ $(type -t rl) == function ]] || exit 92; rl; [[ "$PWD" == "$EXPECTED_WORKTREE" ]] || exit 93',
     ],
     { cwd: w.repo },
   );

@@ -1,4 +1,5 @@
 import { agentAdapter } from "./agent-registry.js";
+import { reconcileAntigravitySessions } from "./agent-runner.js";
 import { desktopAgent, desktopLaunch } from "./agent-desktop.js";
 import type { Agent } from "./agents.js";
 import { syncCodexSessions } from "./codex-sessions.js";
@@ -17,7 +18,11 @@ export async function resumeSessions(
   if (!kind || kind === "codex") {
     await syncCodexSessions(store);
   }
-  const [, data] = await store.locked(() => store.current());
+  const [, data] = await store.locked(() => {
+    const record = store.current();
+    if (!kind || kind === "agy") reconcileAntigravitySessions(store, ...record);
+    return record;
+  });
   const kinds: Agent[] = kind
     ? [kind]
     : options.desktop
@@ -108,6 +113,8 @@ export async function resumeAgent(
     if (options.expectedKey && instance.key !== options.expectedKey) {
       throw new Error("Instance changed before agent launch");
     }
+    if (kind === "agy")
+      reconcileAntigravitySessions(store, instanceFile, instance);
     const sessions = instance.sessions[kind] ?? [];
     const item =
       options.sessionId !== undefined

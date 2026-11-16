@@ -7,7 +7,7 @@ Switch projects, prepare local dependencies, check PRs, and merge finished work
 without losing your place.
 
 Requires macOS or Linux and Node.js 22+. `rl setup install` sets up Git,
-zsh, fzf, GitHub CLI and integration for your zsh or bash terminal.
+zsh, fzf, GitHub CLI and integration for zsh and bash terminals.
 
 ## Install
 
@@ -21,7 +21,8 @@ rl setup install
 See Development below to build and try unpublished changes.
 
 `rl setup install` installs missing tools through your package manager, preserves
-your shell settings, and registers one RL integration block. Open a new terminal
+your shell settings, and registers RL integration for both zsh and bash (pass
+`--shell zsh` or `--shell bash` to configure only one). Open a new terminal
 afterward; bare `rl` can then select a workspace and change directory.
 For the terminal that ran setup, use the activation command printed by
 `rl setup install`, or:
@@ -771,6 +772,10 @@ Foreground stops with background work still running remain observed working.
 When using the native writer/reviewer/DRY workflow, bind each peer's actual
 Antigravity conversation UUID before implementation. RL uses the saved binding
 to keep peers separate from the parent session and prevent recursive workflows.
+Binding removes the child from resume choices immediately. Resume also repairs
+older saved child entries using recorded workflow bindings; known children stay
+excluded even after their workflow history is pruned. Both the picker and
+`--latest` keep legitimate main conversations available.
 
 Antigravity uses its documented named hook definitions, camelCase input and
 `injectSteps`/decision responses; RL preserves unrelated definitions. Feedback
@@ -798,8 +803,9 @@ and [Claude hooks](https://code.claude.com/docs/en/hooks) contracts.
 An adopted workspace has a built-in `writer-reviewer-dry` workflow immediately,
 without creating configuration files. Your current Codex, Claude or Antigravity session
 creates and controls its native children. RL supplies their editable roles,
-handoff rules, review policy and durable run records. RL never launches a
-provider CLI, model API or check process for a workflow.
+handoff rules, review policy and durable run records. RL never manages a provider CLI or model API session for a workflow.
+Only an explicit `workflow check` request executes a planned validation command
+within the current host permissions.
 
 Use your normal agent session in the workspace. RL's hooks advertise discovery
 automatically; a special launcher or pasted workflow prompt is unnecessary.
@@ -809,14 +815,78 @@ input schema, CLI command, positional/flag mappings and JSON stdin requirements.
 The same schemas are advertised through MCP, so an agent can use either connection.
 Native subagent support still comes from the current session's host.
 
-The default team starts together and stays available for the task:
+Execution depth is selected per run. Unnamed built-in CLI runs default to
+`--level auto`: sensitive behavior/paths or broad changes select **Deep**,
+documentation-only changes select **Light**, and uncertain/normal implementation
+scope selects **Standard**. This is a conservative heuristic, not a semantic risk
+assessment. `--level light|standard|deep` explicitly overrides it. The reason is
+saved with the run. Before claiming roles, the coordinator must record
+`workflow assess`: an effort recommendation, rationale, uncertainties, affected
+systems and failure consequences. For `auto`, that assessment selects the actual
+level and rebuilds the unclaimed plan. Explicit `light|standard|deep` choices stay
+pinned. Changing topology clears host preflight so model/tool capabilities must
+be checked again. Assessments freeze once execution starts. To raise an auto
+run's level later, stop its native children and captured checks first, then use
+`workflow escalate` with `{run,level,rationale,stopped:true}`. This creates a
+higher-level successor, preserves the original run, and carries receipts with
+original provenance and source identities; stale evidence remains stale. The
+successor needs fresh assessment, preflight and role claims. A pinned user level
+requires a separate user-selected run.
 
-- **Writer** implements scoped changes. Before adding a function, it asks DRY
-  about existing implementations and waits for the answer. It submits stable
+Explicit named/custom runs without `--level` retain their
+declared execution plan; legacy records remain readable.
+
+| Level | Execution |
+| --- | --- |
+| Light | Writer, then an independent reviewer; one active role at a time |
+| Standard | Research seeds and coordinator decision, then concurrent writer and reviewer |
+| Deep | Research seeds and coordinator decision, then writer, reviewer and retained DRY peer |
+
+Standard and Deep begin with a read-only `researcher`. It aims for three
+structurally different approaches and records two to five credible seeds before
+comparing or recommending them. Each seed includes its mechanism, distinction
+from the others, affected files, advantages, tradeoffs, risks, assumptions,
+repository/documentation sources and validation strategy. Renaming or rephrasing
+one mechanism does not create another approach. A ruled-out alternative needs a
+concrete exclusion reason; the recommendation must identify a viable seed.
+Obvious normalized duplicates are rejected in code; genuine semantic diversity
+still requires coordinator judgment.
+
+The researcher saves the brief with `rl workflow research RUN_ID --file -`
+using its current step/claim and source fingerprint, then reports completion.
+`rl workflow decide RUN_ID --file -` records the coordinator's chosen approach
+and rationale. The coordinator can choose a viable alternative to the
+recommendation. The writer cannot start until that decision exists and research
+still matches the pre-implementation source. The writer receives the seeds and
+decision. The reviewer first inspects requirements and source independently,
+recording risks, assumptions and checks to challenge with `workflow orient` for
+its exact claim and current source fingerprint. Research recommendations and
+writer results/rationale are omitted from its initial prompt, dependencies and
+inbox until that pass is recorded. The orientation response then reveals the
+research rationale and normal inbox access resumes. Ratings and final reviewer
+reports require the first pass. This applies to Light too. It is a review
+protocol, not a secrecy or filesystem access boundary; the native host must not
+relay rationale early. Research is tied to the baseline; implementation edits
+do not require re-running planning research. Changed source before the first
+writer claim or changed requirements require a new research run. Light keeps
+focused alternatives in its coordinator brief and does not start a researcher.
+
+Research input is `{ "run": "RUN_ID", "step": "research", "claim": "CLAIM_ID",
+"brief": { ... } }`. Decision input is `{ "run": "RUN_ID", "approach": "seed-id",
+"rationale": "Why this approach fits the constraints" }`. Discover exact schemas
+through `rl workflow context --json`. The `W` workflow panel in `rl review`
+lets you inspect each seed, its tradeoffs, sources, recommendation and selected
+direction. Evidence is host-reported; RL does not execute research, fetch URLs,
+create prototypes or launch another provider automatically.
+
+The configured peers stay available for the task:
+
+- **Writer** implements scoped changes. It requests focused reuse evidence when
+  uncertain and discloses unavailable research. It submits stable
   file groups to the reviewer, then fixes and resubmits rejected work.
 - **Reviewer** stays read-only, reviews writer checkpoints and returns a rating
   with evidence and actionable feedback. On suspected duplication it asks the
-  same DRY agent before returning its review.
+  configured DRY agent for focused evidence when available.
 - **DRY** stays read-only and serves both peers, returning paths, symbols,
   behavioral differences and reuse options, or explicitly reporting that no
   suitable implementation was found.
@@ -825,9 +895,156 @@ Submitted files stay frozen while awaiting review; the writer can work on
 unrelated files meanwhile. Ratings apply to saved file contents and staged
 versions. RL rejects changed or superseded checkpoints and requires current
 accepted reviews for the writer's changes before completion. The defaults are
-**90/100** and at most **five review rounds** per file group. Required fixes
+**6/10** and at most **four review rounds** per concurrent file group. Unresolved critical defects, required fixes
 and incomplete coverage block acceptance regardless of rating. Pending check
 requests or routing leads must be resolved before a checkpoint can be accepted.
+These blocker gates apply even when a legacy policy has `blockRequired:false`
+or a zero minimum severity score. A rejected finding requires a structured
+`disposition` with `status:"rejected"`, reason and evidence. One reviewer's
+rejection cannot conceal another reviewer's open finding. The active role/policy
+instructions share one concise protocol; blanket style/type score multipliers
+are no longer part of the built-in rubric. Existing explicit workspace role
+instructions are not rewritten.
+
+Leveled runs require a host capability preflight before claims. The parent reports
+actual native delegation, messaging, read-only controls and available models.
+Unavailable delegation blocks execution; missing peer messaging requires an
+explicit new Light run. Unsupported model/control preferences require a recorded
+degraded-execution acknowledgement, not silent substitution. A model fallback
+also needs an explicit `modelOverrides` map from step ID to a model in the
+declared available `models` list. Claims return that selected model while status
+retains the requested preference. Capability claims
+are labelled **host-reported**; RL cannot certify the host's tool isolation.
+
+Acceptance criteria and their validation plan are recorded before work starts
+and freeze after the first claim. Each required criterion needs named checks
+with expected observable outcomes. Check IDs are unique across the run. Every
+planned check must pass independently: a later unit-test pass cannot hide a
+failed integration check. Criteria and individual checks display **passed**,
+**failed** or **unverified**. Missing required evidence pauses completion.
+
+`workflow check` executes an explicitly supplied, exactly planned argv in an
+absolute cwd inside the exact worktree, without adding a shell. It captures
+stdout/stderr, exit status, elapsed time and source identities as
+**command-captured** evidence. There is one in-flight check per run; it runs
+outside the metadata lock so progress and other workflow operations stay
+responsive. The default timeout is two minutes (maximum ten), further bounded
+by remaining validation/run budgets. Combined output is limited to 128000 bytes.
+Timeout, excessive output and launch errors fail the check. Input changes during
+execution invalidate the result. The command inherits the host permissions; RL
+does not introduce a sandbox or elevate privileges. Only run commands authorized
+for the task. Execution mode remains **host-reported**: captured does not mean
+live, and a mocked check cannot satisfy a live-only criterion.
+
+`workflow validation` still accepts **parent-reported** external/manual evidence
+with check ID, criterion ID, argv, cwd, source fingerprint, mode, output, exit
+code, duration and artifacts. It cannot claim captured provenance or satisfy a
+captured-only check. Capture is evidence of execution, not proof that a grader
+is complete or correct.
+
+The default check scope is `{kind:"repository"}`. When dependencies are known,
+set `{kind:"files",files:[...],dependencies:[...],rationale:"..."}` in the plan.
+Captured evidence then hashes the listed working files, file modes, index
+versions and base identity. Unrelated edits preserve that check; changes to its
+files, tests, callers or configuration invalidate it. List every known relevant
+input. Unknown/dynamic dependencies must retain the repository fallback. Coverage
+is coordinator-declared, not inferred from text imports. Reported evidence keeps
+repository-wide invalidation because RL did not observe its execution inputs.
+Final code-review/completion gates remain conservative about overall source.
+
+For example, prepare a plan file with:
+
+```json
+{
+  "level": "standard",
+  "criteria": [
+    { "id": "behavior", "text": "The requested behavior works", "required": true, "validation": "any",
+      "checks": [{ "id": "unit", "expected": "Contract and error-path tests pass", "command": ["npm", "test"], "mode": "static", "source": "captured" }] },
+    { "id": "integration", "text": "The real integration persists the change", "required": true, "validation": "live",
+      "checks": [{ "id": "persist", "expected": "The change survives reload against the real service", "mode": "live", "source": "reported" }] }
+  ]
+}
+```
+
+```sh
+rl workflow run --base HEAD --file plan.json --json
+rl workflow context --json # protocol.tools contains the exact JSON input schemas
+rl workflow assess RUN_ID --file assessment.json --agent codex --session SESSION_ID
+rl workflow preflight RUN_ID --file capabilities.json --agent codex --session SESSION_ID
+rl workflow check RUN_ID --file check.json --agent codex --session SESSION_ID
+rl workflow validation RUN_ID --file receipt.json --agent codex --session SESSION_ID
+rl workflow heartbeat RUN_ID --file progress.json --agent codex --session SESSION_ID
+rl workflow status RUN_ID --json
+rl workflow status RUN_ID --watch # live per-agent state in this terminal
+```
+
+`assess` input is `{ "assessment": { "level": "standard", "rationale": "...",
+"uncertainty": [], "systems": ["..."], "consequences": ["..."] } }`.
+`check` input is `{ "check": "unit", "command": ["npm", "test"],
+"cwd": "/absolute/path/to/the/worktree", "mode": "static" }`.
+`preflight` input is `{ "capabilities": { "delegation": true, "messaging": true,
+"readOnly": true, "models": ["gpt-6-astra"] } }` plus parent identity and run ID
+when those are not passed as flags. Validation input wraps the receipt in
+`"receipt"`; its fingerprint is the SHA-256 scope identity, not a timestamp or
+HEAD alone. Read it from a claim, heartbeat, or `qualityStatus.fingerprint` in
+status output immediately before running the check. Progress input contains
+`step`, the current `claim`, and `message`.
+
+Press **W** in local `rl review` to inspect the latest run for this exact worktree
+and branch. Roles show progress, elapsed time and stalled claims; criteria and
+receipts expose blockers, planned checks and actual reported/captured output.
+`rl workflow status --watch` refreshes every second and shows each role as ready,
+waiting, starting, researching, working, first pass, reviewing, awaiting review,
+stalled or finished. It includes progress, elapsed/idle time, native child ID and
+waiting conditions, plus any active validation command. j/k or arrows scroll; q,
+Escape or Ctrl-C exits. The view follows the selected run in this exact worktree;
+it does not silently switch runs. Claims/heartbeats are recorded workflow state,
+not independent proof that a native process is alive. Select a finding to
+open its file/line or prepare a GitHub comment draft. Changed reviewed files are
+labelled **CHANGED AFTER AI REVIEW**. Stale findings cannot become comment drafts
+without fresh evidence, and no workflow publishes comments or human approvals
+automatically. Remote-only object caches have no local workflow state; there is
+no cross-worktree inference by branch name.
+
+Claims become visibly stalled after five minutes without progress (or their
+configured deadline, if shorter). Report `workflow heartbeat` during meaningful
+progress. `workflow recover` requires the exact expired claim, `stopped:true` and
+a reason **after the parent stops its native child**; it invalidates the old
+claim/binding and records the recovery. RL never kills or replaces host-owned
+agents. Metrics include wall time, reported check duration, checkpoint review
+wait, rejected checkpoints/findings, evidence coverage and observed-defect
+reports. Usage/cost remains unknown when the host does not report it.
+
+New runs have explicit budgets: five minutes of research, one hour total,
+ten minutes of cumulative validation, 32 submissions, 64 consultations and three
+review rounds (the workflow's stricter round limit still applies). Override them
+before roles start with `workflow budget`; fields are `researchMs`, `runMs`,
+`checkMs`, `submissions`, `consultations` and `reviewRounds`. Budgets freeze at
+execution. Exhaustion prevents new work and appears as a blocker; the parent
+must stop native children and report unresolved work. RL does not kill native
+agents. Repeating identical rejected content needs a coordinator `workflow
+resolve` record with submission ID, decision (`fix|reject|blocked`), rationale
+and evidence. A resolution directs the next step, never accepts a checkpoint or
+bypasses fresh review and required findings.
+
+`rl workflow eval --json` lists a versioned suite with reproducible fixtures,
+tasks and exact acceptance/regression grader argv for a small fix, an ambiguous
+feature, a concurrency defect and misleading happy-path tests. It does not run
+models, write fixtures or execute graders. Use a separate user-authorized Git
+workspace per case/level/trial. Freeze the suite's graders in the plan, run the
+native workflow, capture both graders with `workflow check`, then record
+`workflow outcome` with `suiteVersion:1`, `case`, `trial`, `kind:native|synthetic`,
+`acceptance`/`regression` receipt UUIDs, `observedDefects` and `notes`. Even failed
+graders can be recorded: workflow completion/rating is distinct from observed
+outcome. Outcomes are immutable and source-bound when recorded.
+
+`rl workflow eval --file trials.json --json` accepts `{ "runs": ["RUN_UUID", ...] }`
+and compares actual trials by case, level and native/synthetic kind: pass/fail,
+regressions, elapsed/check time and review churn. Duplicate trials are rejected;
+missing outcomes remain unverified. Synthetic harness tests never count as
+native-agent quality results. Historical outcomes do not certify changed source.
+Trial kind, observed defect counts and environment comparability are
+host-reported; token/cost numbers are not invented.
 
 ```sh
 rl workflow context --json           # discover active definitions and their source
@@ -878,8 +1095,8 @@ The default workflow's `collaboration` section is editable:
 }
 ```
 
-These names refer to step IDs. All three collaboration steps must be ready at
-startup with concurrency at least three; reviewer and DRY must be read-only.
+These names refer to step IDs. Configured collaboration steps must be ready at
+startup with sufficient concurrency (two without DRY, three with it); reviewer and DRY must be read-only.
 Change routes, requirements, review rounds, triggers and profiles as needed.
 Required gates support writer `new_function` and reviewer `suspected_duplicate`;
 additional event routes can be added with `required: false` for optional messaging.
@@ -939,6 +1156,14 @@ The MCP server (`rl agent mcp`) exposes:
 | `rl_workflow_answer` | Answer a consultation addressed to that role |
 | `rl_workflow_submit` | Submit a writer checkpoint and declare new functions as path#function subjects |
 | `rl_workflow_review` | Return a rating, rationale, evidence and declared duplicate suspicions |
+| `rl_workflow_assess` | Record semantic effort reasoning before claims |
+| `rl_workflow_budget` | Set bounded exploration, time and review budgets |
+| `rl_workflow_orient` | Record independent reviewer risks before revealing rationale |
+| `rl_workflow_check` | Execute an explicitly requested planned check and capture its evidence |
+| `rl_workflow_validation` | Record accurately reported external/manual check evidence |
+| `rl_workflow_escalate` | Create a higher-effort successor after host-confirmed stop |
+| `rl_workflow_resolve` | Record evidence-backed coordinator direction for a disagreement |
+| `rl_workflow_outcome` | Record a case/trial from captured outcome graders |
 
 The parent claims, spawns and binds all three peers, then announces readiness.
 Handoff tools return a `notify` destination with the peer's native handle. The

@@ -33,7 +33,11 @@ test("an existing session discovers and completes the default team using only th
   assert.equal(context.protocol.requiresMcp, false);
   assert.equal(context.protocol.requiresRlLauncher, false);
   assert.equal(context.protocol.requiresNativeSubagents, true);
-  assert.equal(context.protocol.tools.length, 13);
+  assert.equal(context.protocol.tools.length, 27);
+  const start = context.protocol.tools.find(
+    (tool: DiscoveredTool) => tool.name === "rl_workflow_start",
+  );
+  assert.deepEqual(start.cli.jsonPlan.fields, ["level", "criteria"]);
   assert.ok(!fs.existsSync(path.join(w.a, ".rl")));
   const parent = { agent: "claude", sessionId: randomUUID() };
   const call = (action: string, input: Record<string, unknown> = {}) => {

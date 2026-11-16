@@ -217,7 +217,19 @@ test("the generated MCP command initializes from an unrelated directory with no 
     .split("\n")
     .map((line) => JSON.parse(line));
   assert.equal(replies[0].result.serverInfo.name, "rl");
-  assert.equal(replies[1].result.tools.length, 20);
+  assert.equal(replies[1].result.tools.length, 34);
+  for (const action of [
+    "preflight",
+    "criteria",
+    "validation",
+    "heartbeat",
+    "recover",
+  ])
+    assert.ok(
+      replies[1].result.tools.some(
+        (tool: { name: string }) => tool.name === `rl_workflow_${action}`,
+      ),
+    );
   const context = JSON.parse(replies[2].result.content[0].text);
   assert.equal(context.defaultWorkflow, "writer-reviewer-dry");
   assert.ok(!fs.existsSync(w.log));
