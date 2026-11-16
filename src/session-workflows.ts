@@ -18,6 +18,7 @@ import {
   defaultWorkflow,
   hasAutomation,
   readAutomation,
+  resolveAgentProfile,
   type AutomationConfig,
   type WorkflowTrigger,
 } from "./automation-config.js";
@@ -615,12 +616,29 @@ export async function callWorkflowTool(
 
   if (name === "rl_workflow_context") {
     const [, data] = store.current();
+    const config = readAutomation(data.worktree);
+    if (input.agent !== undefined) {
+      if (
+        input.agent !== "codex" &&
+        input.agent !== "claude" &&
+        input.agent !== "agy"
+      ) {
+        throw new Error("Unsupported agent");
+      }
+      const host = input.agent;
+      config.agents = Object.fromEntries(
+        Object.entries(config.agents).map(([roleName, profile]) => [
+          roleName,
+          resolveAgentProfile(profile, host),
+        ]),
+      );
+    }
     return {
       execution: "native",
       active: true,
       configured: hasAutomation(data.worktree),
       source: hasAutomation(data.worktree) ? "workspace" : "built-in",
-      ...readAutomation(data.worktree),
+      ...config,
       instructions: automationContext(data.worktree),
       protocol: workflowProtocol(),
     };
@@ -823,7 +841,9 @@ export async function callWorkflowTool(
       stage.status = "running";
       persist(run, directory);
 
-      const profile = stage.agent ? run.config.agents[stage.agent] : undefined;
+      const profile = stage.agent
+        ? resolveAgentProfile(run.config.agents[stage.agent], parent.agent)
+        : undefined;
       const dependencies = run.stages
         .filter((step) => stage.after.includes(step.id))
         .map((step) => ({

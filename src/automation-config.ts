@@ -23,6 +23,27 @@ export interface AgentProfile {
   model?: string;
   reasoning?: string;
   access?: "read-only" | "workspace-write";
+  hosts?: Partial<
+    Record<Agent, { model?: string; reasoning?: string; instructions?: string }>
+  >;
+}
+
+/** Resolve only the current host's preferences; never mutate the saved config. */
+export function resolveAgentProfile(
+  profile: AgentProfile,
+  host: Agent,
+): AgentProfile {
+  const { hosts, ...base } = profile;
+  const settings = hosts?.[host];
+  if (!settings) return base;
+  const { instructions, ...preferences } = settings;
+  return {
+    ...base,
+    ...preferences,
+    instructions: instructions
+      ? `${base.instructions}\n\n${instructions}`
+      : base.instructions,
+  };
 }
 
 export interface ReviewPolicy {
@@ -116,21 +137,34 @@ function configPath(root: string, relative: string): string {
   return file;
 }
 
+// Standalone legacy reviews retain model preferences, not team-only host protocols.
+function standaloneReviewProfile(profile: AgentProfile): AgentProfile {
+  return {
+    ...profile,
+    hosts: Object.fromEntries(
+      Object.entries(profile.hosts ?? {}).map(([host, settings]) => [
+        host,
+        { model: settings.model, reasoning: settings.reasoning },
+      ]),
+    ),
+  };
+}
+
 const LEGACY_REVIEW_PROFILES = {
   behavior: {
-    ...PRESET.agents.reviewer,
+    ...standaloneReviewProfile(PRESET.agents.reviewer),
     description: "Review runtime correctness and security",
     instructions:
       "Independently review the supplied scope for runtime correctness, authorization, persistence and concurrency defects. Stay read-only; report concrete evidence and coverage limitations using the supplied result schema.",
   },
   reuse: {
-    ...PRESET.agents.dry,
+    ...standaloneReviewProfile(PRESET.agents.dry),
     description: "Review reuse and complexity",
     instructions:
       "Independently search existing source and dependencies for concrete reuse opportunities in the supplied scope. Stay read-only; distinguish behavioral overlap from superficial similarity and report paths, symbols, findings and coverage limitations using the supplied result schema.",
   },
   quality: {
-    ...PRESET.agents.reviewer,
+    ...standaloneReviewProfile(PRESET.agents.reviewer),
     description: "Review implementation quality and validation",
     instructions:
       "Independently review the supplied scope for type contracts, maintainability, failure handling and meaningful validation. Stay read-only; report evidence-backed findings and coverage limitations using the supplied result schema.",

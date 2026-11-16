@@ -15,16 +15,38 @@ const REASONING_BY_PROVIDER: Record<string, readonly string[]> = {
   inherit: ["low", "medium", "high", "xhigh", "max"],
 };
 
+const ModelSchema = nonNullTextSchema(64000, "model").refine(
+  (val) => !val.startsWith("-"),
+  "Invalid model",
+);
+const hostSettings = (host: "codex" | "claude" | "agy") =>
+  z.strictObject({
+    model: ModelSchema.optional(),
+    reasoning: z
+      .string()
+      .refine(
+        (value) => REASONING_BY_PROVIDER[host].includes(value),
+        "Unsupported reasoning setting for this host",
+      )
+      .optional(),
+    instructions: nonNullTextSchema(64000, "host instructions").optional(),
+  });
+
 export const AgentProfileSchema = z
   .strictObject({
     provider: z.enum(["inherit", "codex", "claude", "agy"]).optional(),
     description: nonNullTextSchema(64000, "description"),
     instructions: nonNullTextSchema(64000, "instructions"),
-    model: nonNullTextSchema(64000, "model")
-      .refine((val) => !val.startsWith("-"), "Invalid model")
-      .optional(),
+    model: ModelSchema.optional(),
     reasoning: z.string().optional(),
     access: z.enum(["read-only", "workspace-write"]).optional(),
+    hosts: z
+      .strictObject({
+        codex: hostSettings("codex").optional(),
+        claude: hostSettings("claude").optional(),
+        agy: hostSettings("agy").optional(),
+      })
+      .optional(),
   })
   .superRefine((profile, ctx) => {
     if (profile.reasoning !== undefined) {

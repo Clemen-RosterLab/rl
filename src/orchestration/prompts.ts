@@ -1,3 +1,5 @@
+import { COORDINATOR_INSTRUCTIONS } from "./coordinator-instructions.js";
+
 export const SHARED_DOCUMENTS_GUIDANCE = [
   "The following RL-owned documents are shared living feature documentation, not just conversation memory.",
   "Read them before starting work, and read the full files when excerpts are truncated.",
@@ -76,6 +78,9 @@ export function buildCoordinatorInstructions(options: {
       "Unsupported native model/reasoning preferences must be reported, not silently substituted.",
       "Policies own scoring; return evidence without assigning yourself a score.",
     ].join(" "),
+    ...(options.defaultWorkflow === "writer-reviewer-dry"
+      ? [COORDINATOR_INSTRUCTIONS]
+      : []),
     `Agents: ${options.agentSummaries}`,
     `Workflow triggers: ${options.triggersJson}`,
   ].join("\n\n");

@@ -156,7 +156,10 @@ ready; `rl pr update` separately updates PR branches through GitHub.
 rl review                                # live three-panel review of the current worktree
 rl review --all                          # choose from the worktree review queue
 rl review --since HEAD~3                 # cumulative revision → HEAD comparison
-rl review --pr 9935                      # discover and inspect a GitHub PR
+rl review --pr 9935                      # remote PR review; infer repository from origin
+rl review --pr https://github.com/owner/repo/pull/9935 # works outside a checkout
+rl review --pr 9935 --github-repo owner/repo # explicitly choose a remote repository
+rl review --pr 9935 --local              # current worktree plus GitHub PR comparison
 rl review feature/login                  # inspect one worktree without switching directories
 rl review feature/login --base origin/test # choose a baseline for an older worktree
 rl review feature/login --diff           # complete feature diff, including committed changes
@@ -211,6 +214,34 @@ diff; `n`/`N` jump between matches. `o` opens the captured Git version and sourc
 line with `code --goto`, including historical or PR-only files. These cached
 copies are read-only; `O` opens the current worktree file instead. `?` shows help
 and `q` quits.
+
+When reviewing a GitHub PR, press `p` for the current PR comparison, then
+click a source line in the preview (or scroll it to the top) and press `i` to
+draft an inline comment. Additions and context target the right side; deletions
+target the left side. Full-file previews can also target lines that appear in
+GitHub's PR diff. The composer supports `Ctrl-j` for a newline, Enter to save
+locally, and Escape to cancel. `D` lists saved comments and lets you edit or
+delete them, edit the review summary, or discard the draft. Drafts persist
+across restarts and are isolated by repository and PR.
+
+Press `R` to submit a review as **Comment**, **Approve**, or **Request changes**.
+Request changes requires a summary. Review the chosen action, revision and
+comment count, then choose **Send review to GitHub**; the confirmation initially
+selects Cancel. Drafts stay local until this explicit submission, which uses
+your `gh` authentication and requires permission to review the PR. Git working
+files and branches are never modified. This works with remote-only `--pr`
+reviews and `--pr --local`.
+
+Inline comments are checked against GitHub's current PR head, target revision,
+and supported patch lines before composing and again before submitting.
+Historical commits, since-review comparisons, stale frozen views, binary files,
+and omitted GitHub patches cannot be used to post comments to unrelated lines.
+After a rebase or PR update, inspect the old draft with `D` and explicitly
+discard it before drafting against the new revision. If submission is
+interrupted, drafts remain protected: `R` checks whether GitHub accepted the
+review before allowing another submission. Only unlock an unresolved draft
+after checking the PR on GitHub. Existing GitHub pending reviews and threads
+are not imported; these pending drafts are stored locally.
 
 Drag across preview text to select it, then press `y` or Ctrl-C to copy it to
 the clipboard using the terminal's [OSC 52 protocol](https://ghostty.org/docs/vt/osc/52).
@@ -280,7 +311,10 @@ refresh stale rankings or restore Git order when the ranking is current.
 Local directory events are debounced for 180 ms, with a 2.5-second Git/status
 polling fallback. Worktree-specific HEAD/index and shared refs are watched
 separately. Source watching uses Git-listed directories and skips dependencies
-and build caches. Git runs in a background process that Quit can stop. Immutable commit metadata and
+and build caches. Snapshot capture and saves run in a background worker that
+Quit can stop. File previews read immutable Git objects independently, so
+switching files does not wait for a repository refresh or checkpoint save.
+A new selection cancels the previous preview read. Immutable commit metadata and
 recent patches are cached, file patches load lazily and only changed terminal
 rows are drawn. Diff display is capped at 8 MiB per file with an explicit
 truncation notice. A live update keeps the selected commit/file and scroll where
@@ -312,10 +346,29 @@ or grant an approval.
 Missing checkpoints are errors; rewritten history compares the saved trees with
 an explicit notice. No branch checkout, staging, commit or file edit occurs.
 
-`gh` discovers PR metadata in the background. Authentication/network failures
-leave local review usable. PR metadata polls independently every 60 seconds;
+`rl review --pr <number|URL>` reviews the remote PR in an isolated bare Git cache,
+without creating a checkout, starting an agent, or changing any existing working
+tree, index or branch. A number uses the configured/current repository's origin;
+pass `--github-repo OWNER/REPO` (or `HOST/OWNER/REPO` for GitHub Enterprise), or a
+full PR URL to review from anywhere. Authentication uses `gh auth login` or the
+GitHub CLI's token environment variables. Credentials stay in gh; RL configures
+a credential helper only inside its private cache.
+
+The cache lives under `RL_STATE_DIR/remote-review/<repository identity>/objects.git`.
+Git fetches commits/trees with `blob:none` filtering and loads file contents as
+needed. The same commit, file, search, context, filter, freeze and review-progress
+controls work there. `HEAD` and `BASE` in ranges refer to this PR's captured head
+and target, even when multiple PRs share the cache. `w` and `O` explain that no
+working tree exists; `o` opens the captured version in VS Code. `m`/`s` checkpoints
+and per-file review progress are scoped to the repository and PR, retain exact
+Git identities, and survive rebases/force pushes with a rewritten-history notice.
+Remote review requires network access; authentication failures are reported
+without substituting a local diff.
+
+`gh` also discovers PR metadata during normal local review. Authentication/network
+failures leave local review usable. PR metadata polls independently every 60 seconds;
 `--remote-interval <seconds>` changes this (minimum 10), and Ctrl-R refreshes
-both sources. Explicit `--pr` downloads missing commit objects into private
+both sources. `--pr <number> --local` keeps the worktree view and downloads missing commit objects into private
 `refs/rl/live-pr` refs, without changing HEAD, FETCH_HEAD or remote-tracking
 branches. Automatic discovery downloads nothing. Branch comparison uses the PR
 target when known, otherwise the configured RL default base; an unavailable
@@ -325,8 +378,9 @@ base produces an error so a revision range can be chosen explicitly.
 summary, Alt-D its feature diff, Alt-F feedback, Alt-A approval, Alt-O VS Code,
 and Ctrl-R refreshes the queue. `--interactive` preserves legacy pickers for
 scripted input. Noninteractive `rl review` prints the queue; `--json` supplies
-structured records. `--since <revision> --json` and `--pr <number> --json` inspect
-the current worktree without a terminal. Existing workspace, session, workflow
+structured records. `--since <revision> --json` inspects the current worktree;
+`--pr <number|URL> --json` supplies remote PR data and its cache location without
+a terminal. Existing workspace, session, workflow
 and GitHub PR commands remain independent.
 
 New feature branches created with `rl switch -c` store their starting commit and
@@ -623,6 +677,8 @@ the saved handoffs, and `rl list` adds a TASK column showing `paused` or `active
 ```sh
 rl agent start codex -- --model <model>
 rl agent start claude
+rl agent start codex --desktop # open this worktree in the Codex desktop app
+rl agent start claude --desktop # open this worktree in Claude Desktop's Code tab
 rl agent start agy
 rl agent run codex --prompt "Review the change" -- --json
 rl agent run claude --prompt "Review the change"
@@ -632,6 +688,8 @@ rl resume --latest       # resume the most recently used session directly (-l / 
 rl resume codex          # choose only among Codex sessions
 rl resume codex --latest # resume the most recently used Codex session directly
 rl resume claude         # choose only among Claude sessions
+rl resume claude --desktop # open the selected saved CLI session in Claude Desktop
+rl resume codex --desktop  # open its workspace; select the displayed session ID in the app
 rl agent save codex     # from inside Codex, if needed
 rl doctor
 rl doctor --repair
@@ -649,6 +707,30 @@ argument filters the choices. Escape cancels without launching an agent.
 Use `--latest` (or `-l` / `--l`) to skip the picker and resume the most recently
 used matching session directly.
 `rl continue` still resumes the exact session saved in its task handoff.
+
+`--desktop` is opt-in on `rl agent start` and `rl resume`; the default remains
+the terminal. `rl agent start codex --desktop --workspace feature/login` opens
+that existing, adopted worktree using its resolved absolute path. No worktree is
+created and the shell stays in its current directory. Claude is launched from
+the same exact worktree. Launchers inherit the existing workflow environment;
+RL does not edit either desktop app's global configuration or authentication.
+Desktop launch does not accept forwarded terminal options or headless prompts.
+
+RL delegates to `codex app <worktree>` and `claude --desktop`. For Claude,
+`rl resume claude --desktop` passes the exact saved session UUID; `--latest`
+still skips the session picker. For Codex, the supported launcher opens a
+workspace rather than a specific saved conversation: RL prints the chosen UUID
+for selection in the app and leaves its last-used time unchanged until an
+actual session event is observed. Bare `rl resume --desktop` offers only Codex
+and Claude sessions belonging to the current worktree. Normal terminal resume,
+including Antigravity, continues to work.
+
+Desktop installation, platform support and authentication follow the native
+launchers. In particular, Claude's
+[`--desktop` handoff](https://code.claude.com/docs/en/desktop#use-claude-code-from-the-cli)
+requires a supported platform and Claude subscription sign-in; it is not
+available with API-key-only authentication. RL preserves native launch failures
+and does not silently fall back to a terminal or a different worktree.
 
 Run Codex normally in an adopted RL workspace, including in the Codex app.
 `rl status`, `rl list`, `rl agent sessions`, and `rl resume` / `rl resume codex`

@@ -36,6 +36,7 @@ import { liveReview } from "./review-live.js";
 import { ReviewStore, reviewStatus } from "./review-store.js";
 import { browseDiff, choose, page, visible } from "./review-terminal.js";
 import { SavedAnalysisDiskSchema } from "./schemas/review.js";
+import { remoteReviewRequested } from "./review-remote.js";
 
 interface Row {
   scope?: string;
@@ -771,6 +772,10 @@ function filterRows(entries: Entry[], filter: string): Entry[] {
 }
 
 export async function main(argv: string[]): Promise<number> {
+  if (remoteReviewRequested(argv)) {
+    const remote = await import("./review-remote.js");
+    return remote.main(argv);
+  }
   const { values, positionals } = args(
     argv,
     [
@@ -803,9 +808,12 @@ export async function main(argv: string[]): Promise<number> {
       "interactive",
       "all",
       "live",
+      "local",
     ],
   );
   arity(positionals, 0, 1);
+  if (values.local && !values.pr)
+    throw new UsageError("Expected --local with --pr <number>");
 
   const context = commandContext(values);
   const filter = String(values.filter ?? "all");

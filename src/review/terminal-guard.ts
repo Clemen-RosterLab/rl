@@ -11,6 +11,7 @@ const EMERGENCY_RESTORE_SEQUENCE =
 export function installTerminalCrashGuard(options: {
   restoreTerminalSettings: () => void;
   getWorkerPid: () => number | undefined;
+  getPreviewPid?: () => number | undefined;
 }): () => void {
   let disarmed = false;
 
@@ -20,8 +21,8 @@ export function installTerminalCrashGuard(options: {
     }
     disarmed = true;
 
-    const pid = options.getWorkerPid();
-    if (pid) {
+    for (const pid of [options.getWorkerPid(), options.getPreviewPid?.()]) {
+      if (!pid) continue;
       try {
         process.kill(-pid, "SIGKILL");
       } catch {

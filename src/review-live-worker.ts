@@ -7,6 +7,8 @@ import {
   type LiveState,
   type ReviewFile,
   type Checkpoint,
+  saveCheckpoint,
+  loadCheckpoint,
 } from "./review-live-engine.js";
 import { message } from "./common.js";
 import { reviewGit } from "./review-git.js";
@@ -23,8 +25,12 @@ import { searchReviewFiles } from "./review-search.js";
 import { rankReviewFiles } from "./review-ranking.js";
 import type { ViewedFile } from "./review-progress.js";
 import { changedFiles } from "./review-git.js";
-const [root, workspaceRepo = root, temporaryRoot, freezeId] =
+const [root, workspaceRepo = root, temporaryRoot, freezeId, remotePr] =
   process.argv.slice(2);
+if (remotePr) {
+  process.env.GIT_TERMINAL_PROMPT = "0";
+  process.env.GH_PROMPT_DISABLED = "1";
+}
 let repository: LiveRepository | undefined;
 let active = 0,
   disconnected = false;
@@ -71,6 +77,7 @@ interface Request {
   branch?: string;
   pr?: number;
   viewed?: ViewedFile;
+  remote?: { head: string; base: string };
 }
 process.on("message", async (request: Request) => {
   active++;
@@ -78,10 +85,14 @@ process.on("message", async (request: Request) => {
     repository ??= new LiveRepository(root, workspaceRepo, {
       temporaryRoot,
       freezeId,
+      remote: remotePr ? Number(remotePr) : undefined,
     });
     if (request.op !== "refresh") repository.assertIdentity();
     let result: unknown;
-    if (request.op === "refresh") result = repository.refresh(request.force);
+    if (request.op === "refresh")
+      result = request.remote
+        ? repository.remoteState(request.remote.head, request.remote.base)
+        : repository.refresh(request.force);
     else if (request.op === "history")
       result = repository.history(request.head!, request.base);
     else if (request.op === "identity") result = true;
@@ -178,24 +189,29 @@ process.on("message", async (request: Request) => {
         commands.join("\n") + "\n",
       );
     } else if (request.op === "checkpoint")
-      result = loadUnifiedCheckpoint(
-        root,
-        workspaceRepo,
-        request.directory!,
-        request.key!,
-        request.branch!,
-        request.pr,
-      );
+      result = remotePr
+        ? loadCheckpoint(request.directory!, request.key!)
+        : loadUnifiedCheckpoint(
+            root,
+            workspaceRepo,
+            request.directory!,
+            request.key!,
+            request.branch!,
+            request.pr,
+          );
     else if (request.op === "mark") {
-      await saveUnifiedCheckpoint(
-        root,
-        workspaceRepo,
-        request.directory!,
-        request.key!,
-        request.point!,
-        request.state!.snapshot,
-        request.pr,
-      );
+      if (remotePr)
+        saveCheckpoint(root, request.directory!, request.key!, request.point!);
+      else
+        await saveUnifiedCheckpoint(
+          root,
+          workspaceRepo,
+          request.directory!,
+          request.key!,
+          request.point!,
+          request.state!.snapshot,
+          request.pr,
+        );
       result = true;
     } else throw new Error("Unknown review worker operation");
     if (process.connected) process.send!({ id: request.id, result });

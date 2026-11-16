@@ -1,6 +1,6 @@
-import { execute, git, object } from "./common.js";
+import { execute, git, gitEnv, object } from "./common.js";
 import { normalizeGitRemoteHostPath, runGh } from "./github/client.js";
-import { OID } from "./review-git.js";
+import { OID, reviewGit } from "./review-git.js";
 
 export interface PullRequest {
   number: number;
@@ -14,7 +14,7 @@ export interface PullRequest {
   files: { path: string; additions: number; deletions: number }[];
 }
 
-/** Read-only provider boundary; future threads/reviews belong on this service. */
+/** Read-only discovery boundary. Explicit submissions use ReviewCommentService. */
 export interface ReviewGitHub {
   discover(
     root: string,
@@ -29,11 +29,16 @@ export interface ReviewGitHub {
 }
 
 export class GhReviewService implements ReviewGitHub {
+  constructor(
+    private readonly options: { repository?: string; cache?: boolean } = {},
+  ) {}
+
   async ensureObjects(
     root: string,
     pr: PullRequest,
     signal?: AbortSignal,
   ): Promise<void> {
+    if (this.options.repository) this.assertRepository(pr);
     const hasCommit = async (oid: string): Promise<boolean> =>
       (
         await execute(["git", "cat-file", "-e", `${oid}^{commit}`], root, {
@@ -41,10 +46,16 @@ export class GhReviewService implements ReviewGitHub {
           signal,
           abortGraceMs: 0,
           processGroup: true,
+          env: {
+            ...gitEnv(),
+            GIT_NO_LAZY_FETCH: "1",
+            GIT_TERMINAL_PROMPT: "0",
+          },
         })
       ).code === 0;
 
     if ((await hasCommit(pr.headRefOid)) && (await hasCommit(pr.baseRefOid))) {
+      if (this.options.cache) this.pinRemote(pr, root);
       return;
     }
 
@@ -61,7 +72,9 @@ export class GhReviewService implements ReviewGitHub {
     }
 
     try {
-      const originUrl = git(root, "remote", "get-url", "origin");
+      const originUrl = this.options.cache
+        ? git(root, "config", "--get", "remote.origin.url")
+        : git(root, "remote", "get-url", "origin");
       if (originUrl.includes("://") || originUrl.includes("@")) {
         const expected = `${url.host}/${match[1]}/${match[2]}`.toLowerCase();
         if (normalizeGitRemoteHostPath(originUrl) !== expected) {
@@ -99,23 +112,29 @@ export class GhReviewService implements ReviewGitHub {
         "--no-tags",
         "--no-write-fetch-head",
         "--no-recurse-submodules",
-        `${url.origin}/${match[1]}/${match[2]}.git`,
+        ...(this.options.cache ? ["--filter=blob:none"] : []),
+        this.options.cache
+          ? "origin"
+          : `${url.origin}/${match[1]}/${match[2]}.git`,
         `+refs/pull/${pr.number}/head:refs/rl/live-pr/${pr.number}/head`,
         `+refs/heads/${pr.baseRefName}:refs/rl/live-pr/${pr.number}/base`,
       ],
       root,
       {
-        timeoutMs: 30000,
+        timeoutMs: this.options.cache ? 120000 : 30000,
         maxOutputBytes: 1024 * 1024,
         signal,
         abortGraceMs: 0,
         processGroup: true,
+        env: { ...gitEnv(), GIT_TERMINAL_PROMPT: "0", GH_PROMPT_DISABLED: "1" },
       },
     );
     if (result.code !== 0) {
       throw new Error(
         result.stderr.trim() ||
-          "PR object download failed; local review remains available with w",
+          (this.options.cache
+            ? "PR object download failed; press Ctrl-r to retry"
+            : "PR object download failed; local review remains available with w"),
       );
     }
     if (
@@ -126,6 +145,28 @@ export class GhReviewService implements ReviewGitHub {
         "PR changed during download; press Ctrl-r to refresh its revision identities",
       );
     }
+    if (this.options.cache) this.pinRemote(pr, root);
+  }
+
+  private pinRemote(pr: PullRequest, root: string): void {
+    reviewGit(
+      root,
+      ["update-ref", "--stdin"],
+      `start\nupdate refs/rl/live-pr/${pr.number}/head ${pr.headRefOid}\nupdate refs/rl/live-pr/${pr.number}/base ${pr.baseRefOid}\nprepare\ncommit\n`,
+    );
+  }
+
+  private assertRepository(pr: PullRequest): void {
+    const url = new URL(pr.url);
+    const identity =
+      `${url.host}${url.pathname.replace(/\/pull\/\d+\/?$/, "")}`.toLowerCase();
+    if (
+      url.protocol !== "https:" ||
+      url.username ||
+      url.password ||
+      identity !== this.options.repository!.toLowerCase()
+    )
+      throw new Error("GitHub PR does not belong to the requested repository");
   }
 
   async discover(
@@ -139,6 +180,7 @@ export class GhReviewService implements ReviewGitHub {
         "pr",
         "view",
         ...(selector ? [String(selector)] : []),
+        ...(this.options.repository ? ["--repo", this.options.repository] : []),
         "--json",
         "number,title,url,headRefName,baseRefName,headRefOid,baseRefOid,commits,files",
       ],
@@ -148,7 +190,10 @@ export class GhReviewService implements ReviewGitHub {
         signal,
         abortGraceMs: 0,
         processGroup: true,
-        offlineMessage: "GitHub offline; local review remains live",
+        respectOffline: true,
+        offlineMessage: this.options.cache
+          ? "GitHub is offline; remote PR review needs network access"
+          : "GitHub offline; local review remains live",
       },
     );
 
@@ -174,6 +219,10 @@ export class GhReviewService implements ReviewGitHub {
     ) {
       throw new Error("Invalid GitHub PR metadata");
     }
-    return data as unknown as PullRequest;
+    const pr = data as unknown as PullRequest;
+    if (selector && pr.number !== selector)
+      throw new Error("GitHub returned a different PR number");
+    if (this.options.repository) this.assertRepository(pr);
+    return pr;
   }
 }

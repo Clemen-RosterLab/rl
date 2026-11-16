@@ -157,6 +157,7 @@ export async function main(argv: string[]): Promise<number> {
       "latest",
       "l",
       "workspace",
+      "desktop",
     ],
     { latest: "l" },
   );
@@ -170,6 +171,10 @@ export async function main(argv: string[]): Promise<number> {
   if ((values.latest || values.l) && command !== "resume") {
     throw new UsageError("--latest is only supported by rl resume");
   }
+  if (values.desktop && command !== "resume")
+    throw new UsageError(
+      "--desktop is only supported by rl resume and rl agent start",
+    );
 
   if (command === "adopt") {
     arity(rest, 0);
@@ -191,7 +196,10 @@ export async function main(argv: string[]): Promise<number> {
     return resumeSessions(
       store,
       rest[0] === undefined ? undefined : parseAgent(rest[0]),
-      { latest: Boolean(values.latest || values.l) },
+      {
+        latest: Boolean(values.latest || values.l),
+        desktop: Boolean(values.desktop),
+      },
     );
   }
 

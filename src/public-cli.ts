@@ -28,6 +28,7 @@ import {
 } from "./repos.js";
 import { main as feedbackMain } from "./review-feedback.js";
 import { main as reviewMain } from "./review.js";
+import { remoteReviewRequested } from "./review-remote.js";
 import { main as stateMain } from "./state.js";
 import { main as storageMain } from "./storage.js";
 import { Store } from "./store.js";
@@ -258,6 +259,10 @@ export async function runPublicCli(rawArgv: string[]): Promise<number> {
     }
 
     const initialCwd = process.cwd();
+    if (command === "review" && remoteReviewRequested(rest)) {
+      const { main } = await import("./review-remote.js");
+      return await main(rest, explicitRepo);
+    }
     const envSettings = resolveCliEnvironment(
       explicitRepo,
       process.env,

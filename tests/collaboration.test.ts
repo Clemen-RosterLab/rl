@@ -29,8 +29,29 @@ const finding = {
 async function setup(
   t: TestContext,
   initialChanges?: (workspace: Workspace) => void,
+  legacyPolicy = true,
 ) {
   const w = new Workspace(t);
+  if (legacyPolicy) {
+    w.rl(["workflow", "init"], { cwd: w.a });
+    const policyPath = path.join(w.a, ".rl/policies.json");
+    const policies = readJson(policyPath);
+    policies.policies.review.blockRequired = true;
+    policies.policies.review.rating = {
+      min: 0,
+      max: 100,
+      minimum: 90,
+      instructions: "Test policy: require 90/100",
+    };
+    write(policyPath, JSON.stringify(policies));
+    const workflowPath = path.join(w.a, ".rl/agent-workflows.json");
+    const workflows = readJson(workflowPath);
+    const collaboration =
+      workflows.workflows["writer-reviewer-dry"].collaboration;
+    collaboration.maxRounds = 5;
+    for (const rule of collaboration.rules) rule.required = true;
+    write(workflowPath, JSON.stringify(workflows));
+  }
   write(path.join(w.a, "app.ts"), "export const initial = 1;\n");
   w.git(w.a, "add", "app.ts");
   w.git(w.a, "commit", "-qm", "Initial source");
@@ -179,13 +200,22 @@ async function setup(
 }
 
 test("the built-in team is active in adopted workspaces without initialization and all roles start together", async (t) => {
-  const { w, parent, rpc, started, team, peer, claims } = await setup(t);
+  const { w, parent, rpc, started, team, peer, claims } = await setup(
+    t,
+    undefined,
+    false,
+  );
   assert.ok(!fs.existsSync(path.join(w.a, ".rl")));
   const context = await rpc("rl_workflow_context");
   assert.equal(context.active, true);
   assert.equal(context.source, "built-in");
   assert.equal(context.defaultWorkflow, "writer-reviewer-dry");
-  assert.deepEqual(Object.keys(context.agents), ["writer", "reviewer", "dry"]);
+  assert.deepEqual(Object.keys(context.agents), [
+    "writer",
+    "reviewer",
+    "dry",
+    "regression-qa",
+  ]);
   assert.equal(context.agents.writer.access, "workspace-write");
   assert.equal(context.agents.reviewer.access, "read-only");
   assert.equal(context.agents.dry.access, "read-only");
@@ -230,7 +260,7 @@ test("work cannot begin until all three peers have distinct native bindings", as
 });
 
 test("partial legacy configuration inherits compatible defaults without rewriting explicit settings", async (t) => {
-  const { w, rpc, started } = await setup(t);
+  const { w, rpc, started } = await setup(t, undefined, false);
   const directory = path.join(w.a, ".rl"),
     agents = path.join(directory, "agents.json"),
     policies = path.join(directory, "policies.json"),
@@ -256,7 +286,7 @@ test("partial legacy configuration inherits compatible defaults without rewritin
   assert.equal(context.defaultWorkflow, "writer-reviewer-dry");
   assert.deepEqual(context.agents.behavior, oldProfile);
   assert.equal(context.agents.writer.access, "workspace-write");
-  assert.equal(context.policies.review.rating.minimum, 90);
+  assert.equal(context.policies.review.rating.minimum, 6);
   assert.equal(fs.readFileSync(agents, "utf8"), original);
   assert.ok(!readJson(policies).policies.review.rating);
   fs.unlinkSync(agents);
@@ -508,7 +538,7 @@ test("peers remain alive until the writer is reviewed and required consultation 
 });
 
 test("all profiles, peer routes, review thresholds and the default workflow remain editable", async (t) => {
-  const { w, rpc } = await setup(t);
+  const { w, rpc } = await setup(t, undefined, false);
   w.rl(["workflow", "init"], { cwd: w.a });
   const profilePath = path.join(w.root, "writer.json"),
     profiles = readJson(path.join(w.a, ".rl/agents.json"));
@@ -565,7 +595,8 @@ test("all profiles, peer routes, review thresholds and the default workflow rema
   );
   assert.equal(
     context.agents.writer.instructions,
-    "Updated writer instructions without changing native settings",
+    "Updated writer instructions without changing native settings\n\n" +
+      profiles.agents.writer.hosts.claude.instructions,
   );
   const customRun = await rpc("rl_workflow_start", { base: "HEAD" });
   assert.equal(customRun.workflow, "custom-team");

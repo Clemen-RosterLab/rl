@@ -1,4 +1,5 @@
 import { agentAdapter } from "./agent-registry.js";
+import { desktopAgent, desktopLaunch } from "./agent-desktop.js";
 import type { Agent } from "./agents.js";
 import { syncCodexSessions } from "./codex-sessions.js";
 import { execute, message, now, sessionId, timestamp } from "./common.js";
@@ -10,13 +11,18 @@ import { readWorkflowConfig, workflowEnvironment } from "./workflow-config.js";
 export async function resumeSessions(
   store: Store,
   kind?: Agent,
-  options: { latest?: boolean } = {},
+  options: { latest?: boolean; desktop?: boolean } = {},
 ): Promise<number> {
+  if (options.desktop && kind) desktopAgent(kind);
   if (!kind || kind === "codex") {
     await syncCodexSessions(store);
   }
   const [, data] = await store.locked(() => store.current());
-  const kinds: Agent[] = kind ? [kind] : ["codex", "claude", "agy"];
+  const kinds: Agent[] = kind
+    ? [kind]
+    : options.desktop
+      ? ["codex", "claude"]
+      : ["codex", "claude", "agy"];
   const choices = kinds
     .flatMap((agent) =>
       (data.sessions[agent] ?? []).map((session) => ({ ...session, agent })),
@@ -47,7 +53,7 @@ export async function resumeSessions(
       picked = await runFzf(fzfRows, {
         cwd: data.worktree,
         prompt: "Resume session › ",
-        header: `${sanitizeTerminalText(data.id)} · Agent / session UUID / last used / started\nMost recently used first · Enter resume · Esc cancel`,
+        header: `${sanitizeTerminalText(data.id)} · Agent / session UUID / last used / started\nMost recently used first · Enter ${options.desktop ? "open in desktop" : "resume"} · Esc cancel`,
         heightPercent: 70,
         errorLabel: "Session selector",
       });
@@ -72,6 +78,7 @@ export async function resumeSessions(
     cwd: data.worktree,
     sessionId: selected.id,
     expectedKey: data.key,
+    desktop: options.desktop,
   });
 }
 
@@ -83,8 +90,14 @@ export async function resumeAgent(
     sessionId?: string;
     prompt?: string;
     expectedKey?: string;
+    desktop?: boolean;
   } = {},
 ): Promise<number> {
+  if (options.desktop) {
+    desktopAgent(kind);
+    if (options.prompt !== undefined)
+      throw new Error("Desktop resume does not support a terminal prompt");
+  }
   const cwd = options.cwd ?? process.cwd();
   if (kind === "codex" && options.sessionId === undefined) {
     await syncCodexSessions(store, cwd);
@@ -114,8 +127,19 @@ export async function resumeAgent(
   });
 
   const stamp = now();
-  console.error(`Resuming ${kind} session ${sid} for ${data.id}`);
-  const command = agentAdapter(kind).resumeArgs(sid, options.prompt);
+  const desktop = options.desktop
+    ? desktopLaunch(kind, data.worktree, sid)
+    : undefined;
+  if (desktop && !desktop.resumesSession)
+    console.error(
+      `Opening ${sanitizeTerminalText(data.id)} in Codex Desktop. Select saved conversation ${sid} in the app; the workspace launcher cannot select an exact conversation.`,
+    );
+  else
+    console.error(
+      `Resuming ${kind} session ${sid} for ${sanitizeTerminalText(data.id)}${desktop ? " in Desktop" : ""}`,
+    );
+  const command =
+    desktop?.command ?? agentAdapter(kind).resumeArgs(sid, options.prompt);
   const result = await execute(command, data.worktree, {
     interactive: true,
     env: {
@@ -128,7 +152,7 @@ export async function resumeAgent(
     },
   });
 
-  if (result.code === 0) {
+  if (result.code === 0 && (!desktop || desktop.resumesSession)) {
     await store.locked(() => {
       const [currentFile, current] = store.current(data.worktree);
       if (currentFile !== file) {

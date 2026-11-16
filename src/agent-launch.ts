@@ -1,5 +1,6 @@
 import fs from "node:fs";
 import { agentAdapter } from "./agent-registry.js";
+import { desktopAgent, desktopLaunch } from "./agent-desktop.js";
 import { args, arity, execute } from "./common.js";
 import {
   commandContext,
@@ -13,6 +14,7 @@ export interface LaunchOptions {
   mode?: "start" | "run";
   prompt?: string;
   cwd?: string;
+  desktop?: boolean;
 }
 
 export async function launchAgent(
@@ -22,6 +24,13 @@ export async function launchAgent(
   options: LaunchOptions = {},
 ): Promise<number> {
   const adapter = agentAdapter(name);
+  if (options.desktop) {
+    desktopAgent(name);
+    if (options.mode === "run" || options.prompt !== undefined || argv.length)
+      throw new Error(
+        "Use --desktop with agent start, without a prompt or forwarded terminal options",
+      );
+  }
   const [, data] = await store.locked(() => store.current(options.cwd));
   const headless = options.mode === "run";
   const prompt = options.prompt ?? "";
@@ -29,9 +38,11 @@ export async function launchAgent(
     throw new Error("Agent run requires a non-empty --prompt");
   if (!headless && options.prompt !== undefined)
     throw new Error("Use agent run for --prompt");
-  const command = headless
-    ? adapter.runArgs(prompt, argv)
-    : adapter.startArgs(argv);
+  const command = options.desktop
+    ? desktopLaunch(name, data.worktree).command
+    : headless
+      ? adapter.runArgs(prompt, argv)
+      : adapter.startArgs(argv);
   const result = await execute(command, data.worktree, {
     interactive: !headless,
     terminalError: headless,
@@ -74,7 +85,7 @@ export async function main(argv: string[]): Promise<number> {
   const { values, positionals } = args(
     separator < 0 ? argv : argv.slice(0, separator),
     [...contextOptions, "prompt", "workspace", "output"],
-    ["stdout"],
+    ["stdout", "desktop"],
   );
   const context = commandContext(values);
   const target = resolveWorkspace(
@@ -86,6 +97,7 @@ export async function main(argv: string[]): Promise<number> {
   if (command === "handoff") {
     if (
       extra.length ||
+      values.desktop ||
       values.prompt !== undefined ||
       (values.stdout && values.output !== undefined)
     )
@@ -111,5 +123,6 @@ export async function main(argv: string[]): Promise<number> {
     mode: command,
     prompt: typeof values.prompt === "string" ? values.prompt : undefined,
     cwd: target.path,
+    desktop: Boolean(values.desktop),
   });
 }

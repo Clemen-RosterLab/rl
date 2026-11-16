@@ -121,7 +121,9 @@ const topics: Record<string, Topic> = {
     usage: "rl review [worktree] [action] [options]",
     options: [
       "--all                     Choose a worktree from the review queue",
-      "--pr <number>             Inspect a GitHub PR (gh; local fallback if unavailable)",
+      "--pr <number|URL>         Review a remote GitHub PR without a checkout",
+      "--github-repo <owner/repo> Select a remote repository (optional HOST/ prefix)",
+      "--local                   Combine --pr with the current working tree instead",
       "--live                    Require the live terminal interface",
       "--remote-interval <sec>   PR polling interval (default 60; minimum 10)",
       "--summary                 AI implementation summary (manual fallback if unavailable)",
@@ -149,7 +151,8 @@ const topics: Record<string, Topic> = {
     ],
     notes: [
       "Default: live commits/files/diff for the current worktree. 1/2/3 focus; Tab cycles; j/k navigate; w working; p branch; r range; f freeze; m mark; s since; / search; o VS Code; ? help; q quit.",
-      "Live review watches source, HEAD and index with polling fallback. Freeze retains immutable trees. Live m/s checkpoints are separate from legacy approval checkpoints.",
+      "Local review watches source, HEAD and index. --pr uses an isolated bare Git cache and remote polling; no checkout is created. m/s retain exact reviewed revisions.",
+      "In PR mode: i drafts an inline comment, D manages local drafts, and R submits a GitHub review after confirmation. Git files remain read-only.",
       "Queue: Enter review, Alt-S summary, Alt-D diff, Alt-F feedback, Alt-A approve, Alt-O editor, Ctrl-R refresh, Esc quit.",
       "New rl switch -c branches record a fixed baseline. Older worktrees require explicit --base; no feature baseline is guessed.",
       "Temporary Git indexes capture committed, staged, unstaged and non-ignored untracked source without changing your real index or branch.",
@@ -241,13 +244,16 @@ const topics: Record<string, Topic> = {
   resume: {
     group: "Agents and tasks",
     description: "Resume a saved conversation",
-    usage: "rl resume [codex|claude|agy] [--latest|-l|--l]",
+    usage: "rl resume [codex|claude|agy] [--latest|-l|--l] [--desktop]",
     options: [
       "--latest, -l, --l  Resume the most recently used matching session directly",
+      "--desktop         Open Codex or Claude Desktop instead of the terminal",
     ],
     notes: [
       "Without a filter, offers both Codex and Claude sessions in this workspace.",
       "One match resumes automatically; multiple matches open a picker.",
+      "Claude Desktop resumes the exact saved CLI session. Codex Desktop opens its workspace; choose the displayed session ID in the app.",
+      "Desktop launch uses the native CLIs and their existing installation, platform and authentication requirements.",
     ],
     related: ["agent sessions", "agent save", "continue"],
   },
@@ -263,8 +269,18 @@ const topics: Record<string, Topic> = {
   "agent start": {
     description: "Start an interactive agent",
     usage:
-      "rl agent start <codex|claude|agy> [--workspace <name>] [-- <agent args>]",
-    examples: ["rl agent start codex -- --model <model>"],
+      "rl agent start <codex|claude|agy> [--workspace <name>] [--desktop] [-- <agent args>]",
+    options: [
+      "--desktop  Open Codex or Claude Desktop on the resolved worktree",
+    ],
+    notes: [
+      "--desktop does not accept forwarded terminal options or change global app settings.",
+    ],
+    examples: [
+      "rl agent start codex -- --model <model>",
+      "rl agent start codex --desktop",
+      "rl agent start claude --desktop",
+    ],
   },
   "agent run": {
     description: "Run an agent non-interactively",

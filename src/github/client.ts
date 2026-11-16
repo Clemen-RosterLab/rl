@@ -5,11 +5,13 @@ import { parseJsonObject } from "../json.js";
 export const DEFAULT_GH_TIMEOUT_MS = 20_000;
 
 export interface GhExecOptions {
+  input?: string;
   timeoutMs?: number;
   signal?: AbortSignal;
   maxOutputBytes?: number;
   abortGraceMs?: number;
   processGroup?: boolean;
+  respectOffline?: boolean;
   offlineMessage?: string;
 }
 
@@ -44,12 +46,13 @@ export async function runGh(
   argv: string[],
   options: GhExecOptions = {},
 ): Promise<CommandResult> {
-  if (process.env.RL_PR_OFFLINE === "1") {
+  if (options.respectOffline && process.env.RL_PR_OFFLINE === "1") {
     throw new RlError(
       options.offlineMessage ?? "GitHub is offline (RL_PR_OFFLINE=1)",
     );
   }
   return execute(["gh", ...argv], cwd, {
+    input: options.input,
     timeoutMs: options.timeoutMs ?? DEFAULT_GH_TIMEOUT_MS,
     env: cleanGhEnvironment(),
     signal: options.signal,

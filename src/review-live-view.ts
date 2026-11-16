@@ -222,6 +222,7 @@ export interface ReviewView {
   rows: number;
   focus: number;
   expanded: boolean;
+  remoteOnly?: boolean;
   sidebarWidth?: number;
   textSelection?: ReviewTextSelection;
   filterMenu?: {
@@ -230,6 +231,9 @@ export interface ReviewView {
     settings?: ReviewSettings;
   };
   menu?: ReviewMenu;
+  composer?: { title: string; detail: string; body: string };
+  draftCount?: number;
+  activeLine?: number;
   reviewed?: Set<string>;
   changedSinceViewed?: Set<string>;
   ranks?: ReviewRanks;
@@ -437,7 +441,9 @@ export function reviewFrame(view: ReviewView): ReviewFrame {
     );
   const indicator = view.frozen
     ? `❄ FROZEN${view.newer ? " · NEW CHANGES" : ""}`
-    : "◎ LIVE";
+    : view.remoteOnly
+      ? "◎ REMOTE"
+      : "◎ LIVE";
   const indicatorWidth = Math.min(layout.width, indicator.length + 2);
   paint(
     1,
@@ -516,7 +522,7 @@ export function reviewFrame(view: ReviewView): ReviewFrame {
       : "Space to select";
     heading(rect, `1 COMMITS · ${selection}`, view.focus === 0);
     hits.push({ ...rect, action: "commits" });
-    const includeWorking = layout.narrow;
+    const includeWorking = layout.narrow && !view.remoteOnly;
     const capacity = Math.max(1, Math.floor((rect.height - 2) / 3));
     const start = Math.max(
       0,
@@ -629,6 +635,12 @@ export function reviewFrame(view: ReviewView): ReviewFrame {
   function working(): void {
     const rect = layout.working;
     if (!rect) return;
+    if (view.remoteOnly) {
+      heading(rect, "REMOTE PR · p", false);
+      line(rect, rect.y + 1, "No checkout · remote polling", palette.muted);
+      hits.push({ ...rect, action: "shortcut", shortcut: "p" });
+      return;
+    }
     heading(
       rect,
       "WORKING TREE  ·  w",
@@ -684,6 +696,29 @@ export function reviewFrame(view: ReviewView): ReviewFrame {
       viewport = layout.viewport,
       file = view.files[view.fileIndex],
       lines = view.help ?? view.lines;
+    if (view.composer) {
+      heading(rect, view.composer.title, true);
+      line(rect, rect.y + 1, view.composer.detail, palette.muted);
+      const width = Math.max(1, rect.width - 2);
+      const content = (view.composer.body + "▏").split("\n").flatMap((text) => {
+        const chars = Array.from(visible(text));
+        const wrapped = [];
+        do {
+          wrapped.push(chars.splice(0, width).join(""));
+        } while (chars.length);
+        return wrapped;
+      });
+      const capacity = Math.max(1, rect.height - 5);
+      for (const [i, text] of content.slice(-capacity).entries())
+        line(rect, rect.y + 3 + i, text, palette.text);
+      line(
+        rect,
+        rect.y + rect.height - 1,
+        "Enter Save locally · Ctrl-j Newline · Esc Cancel",
+        palette.blue,
+      );
+      return;
+    }
     if (view.menu) {
       heading(rect, view.menu.title, true);
       paint(
@@ -870,6 +905,7 @@ export function reviewFrame(view: ReviewView): ReviewFrame {
       if (view.search && text.toLowerCase().includes(view.search.toLowerCase()))
         tone = palette.amber;
       const lineNumber = offset + i;
+      if (view.activeLine === lineNumber) surface = palette.selection;
       const selectedColumns =
         selection &&
         lineNumber >= selection.start.line &&
@@ -948,7 +984,13 @@ export function reviewFrame(view: ReviewView): ReviewFrame {
       });
   }
   if (layout.narrow) {
-    if (view.menu || view.filterMenu || view.expanded || view.focus === 2)
+    if (
+      view.composer ||
+      view.menu ||
+      view.filterMenu ||
+      view.expanded ||
+      view.focus === 2
+    )
       diff();
     else if (view.focus === 0) commits();
     else files();
@@ -965,7 +1007,7 @@ export function reviewFrame(view: ReviewView): ReviewFrame {
   const footerY = Math.max(0, layout.rows - 3);
   rule({ x: 1, y: footerY, width: Math.max(1, layout.width - 2), height: 1 });
   const state = view.input ?? view.status;
-  const meta = `${view.updates} local · ${view.pr ? (view.remote.includes("newer") ? "NEW PR UPDATE" : view.remote.startsWith("#") ? "PR polled" : "PR unavailable") : view.head.slice(0, 8) || "unborn"}`;
+  const meta = `${view.updates} ${view.remoteOnly ? "remote" : "local"} · ${view.pr ? (view.remote.includes("newer") ? "NEW PR UPDATE" : view.remote.startsWith("#") ? "PR polled" : "PR unavailable") : view.head.slice(0, 8) || "unborn"}`;
   const showMeta =
     !view.input &&
     (view.status.startsWith("Updated") || view.status.startsWith("Frozen")) &&
@@ -994,13 +1036,23 @@ export function reviewFrame(view: ReviewView): ReviewFrame {
     { text: "1 Commits", key: "1" },
     { text: "2 Files", key: "2" },
     { text: "3 Diff", key: "3" },
+    ...(view.pr
+      ? [
+          { text: "i Comment", key: "i" },
+          {
+            text: `D Drafts${view.draftCount ? `(${view.draftCount})` : ""}`,
+            key: "D",
+          },
+          { text: "R Review", key: "R" },
+        ]
+      : []),
     { text: "−", key: "-" },
     { text: "+", key: "+" },
     { text: "T Filters", key: "T" },
     { text: "b Compare", key: "b" },
     { text: view.hideNoise ? "t Show all" : "t Focus files", key: "t" },
     { text: "Tab Switch", key: "\t" },
-    { text: "R Range", key: "r" },
+    { text: "r Range", key: "r" },
     { text: "S Since Review", key: "s" },
     { text: "/ Search", key: "/" },
     { text: "F Freeze", key: "f" },

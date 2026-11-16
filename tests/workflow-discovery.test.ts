@@ -111,9 +111,22 @@ test("an existing session discovers and completes the default team using only th
     requestId: reviewerQuestion.id,
     text: "Compared the relevant functions; no duplicate with matching semantics was found",
   });
-  const rated = peer("reviewer", "review", {
+  const belowThreshold = peer("reviewer", "review", {
     submissionId: submission.id,
-    rating: 95,
+    rating: 5.9,
+    rationale: "Final score below the custom rewrite threshold",
+    result,
+    duplicateSuspicions: [subject],
+  });
+  assert.equal(belowThreshold.review.accepted, false);
+  const rewritten = peer("writer", "submit", {
+    files: ["app.ts"],
+    newFunctions: [subject],
+    summary: "Stable rewritten submission for the threshold boundary check",
+  });
+  const rated = peer("reviewer", "review", {
+    submissionId: rewritten.id,
+    rating: 6,
     rationale: "Validated intended behavior and reuse evidence",
     result,
     duplicateSuspicions: [subject],

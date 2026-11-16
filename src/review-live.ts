@@ -39,6 +39,7 @@ import {
   type Commit,
 } from "./review-live-engine.js";
 import { ReviewWatcher } from "./review-live-watch.js";
+import { ReviewPreview } from "./review-live-preview.js";
 import {
   visibleReviewFiles,
   defaultReviewFilters,
@@ -68,9 +69,31 @@ import type {
   ReviewSearchHit,
 } from "./review-search.js";
 import { installTerminalCrashGuard } from "./review/terminal-guard.js";
+import type { RemoteReviewTarget } from "./review-remote.js";
+import {
+  GhReviewComments,
+  ReviewDraftStore,
+  emptyReviewDraft,
+  type ReviewDraft,
+  type InlineDraft,
+  type ReviewEvent,
+} from "./review-comments.js";
 
 interface ActionMenu extends ReviewMenu {
-  kind: "base" | "target" | "search" | "agent";
+  kind:
+    | "base"
+    | "target"
+    | "search"
+    | "agent"
+    | "review"
+    | "drafts"
+    | "draft-actions"
+    | "review-confirm"
+    | "review-recovery";
+  reviewEvent?: ReviewEvent;
+  reviewPr?: PullRequest;
+  draftRevision?: string;
+  commentId?: string;
   values?: string[];
   base?: string;
   identities?: Record<string, string>;
@@ -100,12 +123,18 @@ class GitWorker {
     reject: (error: Error) => void;
   };
 
-  constructor(root: string, repository = root) {
+  constructor(root: string, repository = root, remotePr?: number) {
     // A separate process group lets Quit interrupt synchronous Git commands
     // and their descendants while leaving the terminal process running.
     this.worker = fork(
       new URL("./review-live-worker.js", import.meta.url),
-      [root, repository, this.temporaryRoot, this.freezeId],
+      [
+        root,
+        repository,
+        this.temporaryRoot,
+        this.freezeId,
+        ...(remotePr ? [String(remotePr)] : []),
+      ],
       {
         detached: true,
         stdio: ["ignore", "ignore", "ignore", "ipc"],
@@ -289,6 +318,7 @@ export interface LiveOptions {
   since?: string;
   pr?: number;
   remoteInterval?: number;
+  remote?: RemoteReviewTarget;
 }
 const esc = "\x1b[";
 export function sourceLine(
@@ -355,6 +385,11 @@ const help = [
   "L    Logic-first ordering · A explicit agent ranking",
   "Ctrl-f    Cross-file search · Tab changes search scope",
   "o    Open reviewed version · O open current worktree file",
+  "i    Draft inline GitHub comment (PR comparison only)",
+  "Click a preview line, or scroll it to the top, then press i.",
+  "D    Edit / delete saved local PR review drafts",
+  "R    Review summary and submit: Comment / Approve / Request changes",
+  "Composer: Enter saves locally · Ctrl-j adds a newline · Esc cancels",
   "/    Search file paths and selected diff",
   "n / N    Next / previous match",
   "Ctrl-r    Refresh local state and PR metadata",
@@ -363,7 +398,7 @@ const help = [
   "",
   "Merges compare with their first parent. Initial commits use an empty tree.",
   "Live refresh preserves selection and scroll. Freeze retains immutable trees.",
-  "Review is read-only; m writes only private checkpoint metadata and refs.",
+  "Git files remain read-only. Only explicit R submission writes to GitHub.",
 ];
 
 export async function liveReview(options: LiveOptions): Promise<void> {
@@ -373,7 +408,12 @@ export async function liveReview(options: LiveOptions): Promise<void> {
     );
   let fileFilters = loadReviewFilters(options.directory, options.root);
   let settings = loadReviewSettings(options.directory, options.root);
-  const git = new GitWorker(options.root, options.repository);
+  const git = new GitWorker(
+    options.root,
+    options.repository,
+    options.remote?.number,
+  );
+  const preview = new ReviewPreview(options.root);
   const remoteAbort = new AbortController();
   let stopped = false,
     state: LiveState | undefined,
@@ -381,9 +421,11 @@ export async function liveReview(options: LiveOptions): Promise<void> {
     frozen = false,
     newer = false,
     updates = 0;
-  let mode: Mode = options.since
-    ? { kind: "range", from: options.since, to: "HEAD" }
-    : { kind: "working" };
+  let mode: Mode = options.remote
+    ? { kind: "branch", base: options.defaultBase }
+    : options.since
+      ? { kind: "range", from: options.since, to: "HEAD" }
+      : { kind: "working" };
   let comparison: Comparison | undefined,
     allFiles: ReviewFile[] = [],
     files: ReviewFile[] = [],
@@ -420,13 +462,22 @@ export async function liveReview(options: LiveOptions): Promise<void> {
     rankVersion = 0,
     rankStale = false;
   const rankedFingerprints = new Map<string, string>();
-  let status = "Loading Git state…",
+  let status = options.remote
+      ? `Loading PR #${options.pr} from ${options.remote.repository}…`
+      : "Loading Git state…",
     helpOpen = false,
     filterMenuOpen = false,
     filterMenuIndex = 0,
     filterPreviousFocus = 0,
     prompt:
-      "range" | "search" | "hidePaths" | "showPaths" | "wheel" | undefined,
+      | "range"
+      | "search"
+      | "hidePaths"
+      | "showPaths"
+      | "wheel"
+      | "comment"
+      | "review-body"
+      | undefined,
     input = "",
     search = "",
     pr: PullRequest | undefined,
@@ -434,13 +485,20 @@ export async function liveReview(options: LiveOptions): Promise<void> {
     remoteCommits: Commit[] | undefined,
     latestRemoteCommits: Commit[] | undefined,
     remote = "Checking PR…";
+  const comments = new GhReviewComments(options.root);
+  let draft: ReviewDraft | undefined, draftStore: ReviewDraftStore | undefined;
+  let commentTarget: InlineDraft | undefined,
+    composerDraft: ReviewDraft | undefined;
+  let composerError = "",
+    composerSaving = false;
+  let reviewBusy = false;
+  let commentPoint: { lines: string[]; line: number } | undefined;
   let refreshBusy = false,
     refreshAgain = false,
     compareBusy = false,
     compareAgain = false,
     compareVersion = 0,
     patchBusy = false,
-    patchAgain = false,
     patchVersion = 0;
   let navigationVersion = 0;
   let previousRows: string[] = [],
@@ -498,7 +556,9 @@ export async function liveReview(options: LiveOptions): Promise<void> {
     status = text;
     render();
   };
-  const watcher = new ReviewWatcher(() => void refresh());
+  const watcher = options.remote
+    ? undefined
+    : new ReviewWatcher(() => void refresh());
   const error = (cause: unknown) => {
     if (!stopped) {
       if (textSelection) selectionNotice = message(cause);
@@ -522,6 +582,7 @@ export async function liveReview(options: LiveOptions): Promise<void> {
     const visibleWorkingFiles = workingFiles();
     frame = reviewFrame({
       width,
+      remoteOnly: Boolean(options.remote),
       rows,
       focus,
       expanded: expandedDiff,
@@ -531,6 +592,25 @@ export async function liveReview(options: LiveOptions): Promise<void> {
         ? { filters: fileFilters, index: filterMenuIndex, settings }
         : undefined,
       menu,
+      composer:
+        prompt === "comment" || prompt === "review-body"
+          ? {
+              title:
+                prompt === "comment"
+                  ? "INLINE COMMENT · LOCAL DRAFT"
+                  : "REVIEW SUMMARY · LOCAL DRAFT",
+              detail:
+                prompt === "comment" && commentTarget
+                  ? `${commentTarget.path}:${commentTarget.line} · ${commentTarget.side} · ${composerDraft?.head.slice(0, 8)}`
+                  : `PR #${pr?.number} · ${composerDraft?.head.slice(0, 8)}`,
+              body: input,
+            }
+          : undefined,
+      draftCount: draft?.comments.length,
+      activeLine:
+        commentPoint?.lines === displayedLines()
+          ? commentPoint.line
+          : undefined,
       reviewed: new Set(
         files
           .filter((file) => isFileReviewed(progress, file))
@@ -555,7 +635,9 @@ export async function liveReview(options: LiveOptions): Promise<void> {
         : fullFile
           ? `${beforeFile ? "Base" : "Target"} file content · c returns to diff`
           : undefined,
-      branch: state?.snapshot.branch ?? path.basename(options.root),
+      branch: options.remote
+        ? `${options.remote.repository} · PR #${options.pr}${pr ? " / " + pr.headRefName : ""}`
+        : (state?.snapshot.branch ?? path.basename(options.root)),
       head: state?.snapshot.head ?? "",
       frozen,
       newer,
@@ -580,7 +662,10 @@ export async function liveReview(options: LiveOptions): Promise<void> {
         ? `${selectionNotice || "Text selected · y / Ctrl-c Copy · Esc Clear"}${textSelection.lines !== lines ? " · newer diff available" : ""}`
         : `${state && (!state.snapshot.complete || state.snapshot.conflicts.length || !state.snapshot.stable) ? `${state.snapshot.excluded.length} omitted / ${state.snapshot.conflicts.length} conflicts${!state.snapshot.stable ? " / source moving" : ""} · ` : ""}${options.pr && !pr && remote !== "Checking PR…" ? `PR #${options.pr}: ${remote}` : status}`,
       input: prompt
-        ? `${prompt === "range" ? "Range FROM TO" : prompt === "search" ? `Search files / diff [${searchScope}; Tab changes scope]` : prompt === "wheel" ? "Wheel lines (1–20)" : prompt === "hidePaths" ? "Hide paths (comma-separated globs)" : "Always show paths (comma-separated globs)"}: ${input}▏`
+        ? prompt === "comment" || prompt === "review-body"
+          ? composerError ||
+            "Enter Save draft · Ctrl-j Newline · Esc Cancel · R submits after saving"
+          : `${prompt === "range" ? "Range FROM TO" : prompt === "search" ? `Search files / diff [${searchScope}; Tab changes scope]` : prompt === "wheel" ? "Wheel lines (1–20)" : prompt === "hidePaths" ? "Hide paths (comma-separated globs)" : "Always show paths (comma-separated globs)"}: ${input}▏`
         : undefined,
       remote,
       pr: pr
@@ -616,6 +701,7 @@ export async function liveReview(options: LiveOptions): Promise<void> {
     return "working";
   }
   function scrollDiff(delta: number): void {
+    commentPoint = undefined;
     if (helpOpen)
       helpScroll = Math.max(
         0,
@@ -634,6 +720,10 @@ export async function liveReview(options: LiveOptions): Promise<void> {
     render();
   }
   function selectCommit(index: number): void {
+    if (options.remote && index === 0) {
+      onKey("p", { name: "p" });
+      return;
+    }
     rememberViewed();
     navigationVersion++;
     clearTextSelection();
@@ -669,7 +759,13 @@ export async function liveReview(options: LiveOptions): Promise<void> {
           kind: "commits",
           commits: commits.filter((entry) => selection.has(entry.sha)),
         }
-      : { kind: "working" };
+      : options.remote
+        ? {
+            kind: "branch",
+            base: pr?.baseRefOid ?? options.defaultBase,
+            head: pr?.headRefOid ?? state?.snapshot.head,
+          }
+        : { kind: "working" };
     commitIndex = Math.max(
       0,
       timeline().findIndex((entry) => entry.sha === commit.sha) + 1,
@@ -691,7 +787,8 @@ export async function liveReview(options: LiveOptions): Promise<void> {
   function scrollCommits(delta: number): void {
     const layout = geometry();
     const capacity = Math.max(1, Math.floor((layout.commits.height - 2) / 3));
-    const count = timeline().length + (layout.narrow ? 1 : 0);
+    const count =
+      timeline().length + (layout.narrow && !options.remote ? 1 : 0);
     commitScroll = Math.max(
       0,
       Math.min(Math.max(0, count - capacity), commitScroll + delta),
@@ -701,7 +798,10 @@ export async function liveReview(options: LiveOptions): Promise<void> {
   function revealCommit(): void {
     const layout = geometry();
     const capacity = Math.max(1, Math.floor((layout.commits.height - 2) / 3));
-    const row = Math.max(0, commitIndex - (layout.narrow ? 0 : 1));
+    const row = Math.max(
+      0,
+      commitIndex - (layout.narrow && !options.remote ? 0 : 1),
+    );
     if (row < commitScroll) commitScroll = row;
     else if (row >= commitScroll + capacity) commitScroll = row - capacity + 1;
     scrollCommits(0);
@@ -790,7 +890,10 @@ export async function liveReview(options: LiveOptions): Promise<void> {
     const choices = [
       { label: "Current HEAD", ref: state.snapshot.head },
       ...(options.pr && pr
-        ? [{ label: `PR #${pr.number} HEAD`, ref: pr.headRefOid }]
+        ? [
+            { label: `PR #${pr.number} HEAD`, ref: pr.headRefOid },
+            { label: `PR target ${pr.baseRefName}`, ref: pr.baseRefOid },
+          ]
         : []),
       ...references.map((entry) => ({ label: entry.label, ref: entry.sha })),
       ...timeline().map((commit) => ({
@@ -805,7 +908,9 @@ export async function liveReview(options: LiveOptions): Promise<void> {
       index: 0,
       items: [
         {
-          label: "Last reviewed → current working tree",
+          label: options.remote
+            ? "Last reviewed → current PR HEAD"
+            : "Last reviewed → current working tree",
           detail: "Use your exact saved source and index checkpoint",
         },
         ...choices.map((choice) => ({
@@ -819,6 +924,18 @@ export async function liveReview(options: LiveOptions): Promise<void> {
   async function chooseMenu(index: number): Promise<void> {
     const current = menu;
     if (!current) return;
+    if (
+      [
+        "review",
+        "drafts",
+        "draft-actions",
+        "review-confirm",
+        "review-recovery",
+      ].includes(current.kind)
+    ) {
+      await chooseReviewAction(current, index);
+      return;
+    }
     if (current.kind === "base") {
       const base = current.values?.[index];
       if (!base) return;
@@ -1190,12 +1307,13 @@ export async function liveReview(options: LiveOptions): Promise<void> {
         !helpOpen &&
         event.y >= viewport.y &&
         event.y < viewport.y + viewport.height &&
-        event.x >= viewport.x &&
+        event.x >= frame!.layout.diff.x + 1 &&
         event.x < viewport.x + viewport.width
       ) {
         clearTextSelection();
         if (!patchBusy && lines.length) {
           const point = textPoint(event);
+          commentPoint = { lines, line: point.line };
           textSelection = { anchor: point, end: point, lines };
           selectionSource = loadedFile;
           selectingText = true;
@@ -1375,10 +1493,16 @@ export async function liveReview(options: LiveOptions): Promise<void> {
     }
     refreshBusy = true;
     try {
-      const result = await git.request<LiveState>("refresh", { force });
+      if (options.remote && !latestPr) return;
+      const result = await git.request<LiveState>("refresh", {
+        force,
+        ...(options.remote && latestPr
+          ? { remote: { head: latestPr.headRefOid, base: latestPr.baseRefOid } }
+          : {}),
+      });
       if (stopped) return;
       if (latest?.signature !== result.signature || force)
-        watcher.update(result);
+        watcher?.update(result);
       latest = result;
       if (state?.signature !== result.signature || force) {
         if (frozen) {
@@ -1466,6 +1590,8 @@ export async function liveReview(options: LiveOptions): Promise<void> {
         : `Updated · ${files.length} file layers${rankStale ? " · ranking stale: L refreshes" : ""} · f freezes the inspected snapshot`;
     } catch (cause) {
       if (version === compareVersion) {
+        preview.cancel();
+        patchBusy = false;
         loadedFile = undefined;
         comparison = undefined;
         allFiles = [];
@@ -1484,10 +1610,8 @@ export async function liveReview(options: LiveOptions): Promise<void> {
   }
   async function patch(): Promise<void> {
     patchVersion++;
-    if (patchBusy) {
-      patchAgain = true;
-      return;
-    }
+    preview.cancel();
+    patchBusy = false;
     const file = selected();
     if (!file) {
       loadedFile = undefined;
@@ -1529,25 +1653,13 @@ export async function liveReview(options: LiveOptions): Promise<void> {
     lines = [`Loading ${file.path}…`];
     render();
     try {
-      let result: string;
-      if (fullFile)
-        result = (
-          await git.request<{ text: string }>("content", {
-            file,
-            side: beforeFile ? "before" : "after",
-          })
-        ).text;
-      else if (sinceViewed && progress.viewed[file.key])
-        result = await git.request<string>("delta", {
-          file,
-          viewed: progress.viewed[file.key],
-          context: patchContext,
-        });
-      else
-        result = await git.request<string>("patch", {
-          file,
-          context: patchContext,
-        });
+      const result = await preview.read(file, {
+        gitDir: state!.gitDir,
+        context: patchContext,
+        fullFile,
+        side: beforeFile ? "before" : "after",
+        viewed: sinceViewed ? progress.viewed[file.key] : undefined,
+      });
       if (stopped || version !== patchVersion) return;
       lines = result.split("\n");
       loadedFile = file;
@@ -1569,11 +1681,9 @@ export async function liveReview(options: LiveOptions): Promise<void> {
         error(cause);
       }
     } finally {
-      patchBusy = false;
-      render();
-      if (patchAgain) {
-        patchAgain = false;
-        void patch();
+      if (version === patchVersion) {
+        patchBusy = false;
+        render();
       }
     }
   }
@@ -1585,7 +1695,11 @@ export async function liveReview(options: LiveOptions): Promise<void> {
     try {
       await git.request("identity");
       if (stopped) return;
-      const github = new GhReviewService();
+      const github = new GhReviewService(
+        options.remote
+          ? { repository: options.remote.repository, cache: true }
+          : undefined,
+      );
       const result = await github.discover(
         options.root,
         options.pr,
@@ -1607,6 +1721,10 @@ export async function liveReview(options: LiveOptions): Promise<void> {
         commitIndex > 0 ? timeline()[commitIndex - 1]?.sha : undefined;
       latestPr = result;
       if (!frozen) pr = result;
+      if (!draftStore) {
+        draftStore = new ReviewDraftStore(options.directory, result);
+        draft = draftStore.load();
+      }
       if (options.pr && changed)
         latestRemoteCommits = await git.request<Commit[]>("history", {
           head: result.headRefOid,
@@ -1626,9 +1744,10 @@ export async function liveReview(options: LiveOptions): Promise<void> {
             base: result.baseRefOid,
             head: result.headRefOid,
           };
-          void compare();
+          if (!options.remote) void compare();
         }
       }
+      if (options.remote) await refresh();
       if (
         frozen &&
         pr &&
@@ -1719,6 +1838,370 @@ export async function liveReview(options: LiveOptions): Promise<void> {
       `Marked inspected snapshot ${point.label} reviewed · s compares later changes`,
     );
   }
+  function reviewDraft(reload = false): ReviewDraft {
+    if (!pr)
+      throw new Error("PR metadata unavailable · use rl review --pr NUMBER");
+    if (!draftStore) draftStore = new ReviewDraftStore(options.directory, pr);
+    if (!draft || reload) draft = draftStore.load();
+    return draft;
+  }
+  function editableDraft(): ReviewDraft {
+    const current = reviewDraft(true);
+    if (current.attempt)
+      throw new Error(
+        "Previous submission needs verification · press R to recover it before editing",
+      );
+    if (!current.body && !current.comments.length) {
+      current.head = pr!.headRefOid;
+      current.base = pr!.baseRefOid;
+    }
+    return current;
+  }
+  function composeReview(
+    kind: "comment" | "review-body",
+    current: ReviewDraft,
+    target?: InlineDraft,
+  ): void {
+    closeMenu();
+    clearTextSelection();
+    helpOpen = filterMenuOpen = false;
+    composerDraft = current;
+    composerError = "";
+    commentTarget = target;
+    prompt = kind;
+    input = kind === "comment" ? target!.body : current.body;
+    focus = 2;
+    render();
+  }
+  async function beginInlineComment(): Promise<void> {
+    if (reviewBusy) return;
+    const current = editableDraft();
+    const capturedPr = pr!;
+    const file = textSelection ? selectionSource : loadedFile;
+    if (
+      focus !== 2 ||
+      helpOpen ||
+      patchBusy ||
+      compareBusy ||
+      compareAgain ||
+      sinceViewed ||
+      mode.kind !== "branch" ||
+      mode.base !== capturedPr.baseRefOid ||
+      !file ||
+      file !== loadedFile ||
+      file.to !== capturedPr.headRefOid ||
+      (textSelection && textSelection.lines !== lines)
+    )
+      throw new Error(
+        "Use p for the current PR comparison, focus the loaded preview, then click a line or scroll it to the top and press i",
+      );
+    if (
+      (current.comments.length || current.body) &&
+      (current.head !== capturedPr.headRefOid ||
+        current.base !== capturedPr.baseRefOid)
+    )
+      throw new Error(
+        "Draft is from an older PR revision · use D to inspect or discard it first",
+      );
+    const content = displayedLines();
+    const position =
+      textSelection?.anchor.line ??
+      (commentPoint?.lines === content ? commentPoint.line : scroll);
+    const [old, next] = fullFile
+      ? [
+          beforeFile ? position + 1 : undefined,
+          beforeFile ? undefined : position + 1,
+        ]
+      : (reviewLineNumbers(content)[position] ?? []);
+    const side =
+      old !== undefined && (next === undefined || (fullFile && beforeFile))
+        ? "LEFT"
+        : "RIGHT";
+    const line = side === "LEFT" ? old : next;
+    if (line === undefined)
+      throw new Error(
+        "Select a source line inside a diff hunk, rather than a file or hunk header",
+      );
+    const target: InlineDraft = {
+      id: randomUUID(),
+      path: file.path,
+      line,
+      side,
+      body: "Draft",
+    };
+    reviewBusy = true;
+    setStatus("Checking comment location against GitHub's current PR diff…");
+    try {
+      await comments.validate(capturedPr, [target], remoteAbort.signal);
+      if (stopped) return;
+      if (
+        pr?.headRefOid !== capturedPr.headRefOid ||
+        pr?.baseRefOid !== capturedPr.baseRefOid ||
+        loadedFile !== file ||
+        lines !== content ||
+        mode.kind !== "branch" ||
+        prompt ||
+        menu ||
+        helpOpen ||
+        filterMenuOpen ||
+        focus !== 2
+      )
+        throw new Error(
+          "Preview changed while checking the comment location; select it again",
+        );
+      // The revision belongs to the captured display, never a later poll.
+      const captured = structuredClone(current);
+      if (!captured.comments.length && !captured.body) {
+        captured.head = capturedPr.headRefOid;
+        captured.base = capturedPr.baseRefOid;
+      }
+      target.body = "";
+      composeReview("comment", captured, target);
+    } finally {
+      reviewBusy = false;
+    }
+  }
+  function showDrafts(): void {
+    if (reviewBusy) return;
+    const current = reviewDraft(true);
+    openMenu({
+      kind: "drafts",
+      title: `LOCAL REVIEW DRAFT · ${current.comments.length} COMMENTS`,
+      subtitle: `PR #${pr!.number} · ${current.head.slice(0, 8)}${current.head !== pr!.headRefOid || current.base !== pr!.baseRefOid ? " · OLD REVISION" : ""}${current.attempt ? " · SUBMISSION NEEDS VERIFICATION (R)" : ""}`,
+      index: 0,
+      items: [
+        { label: "Edit review summary", detail: current.body || "No summary" },
+        ...current.comments.map((c) => ({
+          label: `${c.path}:${c.line} · ${c.side}`,
+          detail: c.body,
+        })),
+        {
+          label: "Discard draft and start on the current PR",
+          detail: "Removes local comments and summary after confirmation",
+        },
+      ],
+      values: ["summary", ...current.comments.map((c) => c.id), "discard"],
+    });
+  }
+  async function showReview(): Promise<void> {
+    if (reviewBusy) return;
+    const current = reviewDraft(true);
+    if (current.attempt) {
+      reviewBusy = true;
+      setStatus("Checking the previous submission on GitHub…");
+      try {
+        const found = await comments.findSubmission(
+          pr!,
+          current.attempt.token,
+          remoteAbort.signal,
+        );
+        if (stopped) return;
+        if (found) {
+          draft = await draftStore!.update(current, (d) =>
+            Object.assign(d, emptyReviewDraft(pr!), { attempt: undefined }),
+          );
+          setStatus(`Review already submitted · ${found.html_url}`);
+        } else
+          openMenu({
+            kind: "review-recovery",
+            title: "PREVIOUS SUBMISSION OUTCOME UNKNOWN",
+            subtitle:
+              "Check the PR on GitHub before unlocking; retrying could duplicate a review.",
+            index: 0,
+            items: [
+              { label: "Keep protected draft and close" },
+              {
+                label: "I checked GitHub: this review was not posted",
+                detail: "Unlock local draft for an explicit retry",
+              },
+            ],
+            values: ["cancel", "unlock"],
+          });
+      } finally {
+        reviewBusy = false;
+      }
+      return;
+    }
+    openMenu({
+      kind: "review",
+      title: "SUBMIT GITHUB REVIEW",
+      subtitle: `PR #${pr!.number} · ${current.comments.length} local comments · ${current.head.slice(0, 8)}`,
+      index: 0,
+      items: [
+        { label: "Edit review summary", detail: current.body || "No summary" },
+        { label: "Comment", detail: "Submit comments and summary" },
+        {
+          label: "Approve",
+          detail: "Approve this PR revision with your drafted comments",
+        },
+        { label: "Request changes", detail: "Requires a review summary" },
+      ],
+      values: ["summary", "COMMENT", "APPROVE", "REQUEST_CHANGES"],
+    });
+  }
+  async function chooseReviewAction(
+    current: ActionMenu,
+    index: number,
+  ): Promise<void> {
+    if (reviewBusy) return;
+    const action = current.values?.[index];
+    if (!action) return;
+    if (current.kind === "review-recovery") {
+      if (action === "unlock") {
+        const saved = reviewDraft();
+        draft = await draftStore!.update(saved, (d) => {
+          delete d.attempt;
+        });
+        setStatus("Draft unlocked · R to prepare a new submission");
+      }
+      closeMenu();
+      return;
+    }
+    if (current.kind === "review-confirm") {
+      closeMenu();
+      if (action === "discard") {
+        const saved = editableDraft();
+        draft = await draftStore!.update(saved, (d) =>
+          Object.assign(d, emptyReviewDraft(pr!), { attempt: undefined }),
+        );
+        setStatus("Local review draft discarded");
+      } else if (action === "send" && current.reviewEvent && current.reviewPr)
+        await submitReview(
+          current.reviewEvent,
+          current.reviewPr,
+          current.draftRevision!,
+        );
+      return;
+    }
+    const saved = editableDraft();
+    if (action === "summary") {
+      composeReview("review-body", saved);
+      return;
+    }
+    if (action === "discard" || current.kind === "review") {
+      const event =
+        current.kind === "review" ? (action as ReviewEvent) : undefined;
+      openMenu({
+        kind: "review-confirm",
+        title: event
+          ? `CONFIRM ${event.replaceAll("_", " ")}`
+          : "DISCARD LOCAL DRAFT?",
+        subtitle: event
+          ? `PR #${pr!.number} · ${saved.head.slice(0, 8)} · ${saved.comments.length} comments · ${saved.body || "No summary"}`
+          : "Local comments and summary will be removed. GitHub is unchanged.",
+        index: 0,
+        reviewEvent: event,
+        reviewPr: pr,
+        draftRevision: saved.revision,
+        items: [
+          { label: "Cancel" },
+          { label: event ? "Send review to GitHub" : "Discard draft" },
+        ],
+        values: ["cancel", event ? "send" : "discard"],
+      });
+    } else if (current.kind === "drafts") {
+      const comment = saved.comments.find((c) => c.id === action);
+      if (!comment) throw new Error("Draft changed; press D to reload it");
+      openMenu({
+        kind: "draft-actions",
+        title: `${comment.path}:${comment.line} · ${comment.side}`,
+        subtitle: comment.body,
+        index: 0,
+        commentId: comment.id,
+        items: [{ label: "Edit comment" }, { label: "Delete local comment" }],
+        values: ["edit", "delete"],
+      });
+    } else if (current.kind === "draft-actions") {
+      const comment = saved.comments.find((c) => c.id === current.commentId);
+      if (!comment) throw new Error("Draft changed; press D to reload it");
+      if (action === "edit") composeReview("comment", saved, { ...comment });
+      else {
+        draft = await draftStore!.update(saved, (d) => {
+          d.comments = d.comments.filter((c) => c.id !== comment.id);
+        });
+        showDrafts();
+      }
+    }
+  }
+  async function saveComposer(
+    kind: "comment" | "review-body",
+    body: string,
+  ): Promise<void> {
+    const captured = composerDraft;
+    const target = commentTarget;
+    if (!captured || !draftStore)
+      throw new Error("Review composer lost its draft identity");
+    if (kind === "comment" && !body.trim())
+      throw new Error("Empty comment was not saved");
+    draft = await draftStore.update(captured, (d) => {
+      if (d.attempt)
+        throw new Error(
+          "Cannot edit a draft while submission needs verification",
+        );
+      d.head = captured.head;
+      d.base = captured.base;
+      if (kind === "review-body") d.body = body;
+      else {
+        d.comments = d.comments.filter((c) => c.id !== target!.id);
+        d.comments.push({ ...target!, body });
+      }
+    });
+    setStatus(
+      `Saved local review draft · ${draft.comments.length} comments · D Edit · R Submit`,
+    );
+  }
+  async function submitReview(
+    event: ReviewEvent,
+    capturedPr: PullRequest,
+    revision: string,
+  ): Promise<void> {
+    if (reviewBusy) return;
+    const saved = reviewDraft();
+    if (saved.attempt)
+      throw new Error("Previous submission needs verification · press R");
+    if (
+      saved.revision !== revision ||
+      pr?.headRefOid !== capturedPr.headRefOid ||
+      pr?.baseRefOid !== capturedPr.baseRefOid
+    )
+      throw new Error(
+        "PR or draft changed after confirmation; press R to inspect and confirm again",
+      );
+    reviewBusy = true;
+    setStatus("Validating PR revision and submitting review…");
+    try {
+      const token = randomUUID();
+      const result = await comments.submit(
+        capturedPr,
+        saved,
+        event,
+        token,
+        remoteAbort.signal,
+        async () => {
+          if (stopped) throw new Error("Review closed");
+          draft = await draftStore!.update(saved, (d) => {
+            d.head = saved.head;
+            d.base = saved.base;
+            d.attempt = { token, event };
+          });
+        },
+      );
+      // Persist completion even when Quit follows a successful response.
+      draft = await draftStore!.update(draft!, (d) =>
+        Object.assign(d, emptyReviewDraft(capturedPr), { attempt: undefined }),
+      );
+      setStatus(`Review submitted · ${result.html_url}`);
+    } catch (cause) {
+      if (draft?.attempt)
+        throw new Error(
+          `${message(cause)} · Draft kept; R verifies the outcome before any retry`,
+          { cause },
+        );
+      throw cause;
+    } finally {
+      reviewBusy = false;
+    }
+  }
   function onKey(text: string, keypress: readline.Key): void {
     if (stopped) return;
     scrollbarDrag = undefined;
@@ -1730,6 +2213,36 @@ export async function liveReview(options: LiveOptions): Promise<void> {
       return;
     }
     if (prompt) {
+      if (composerSaving) return;
+      if (
+        name === "return" &&
+        (prompt === "comment" || prompt === "review-body")
+      ) {
+        const kind = prompt,
+          value = input;
+        composerSaving = true;
+        void saveComposer(kind, value)
+          .then(() => {
+            prompt = undefined;
+            input = "";
+          })
+          .catch((cause) => {
+            composerError = message(cause);
+          })
+          .finally(() => {
+            composerSaving = false;
+            render();
+          });
+        return;
+      }
+      if (
+        (prompt === "comment" || prompt === "review-body") &&
+        (name === "enter" || (keypress.ctrl && name === "j"))
+      ) {
+        if (input.length < 60000) input += "\n";
+        render();
+        return;
+      }
       if (name === "tab" && prompt === "search") {
         const scopes: ReviewSearchScope[] = [
           "diff",
@@ -1794,7 +2307,8 @@ export async function liveReview(options: LiveOptions): Promise<void> {
         }
       } else if (name === "backspace")
         input = Array.from(input).slice(0, -1).join("");
-      else if (text && !keypress.ctrl && !keypress.meta) input += visible(text);
+      else if (text && !keypress.ctrl && !keypress.meta && input.length < 60000)
+        input += visible(text);
       render();
       return;
     }
@@ -1872,6 +2386,22 @@ export async function liveReview(options: LiveOptions): Promise<void> {
     }
     if (text === "T") {
       toggleFilterMenu();
+      return;
+    }
+    if (text === "i" && !keypress.ctrl && !keypress.meta) {
+      void beginInlineComment().catch(error);
+      return;
+    }
+    if (text === "D" && !keypress.ctrl && !keypress.meta) {
+      try {
+        showDrafts();
+      } catch (cause) {
+        error(cause);
+      }
+      return;
+    }
+    if (text === "R" && !keypress.ctrl && !keypress.meta) {
+      void showReview().catch(error);
       return;
     }
     if (name === "escape") {
@@ -2048,7 +2578,7 @@ export async function liveReview(options: LiveOptions): Promise<void> {
     }
     if (text === "f") {
       if (!state || !comparison) return;
-      if (compareBusy || patchBusy) {
+      if (!frozen && (compareBusy || patchBusy)) {
         setStatus(
           "Wait for the displayed comparison to finish loading, then freeze",
         );
@@ -2084,6 +2614,12 @@ export async function liveReview(options: LiveOptions): Promise<void> {
       return;
     }
     if (text === "w") {
+      if (options.remote) {
+        setStatus(
+          "Remote PR review has no working tree · p shows the PR · o opens a captured file",
+        );
+        return;
+      }
       navigationVersion++;
       rememberViewed();
       clearTextSelection();
@@ -2167,10 +2703,16 @@ export async function liveReview(options: LiveOptions): Promise<void> {
         editor.unref();
       };
       if (text === "O")
-        void git
-          .request("identity")
-          .then(() => open(path.join(options.root, file.path)))
-          .catch(error);
+        if (options.remote) {
+          setStatus(
+            "Remote PR review has no checkout · use o to open the captured Git version",
+          );
+          return;
+        } else
+          void git
+            .request("identity")
+            .then(() => open(path.join(options.root, file.path)))
+            .catch(error);
       else
         void git
           .request<string>("editor", {
@@ -2291,6 +2833,7 @@ export async function liveReview(options: LiveOptions): Promise<void> {
     if (stopped) return;
     rememberViewed();
     stopped = true;
+    preview.close();
     remoteAbort.abort();
     agentAbort.abort();
     resolveExit();
@@ -2303,6 +2846,7 @@ export async function liveReview(options: LiveOptions): Promise<void> {
   const disarmCrashGuard = installTerminalCrashGuard({
     restoreTerminalSettings,
     getWorkerPid: () => git.pid,
+    getPreviewPid: () => preview.pid,
   });
   try {
     readline.emitKeypressEvents(inputEvents.keys);
@@ -2335,6 +2879,7 @@ export async function liveReview(options: LiveOptions): Promise<void> {
     await done;
   } finally {
     stopped = true;
+    preview.close();
     remoteAbort.abort();
     clearTimeout(renderTimer);
     clearInterval(remoteTimer);
@@ -2352,7 +2897,7 @@ export async function liveReview(options: LiveOptions): Promise<void> {
       );
     });
     try {
-      watcher.close();
+      watcher?.close();
       await Promise.all([git.close(state?.gitDir), restored]);
     } finally {
       await releaseInput();

@@ -4,6 +4,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { spawnSync } from "node:child_process";
 import {
   canonical,
+  now,
   writeJson,
   readJson,
   object,
@@ -41,6 +42,7 @@ export interface LiveState {
   commonDir: string;
   directories: string[];
   signature: string;
+  remote?: { head: string; base: string };
 }
 export interface Comparison {
   label: string;
@@ -112,10 +114,17 @@ export class LiveRepository {
     private readonly options: {
       temporaryRoot?: string;
       freezeId?: string;
+      remote?: number;
     } = {},
   ) {
     this.freezeRef = `refs/rl/live-freeze/${options.freezeId ?? randomUUID()}`;
-    reviewRoot(root, repository);
+    if (options.remote) {
+      if (
+        canonical(root) !== canonical(repository) ||
+        reviewGit(root, ["rev-parse", "--is-bare-repository"]).trim() !== "true"
+      )
+        throw new Error("Remote review requires its isolated bare Git cache");
+    } else reviewRoot(root, repository);
     this.identity = canonical(
       reviewGit(root, ["rev-parse", "--absolute-git-dir"]).trim(),
     );
@@ -125,9 +134,10 @@ export class LiveRepository {
       canonical(
         reviewGit(this.root, ["rev-parse", "--absolute-git-dir"]).trim(),
       ) !== this.identity ||
-      canonical(
-        reviewGit(this.root, ["rev-parse", "--show-toplevel"]).trim(),
-      ) !== canonical(this.root)
+      (!this.options.remote &&
+        canonical(
+          reviewGit(this.root, ["rev-parse", "--show-toplevel"]).trim(),
+        ) !== canonical(this.root))
     )
       throw new Error(
         "Worktree identity changed or was removed; reopen review explicitly",
@@ -167,6 +177,11 @@ export class LiveRepository {
     this.pinned.clear();
   }
   refresh(force = false): LiveState {
+    if (this.options.remote)
+      return this.remoteState(
+        revision(this.root, `refs/rl/live-pr/${this.options.remote}/head`),
+        revision(this.root, `refs/rl/live-pr/${this.options.remote}/base`),
+      );
     const gitDir = reviewGit(this.root, [
       "rev-parse",
       "--absolute-git-dir",
@@ -279,6 +294,44 @@ export class LiveRepository {
     );
     return (this.last = state);
   }
+  remoteState(headRef: string, baseRef: string): LiveState {
+    if (!this.options.remote)
+      throw new Error("Remote state requires a remote review cache");
+    this.assertIdentity();
+    const head = revision(this.root, headRef),
+      base = revision(this.root, baseRef);
+    const signature = hash(`${head}:${base}`);
+    if (this.last?.signature === signature) return this.last;
+    const tree = reviewGit(this.root, ["rev-parse", `${head}^{tree}`]).trim(),
+      empty = this.emptyTree();
+    const snapshot: Snapshot = {
+      id: randomUUID(),
+      at: now(),
+      head,
+      branch: `pr/${this.options.remote}`,
+      headTree: tree,
+      indexTree: tree,
+      worktreeTree: tree,
+      stages: [empty, empty, empty],
+      indexHash: hash(tree),
+      fingerprint: hash(`${head}:${tree}`),
+      stable: true,
+      complete: true,
+      excluded: [],
+      untracked: [],
+      conflicts: [],
+    };
+    return (this.last = {
+      snapshot,
+      signature,
+      remote: { head, base },
+      gitDir: this.identity,
+      commonDir: this.identity,
+      directories: [],
+      workingFiles: [],
+      commits: this.history(head, base),
+    });
+  }
   history(head: string, base?: string): Commit[] {
     const headOid = revision(this.root, head),
       baseOid = base ? revision(this.root, base) : undefined;
@@ -371,6 +424,10 @@ export class LiveRepository {
     const s = state.snapshot;
     switch (mode.kind) {
       case "working":
+        if (this.options.remote)
+          throw new Error(
+            "Remote PR review has no working tree; press p for the PR comparison",
+          );
         return {
           label: `HEAD ${s.head.slice(0, 8) || "(unborn)"} → working tree · separate index / source layers`,
           target: s.worktreeTree,
@@ -396,8 +453,15 @@ export class LiveRepository {
         };
       }
       case "range": {
-        const from = revision(this.root, mode.from),
-          to = revision(this.root, mode.to);
+        const resolve = (ref: string) => {
+          if (state.remote && /^(?:HEAD|BASE)(?:[~^]\d*)*$/.test(ref))
+            ref = ref.replace(/^(HEAD|BASE)/, (name) =>
+              name === "HEAD" ? state.remote!.head : state.remote!.base,
+            );
+          return revision(this.root, ref);
+        };
+        const from = resolve(mode.from),
+          to = resolve(mode.to);
         return {
           label: `Range ${mode.from} (${from.slice(0, 8)}) → ${mode.to} (${to.slice(0, 8)})`,
           target: to,
@@ -442,12 +506,18 @@ export class LiveRepository {
             rewritten = true;
           }
         return {
-          label: `Reviewed ${p.label} → current source${rewritten ? " · history rewritten; exact saved trees retained" : ""}`,
-          target: s.worktreeTree,
-          scopes: [
-            { name: "source since review", from: p.tree, to: s.worktreeTree },
-            { name: "index since review", from: p.index, to: s.indexTree },
-          ],
+          label: `Reviewed ${p.label} → ${this.options.remote ? "PR HEAD" : "current source"}${rewritten ? " · history rewritten; exact saved trees retained" : ""}`,
+          target: this.options.remote ? s.head : s.worktreeTree,
+          scopes: this.options.remote
+            ? [{ name: "PR since review", from: p.tree, to: s.headTree }]
+            : [
+                {
+                  name: "source since review",
+                  from: p.tree,
+                  to: s.worktreeTree,
+                },
+                { name: "index since review", from: p.index, to: s.indexTree },
+              ],
         };
       }
     }

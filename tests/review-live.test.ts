@@ -288,7 +288,7 @@ test("CLI revision ranges use the active worktree; explicit PR discovery uses gh
     ["committed.txt"],
   );
   const offline = JSON.parse(
-    w.rl(["review", "--pr", "99", "--json"], { cwd: w.a }).stdout,
+    w.rl(["review", "--pr", "99", "--local", "--json"], { cwd: w.a }).stdout,
   );
   assert.match(offline.warning, /offline/);
   assert.equal(offline.files[0].path, "local.txt");
@@ -314,7 +314,7 @@ test("CLI revision ranges use the active worktree; explicit PR discovery uses gh
   const before = w.git(w.a, "status", "--porcelain"),
     index = fs.readFileSync(w.git(w.a, "rev-parse", "--git-path", "index"));
   const pr = JSON.parse(
-    w.rl(["review", "--pr", "99", "--json"], { cwd: w.a }).stdout,
+    w.rl(["review", "--pr", "99", "--local", "--json"], { cwd: w.a }).stdout,
   );
   assert.equal(pr.pr.number, 99);
   assert.equal(pr.comparison.target, head);
@@ -371,7 +371,7 @@ test("explicit PR downloads use private refs and preserve the worktree, index, F
   const fetchHead = w.git(w.a, "rev-parse", "--git-path", "FETCH_HEAD");
   write(fetchHead, "keep this fetch record\n");
   const result = JSON.parse(
-    w.rl(["review", "--pr", "88", "--json"], { cwd: w.a }).stdout,
+    w.rl(["review", "--pr", "88", "--local", "--json"], { cwd: w.a }).stdout,
   );
   assert.equal(result.comparison.target, head);
   assert.equal(result.files[0].path, "remote-feature.txt");

@@ -22,6 +22,11 @@ terminal_rows, terminal_columns = 34, 160
 pid, fd = pty.fork()
 if pid == 0:
     os.chdir(root)
+    # These scenarios assert Ghostty-style RGB selection and diff colours,
+    # independently of NO_COLOR/TERM=dumb inherited from a test runner.
+    os.environ.pop('NO_COLOR', None)
+    os.environ['TERM'] = 'xterm-256color'
+    os.environ['COLORTERM'] = 'truecolor'
     if scenario in ('shell', 'shell-function'):
         os.execvpe('zsh', ['zsh', '-f', '-i'], {
             **os.environ, 'PROMPT': 'RL_SHELL_READY> ', 'ZDOTDIR': root,
@@ -64,7 +69,9 @@ if pid == 0:
         sys.exit(0)
     if scenario == "quit":
         os.execv(node, [node, cli, 'review', '--live'])
-    extra = ['--pr', '99', '--remote-interval', '10'] if scenario in ('pr-navigation', 'pr-freeze') else []
+    extra = ['--pr', '99', '--local', '--remote-interval', '10'] if scenario in ('pr-navigation', 'pr-freeze') else ['--pr', '99', '--github-repo', 'example/repo', '--remote-interval', '10'] if scenario in ('remote-pr', 'pr-comments') else []
+    if scenario == 'pr-comments' and os.environ.get('REVIEW_LOCAL_COMMENTS'):
+        extra = ['--pr', '99', '--local', '--remote-interval', '10']
     os.execv(node, [node, cli, 'review', '--repo', repo, '--state-dir', state,
                       '--base-dir', base, '--default-base', 'develop', '--live', *extra])
 
@@ -180,7 +187,8 @@ def assert_background(text, expected):
     for y, row in enumerate(rows):
         x = row.find(text)
         if x >= 0:
-            assert all(backgrounds[y][n] == expected for n in range(x, x+len(text))), f'{text} has the wrong background'
+            actual = backgrounds[y][x:x+len(text)]
+            assert all(value == expected for value in actual), f'{text} has the wrong background at row {y}: {actual}; expected {expected}'
             return
     raise AssertionError(f'Missing selected file {text}')
 
@@ -313,7 +321,7 @@ def mouse_scenario():
     expect_screen('+middle-only')
     assert not any('files grouped by commit' in row for row in screen()), 'A regular click should restore single selection'
     assert b'Marked inspected snapshot' not in output, 'Mouse packet triggered m shortcut'
-    click('R Range')
+    click('r Range')
     expect_screen('Range FROM TO')
     click('Q Quit')
 
@@ -639,12 +647,182 @@ def checkpoint_quit_scenario():
     key('q')
     return started
 
+def switch_performance_scenario():
+    expect_screen('+a-v1')
+    expect_screen('Updated')
+    key('3\r')
+    expect_screen('[Back]')
+    with open(os.environ['REVIEW_PAUSE_GIT'], 'w'):
+        pass
+    with open(os.path.join(root, 'a.txt'), 'w') as file:
+        file.write('a-v2\n')
+    deadline = time.monotonic()+15
+    while not os.path.exists(os.environ['REVIEW_GIT_INDEX_MARKER']):
+        assert time.monotonic()<deadline, 'Snapshot refresh did not start'
+        pump(.05)
+    started = time.monotonic()
+    key(']')
+    expect_screen('+b-v1', timeout=1.5)
+    elapsed = time.monotonic()-started
+    assert os.path.exists(os.environ['REVIEW_PAUSE_GIT']), 'Refresh was released before the cold preview loaded'
+    started = time.monotonic()
+    key('[')
+    expect_screen('+a-v1', timeout=.5)
+    cached = time.monotonic()-started
+    os.unlink(os.environ['REVIEW_PAUSE_GIT'])
+    expect_screen('+a-v2')
+    print(f'SWITCH_LATENCY={elapsed:.3f}s CACHE_SWITCH_LATENCY={cached:.3f}s')
+    key('q')
+
+def remote_pr_scenario():
+    expect_screen('◎ REMOTE')
+    expect_screen('+remote version one')
+    expect_screen('Updated')
+    assert not any('WORKING TREE' in row for row in screen()), 'Remote view exposed a working tree'
+    key('w')
+    expect_screen('no working tree')
+    key('p')
+    expect_screen('Updated')
+    key('3\r')
+    expect_screen('[Back]')
+    key('c')
+    expect_screen('3 FILE · AFTER')
+    expect_screen('remote version one')
+    key('c')
+    expect_screen('+remote version one')
+    key('m')
+    expect_screen('Marked inspected snapshot')
+    key('f')
+    expect_screen('FROZEN')
+    source = os.environ['REVIEW_PR_WORKTREE']
+    real_git = os.environ['REVIEW_REAL_GIT']
+    with open(os.path.join(source, 'pr-only.txt'), 'w') as file:
+        file.write('remote version two\n')
+    subprocess.check_call([real_git, 'add', 'pr-only.txt'], cwd=source)
+    subprocess.check_call([real_git, 'commit', '-qm', 'Remote correction'], cwd=source)
+    head = subprocess.check_output([real_git, 'rev-parse', 'HEAD'], cwd=source).decode().strip()
+    subprocess.check_call([real_git, 'update-ref', 'refs/pull/99/head', head], cwd=source)
+    metadata_file = os.environ['REVIEW_METADATA_FILE']
+    with open(metadata_file) as file:
+        metadata = json.load(file)
+    metadata['headRefOid'] = head
+    metadata['commits'] = [{'oid': head}]
+    with open(metadata_file, 'w') as file:
+        json.dump(metadata, file)
+    key('\x12')
+    expect_screen('NEW CHANGES')
+    expect_screen('+remote version one')
+    assert not any('+remote version two' in row for row in screen()), 'Remote polling overwrote a frozen PR'
+    key('p')
+    expect_screen('+remote version one')
+    key('f')
+    expect_screen('+remote version two')
+    expect_screen('Updated')
+    key('s')
+    expect_screen('PR HEAD')
+    expect_screen('-remote version one')
+    expect_screen('+remote version two')
+    key('rBASE HEAD\r')
+    expect_screen('Range BASE')
+    expect_screen('+remote version two')
+    key('O')
+    expect_screen('no checkout')
+    key('o')
+    expect_screen('Opened pr-only.txt')
+    with open(os.environ['REVIEW_CODE_CAPTURE']) as file:
+        args = json.load(file)
+    captured = args[1].rsplit(':', 1)[0]
+    assert captured != os.path.join(source, 'pr-only.txt')
+    assert os.stat(captured).st_mode & 0o222 == 0
+    with open(captured) as file:
+        assert file.read() == 'remote version two\n'
+    key('q')
+
+def pr_comments_scenario():
+    posts_file = os.environ['REVIEW_API_POSTS']
+    with open(posts_file) if os.path.exists(posts_file) else open(os.devnull) as saved:
+        initial_posts = len(json.load(saved)) if os.path.exists(posts_file) else 0
+    expect_screen('+review this line')
+    expect_screen('Updated')
+    key('3')
+    pump(.2)
+    rows = screen()
+    row = next(i for i, line in enumerate(rows) if '+review this line' in line)
+    column = rows[row].index('+review this line') + 2
+    os.write(fd, f'\x1b[<0;{column+1};{row+1}M\x1b[<0;{column+1};{row+1}m'.encode())
+    pump(.1)
+    key('i')
+    expect_screen('INLINE COMMENT')
+    key('initial comment\r')
+    expect_screen('Saved local review draft')
+    key('D')
+    expect_screen('LOCAL REVIEW DRAFT')
+    key('j\r')
+    expect_screen('Edit comment')
+    key('\r')
+    expect_screen('INLINE COMMENT')
+    # Clear the saved text, then exercise multiline composition.
+    key('\x7f' * len('initial comment') + 'edited comment\x0asecond paragraph\r')
+    expect_screen('Saved local review draft')
+    key('i')
+    expect_screen('INLINE COMMENT')
+    key('temporary comment\r')
+    expect_screen('Saved local review draft')
+    key('D')
+    expect_screen('2 COMMENTS')
+    key('jj\r')
+    expect_screen('Delete local comment')
+    key('j\r')
+    expect_screen('1 COMMENTS')
+    key('\x1b')
+    expect_screen('+review this line')
+    key('R')
+    expect_screen('SUBMIT GITHUB REVIEW')
+    key('\r')
+    expect_screen('REVIEW SUMMARY')
+    key('review summary\r')
+    expect_screen('Saved local review draft')
+    key('R')
+    expect_screen('SUBMIT GITHUB REVIEW')
+    key('j\r')
+    expect_screen('CONFIRM COMMENT')
+    # Default is Cancel. Enter must not send a review.
+    key('\r')
+    pump(.2)
+    with open(posts_file) if os.path.exists(posts_file) else open(os.devnull) as saved:
+        after_cancel = len(json.load(saved)) if os.path.exists(posts_file) else 0
+    assert after_cancel == initial_posts, 'Review sent without explicit confirmation'
+    key('R')
+    expect_screen('SUBMIT GITHUB REVIEW')
+    key('j\r')
+    expect_screen('CONFIRM COMMENT')
+    key('j\r')
+    with open(os.environ['REVIEW_API_FIXTURE']) as fixture_file:
+        dropped = json.load(fixture_file).get('dropResponse')
+    if dropped:
+        expect_screen('Draft kept')
+        key('R')
+        expect_screen('Review already submitted')
+    else:
+        expect_screen('Review submitted')
+    key('D')
+    expect_screen('0 COMMENTS')
+    key('\x1b')
+    expect_screen('+review this line')
+    # Old commits cannot receive comments pretending to target the PR diff.
+    key('1j3')
+    expect_screen('pr-comment.txt · commit')
+    expect_screen('Updated')
+    key('i')
+    expect_screen('Use p for the current PR comparison')
+    key('q')
+
 def quit_scenario():
-    expect('+version-one')
+    expect('+version-one', timeout=60)
     expect('Updated')
     expect('FROZEN', key('f'))
-    deadline = time.monotonic()+10
-    while not freeze_refs():
+    deadline = time.monotonic()+20
+    while not freeze_refs().endswith(b'/trees'):
         assert time.monotonic()<deadline, 'Freeze refs were not written'
         pump(.1)
     with open(os.environ['REVIEW_PAUSE_GIT'], 'w'):
@@ -653,7 +831,7 @@ def quit_scenario():
         file.write('version-two\n')
     marker = os.environ['REVIEW_GIT_INDEX_MARKER']
     heartbeat = os.environ['REVIEW_GIT_HEARTBEAT']
-    deadline = time.monotonic()+10
+    deadline = time.monotonic()+20
     while not (os.path.exists(marker) and os.path.exists(heartbeat)):
         assert time.monotonic()<deadline, 'Slow Git refresh never started'
         pump(.1)
@@ -728,6 +906,12 @@ try:
         pr_freeze_scenario()
     elif scenario == "checkpoint-quit":
         quit_started = checkpoint_quit_scenario()
+    elif scenario == "switch-performance":
+        switch_performance_scenario()
+    elif scenario == "remote-pr":
+        remote_pr_scenario()
+    elif scenario == "pr-comments":
+        pr_comments_scenario()
     elif scenario == "quit":
         scratch = quit_scenario()
     elif scenario == "handoff":

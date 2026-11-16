@@ -125,7 +125,7 @@ test("protected path policy blocks credentials and metadata while allowing gener
 
 test("Zod schemas preserve forward-compatible fields, clean JSON schemas, and validate reasoning/defaults", () => {
   const parsedInstance = InstanceDiskSchema.parse({
-    schemaVersion: 2,
+    schemaVersion: 1,
     id: "feature/demo",
     key: "demo-1234",
     repository: "/repo",

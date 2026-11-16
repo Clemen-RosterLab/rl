@@ -229,7 +229,7 @@ export async function locked<T>(
     realpath: false,
     lockfilePath: path.join(directory, name),
     stale: 120000,
-    retries: { retries: 300, factor: 1, minTimeout: 25, maxTimeout: 100 },
+    retries: { retries: 1200, factor: 1, minTimeout: 25, maxTimeout: 100 },
   });
   try {
     return await action();

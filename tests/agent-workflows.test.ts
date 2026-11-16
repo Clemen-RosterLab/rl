@@ -37,6 +37,10 @@ const initialize = {
 function setup(t: TestContext) {
   const w = new Workspace(t);
   w.rl(["workflow", "init"], { cwd: w.a });
+  const policyFile = path.join(w.a, ".rl/policies.json");
+  const policies = readJson(policyFile);
+  policies.policies.review.blockRequired = true;
+  write(policyFile, JSON.stringify(policies));
   // Explicit legacy definitions keep exercising the generic DAG engine after
   // the out-of-box preset changes to the collaborative writer/reviewer/DRY team.
   const profilesFile = path.join(w.a, ".rl/agents.json");
