@@ -13,6 +13,10 @@ export interface UserConfigValues {
   defaultBase?: string;
   stateDir?: string;
   repo?: string;
+  cloudProject?: string;
+  cloudZone?: string;
+  cloudTemplate?: string;
+  cloudVm?: string;
 }
 
 export interface ResolvedCliEnvironment {
@@ -37,6 +41,14 @@ const KEY_MAP: Readonly<Record<string, keyof UserConfigValues>> = {
   RL_STATE_DIR: "stateDir",
   repo: "repo",
   RL_REPO: "repo",
+  cloudProject: "cloudProject",
+  RL_CLOUD_PROJECT: "cloudProject",
+  cloudZone: "cloudZone",
+  RL_CLOUD_ZONE: "cloudZone",
+  cloudTemplate: "cloudTemplate",
+  RL_CLOUD_TEMPLATE: "cloudTemplate",
+  cloudVm: "cloudVm",
+  RL_CLOUD_VM: "cloudVm",
 };
 
 const PATH_KEYS = new Set<keyof UserConfigValues>([
