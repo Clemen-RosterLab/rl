@@ -33,11 +33,6 @@ Use `--agent claude` or `--agent agy` for another agent.
 Run `rl` to pick a workspace, `rl switch -` to return to the previous one, or
 `rl resume` to continue a saved agent conversation.
 
-> **Screenshot:** Add your workspace picker here.
-
-<!-- Replace the placeholder above with this image after adding the file:
-![RL workspace picker](docs/images/workspaces.png)
--->
 
 ## Live review
 
@@ -49,26 +44,11 @@ rl review
 rl review --pr https://github.com/owner/repo/pull/123
 ```
 
-> **Screenshot:** Add your live review interface here.
-
-<!-- Replace the placeholder above with this image after adding the file:
-![RL live review with file navigation and coloured diffs](docs/images/review.png)
--->
-
 ## Agent workflows
 
 Your main agent coordinates research, implementation, and independent review
 using its native subagents. Follow each role's reported progress and blockers:
 
-```sh
-rl workflow status --watch
-```
-
-> **Screenshot:** Add your agent status view here.
-
-<!-- Replace the placeholder above with this image after adding the file:
-![RL agent workflow status](docs/images/agents.png)
--->
 
 ## Customize and learn more
 
