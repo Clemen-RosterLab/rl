@@ -269,6 +269,27 @@ export async function runPublicCli(rawArgv: string[]): Promise<number> {
       initialCwd,
     );
 
+    if (command === "cloud") {
+      const { main: cloudMain } = await import("./cloud.js");
+      return await cloudMain(rest, {
+        stateDir: envSettings.stateDir,
+        worktreeDir: envSettings.worktreeDir,
+        selectedRepo: explicitRepo,
+      });
+    }
+
+    if (
+      command === "review" &&
+      optionsBeforeSeparator(rest).includes("--cloud")
+    ) {
+      const { runCloudReview } = await import("./cloud.js");
+      return await runCloudReview(rest, {
+        stateDir: envSettings.stateDir,
+        worktreeDir: envSettings.worktreeDir,
+        selectedRepo: explicitRepo,
+      });
+    }
+
     const repoSettings: RepoSettings = {
       stateDir: envSettings.stateDir,
       baseDir: envSettings.worktreeDir,
@@ -355,6 +376,46 @@ export async function runPublicCli(rawArgv: string[]): Promise<number> {
         writeWorkspaceOutput(selected[0].path);
       }
       return 0;
+    }
+
+    if (command === "--cloud" || command === "--include-cloud") {
+      const { parseArgs } = await import("node:util");
+      const parsedPicker = parseArgs({
+        args,
+        options: {
+          cloud: { type: "boolean" },
+          "include-cloud": { type: "boolean" },
+          vm: { type: "string" },
+        },
+        allowPositionals: false,
+        strict: true,
+      });
+      if (parsedPicker.values.cloud && parsedPicker.values["include-cloud"]) {
+        throw new UsageError("Choose either --cloud or --include-cloud");
+      }
+      const { pickWorkspaceWithCloud } = await import("./cloud.js");
+      if (parsedPicker.values.cloud) {
+        const store = new Store(repoRoot, envSettings.stateDir);
+        return await pickWorkspaceWithCloud({
+          store,
+          localCandidates: [],
+          defaultBase,
+          stateDir: envSettings.stateDir,
+          worktreeDir: envSettings.worktreeDir,
+          cloudOnly: true,
+          vm: parsedPicker.values.vm,
+        });
+      }
+      const store = new Store(repoRoot, envSettings.stateDir);
+      return await pickWorkspaceWithCloud({
+        store,
+        localCandidates: candidates(store.repo, canonical(managedDir), store),
+        defaultBase,
+        stateDir: envSettings.stateDir,
+        worktreeDir: envSettings.worktreeDir,
+        cloudOnly: false,
+        vm: parsedPicker.values.vm,
+      });
     }
 
     switch (command) {

@@ -417,7 +417,7 @@ class Registry {
   }
 }
 
-interface OverviewRow extends Checkout {
+export interface OverviewRow extends Checkout {
   id: string;
   key: string | null;
   repository: string;
@@ -551,7 +551,7 @@ async function repositoryRows(
   };
 }
 
-function renderOverviewTable(rows: OverviewRow[]): void {
+export function renderOverviewTable(rows: OverviewRow[]): void {
   const hasAgy = rows.some((row) => row.sessions?.agy?.length);
   const table: string[][] = [
     [
@@ -780,9 +780,22 @@ export async function main(argv: string[]): Promise<number> {
       "worktree-name",
       "alias",
       "output-path",
+      "vm",
     ],
-    ["all", "list", "json", "fetch", "include-deleted"],
+    [
+      "all",
+      "list",
+      "json",
+      "fetch",
+      "include-deleted",
+      "cloud",
+      "include-cloud",
+    ],
   );
+
+  if (values.cloud && values["include-cloud"]) {
+    throw new UsageError("Choose either --cloud or --include-cloud");
+  }
 
   const settings: Settings = {
     stateDir: required(values, "state-dir"),
@@ -797,6 +810,51 @@ export async function main(argv: string[]): Promise<number> {
   const [command, ...rest] = positionals;
 
   if (command === "repo") {
+    if (rest[0] === "list" && (values.cloud || values["include-cloud"])) {
+      arity(rest, 1);
+      const { fetchCloudRepositories } = await import("./cloud.js");
+      const cloud = await fetchCloudRepositories({
+        stateDir: settings.stateDir,
+        vm: values.vm as string | undefined,
+      });
+      const localData = values["include-cloud"] ? registry.read() : null;
+      if (values.json) {
+        json(
+          localData
+            ? {
+                local: localData,
+                cloud: {
+                  vm: cloud.vm,
+                  default: cloud.defaultRepo,
+                  repositories: cloud.repositories,
+                },
+              }
+            : {
+                vm: cloud.vm,
+                default: cloud.defaultRepo,
+                repositories: cloud.repositories,
+              },
+        );
+      } else {
+        if (localData) {
+          for (const key of Object.keys(localData.repositories).toSorted()) {
+            const repo = localData.repositories[key]!;
+            const marker = key === localData.default ? "*" : " ";
+            console.log(
+              `${marker} [local] ${key}  ${repo.root}  base=${repo.base}  directory=${repo.worktreeName}`,
+            );
+          }
+        }
+        for (const repo of cloud.repositories) {
+          const marker = repo.isDefault ? "*" : " ";
+          const regTag = repo.registered ? "" : " [unregistered]";
+          console.log(
+            `${marker} [${cloud.vm}] ${repo.name}  ${repo.root}  base=${repo.base}  directory=${repo.worktreeName}${regTag}`,
+          );
+        }
+      }
+      return 0;
+    }
     await registry.manage(rest, values);
     return 0;
   }
@@ -839,6 +897,35 @@ export async function main(argv: string[]): Promise<number> {
     );
   }
 
+  if (values.cloud) {
+    const { fetchCloudOverview } = await import("./cloud.js");
+    const cloud = await fetchCloudOverview({
+      stateDir: settings.stateDir,
+      vm: values.vm as string | undefined,
+      fetch: Boolean(values.fetch),
+      includeDeleted: Boolean(values["include-deleted"]),
+    });
+    if (values.json) {
+      json({
+        vm: cloud.vm,
+        instances: cloud.rows,
+        errors: cloud.errors,
+        fetched: Boolean(values.fetch),
+      });
+    } else {
+      renderOverviewTable(cloud.rows);
+      console.log(
+        "S=staged M=unstaged ?=untracked !=conflicts; +ahead/-behind relative to upstream.",
+      );
+      for (const err of cloud.errors) {
+        console.error(
+          `${sanitizeTerminalText(err.repository)}: ${sanitizeTerminalText(err.message)}`,
+        );
+      }
+    }
+    return cloud.errors.length > 0 ? 1 : 0;
+  }
+
   let repos = values.all
     ? Object.keys(data.repositories)
         .toSorted()
@@ -848,28 +935,50 @@ export async function main(argv: string[]): Promise<number> {
     repos = [registry.legacy()];
   }
 
-  const results = await pooled(repos, 4, (repo) =>
-    repositoryRows(
-      repo,
-      settings,
-      Boolean(values.fetch),
-      Boolean(values["include-deleted"]),
+  const [results, cloudResult] = await Promise.all([
+    pooled(repos, 4, (repo) =>
+      repositoryRows(
+        repo,
+        settings,
+        Boolean(values.fetch),
+        Boolean(values["include-deleted"]),
+      ),
     ),
-  );
+    values["include-cloud"]
+      ? import("./cloud.js").then(({ fetchCloudOverview }) =>
+          fetchCloudOverview({
+            stateDir: settings.stateDir,
+            vm: values.vm as string | undefined,
+            fetch: Boolean(values.fetch),
+            includeDeleted: Boolean(values["include-deleted"]),
+          }),
+        )
+      : Promise.resolve(null),
+  ]);
 
-  const rows = results
-    .flatMap((result) => result.rows)
-    .toSorted((a, b) =>
-      [a.repositoryName, a.id, a.status]
-        .join("\0")
-        .localeCompare([b.repositoryName, b.id, b.status].join("\0")),
-    );
-  const errors = results.flatMap((result) => result.errors);
+  const localRows = results.flatMap((result) => result.rows);
+  const combinedRows = [
+    ...localRows,
+    ...(cloudResult ? cloudResult.rows : []),
+  ].toSorted((a, b) =>
+    [a.repositoryName, a.id, a.status]
+      .join("\0")
+      .localeCompare([b.repositoryName, b.id, b.status].join("\0")),
+  );
+  const errors = [
+    ...results.flatMap((result) => result.errors),
+    ...(cloudResult ? cloudResult.errors : []),
+  ];
 
   if (values.json) {
-    json({ instances: rows, errors, fetched: Boolean(values.fetch) });
+    json({
+      instances: combinedRows,
+      errors,
+      fetched: Boolean(values.fetch),
+      ...(cloudResult ? { cloudVm: cloudResult.vm } : {}),
+    });
   } else {
-    renderOverviewTable(rows);
+    renderOverviewTable(combinedRows);
     console.log(
       "S=staged M=unstaged ?=untracked !=conflicts; +ahead/-behind relative to upstream.",
     );

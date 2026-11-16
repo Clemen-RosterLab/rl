@@ -12,11 +12,11 @@ test("main help lists each command once with details reserved for command help",
     (match) => match[1],
   );
   assert.equal(new Set(names).size, names.length);
-  assert.equal(names.length, 23);
+  assert.equal(names.length, 24);
   assert.ok(output.split("\n").length < 45);
   assert.ok(!output.includes("--") && !output.includes("[--"));
   assert.ok(
-    ["git", "notes", "storage", "agent", "setup"].every((name) =>
+    ["git", "notes", "storage", "agent", "setup", "cloud"].every((name) =>
       names.includes(name),
     ),
   );

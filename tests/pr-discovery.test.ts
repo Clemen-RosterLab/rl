@@ -157,6 +157,7 @@ test("fork branches and truncated results are not misidentified as local PRs or 
   w.managed("task");
   w.env.PR_DATA = JSON.stringify({
     task: [
+      { ...pr("task", "OPEN", 21), headRepository: null },
       pr("task", "OPEN", 20, false, "someone/fork"),
       pr("task", "MERGED", 19),
     ],

@@ -54,6 +54,9 @@ const topics: Record<string, Topic> = {
     usage: "rl list [options]",
     options: [
       "--all                List workspaces across registered repositories",
+      "--cloud              List workspaces on the cloud dev VM",
+      "--include-cloud      Include cloud dev VM workspaces alongside local ones",
+      "--vm <name>          Select a specific cloud VM",
       "--json               Print structured output",
       "--fetch              Refresh remote refs first",
       "--include-deleted    Include archived records",
@@ -121,6 +124,7 @@ const topics: Record<string, Topic> = {
     usage: "rl review [worktree] [action] [options]",
     options: [
       "--all                     Choose a worktree from the review queue",
+      "--cloud                   Review a workspace on the cloud dev VM over SSH",
       "--pr <number|URL>         Review a remote GitHub PR without a checkout",
       "--github-repo <owner/repo> Select a remote repository (optional HOST/ prefix)",
       "--local                   Combine --pr with the current working tree instead",
@@ -763,7 +767,7 @@ const topics: Record<string, Topic> = {
   },
   "repo list": {
     description: "List registered repositories",
-    usage: "rl repo list [--json]",
+    usage: "rl repo list [--cloud | --include-cloud] [--vm <name>] [--json]",
   },
   "repo use": {
     description: "Set the default repository",
@@ -836,6 +840,99 @@ const topics: Record<string, Topic> = {
     description: "Print shell integration",
     usage: "rl setup shell <zsh|bash>",
     examples: ['eval "$(rl setup shell zsh)"'],
+  },
+  cloud: {
+    group: "Workspaces",
+    description: "Browse, connect and sync cloud dev workspaces",
+    usage: "rl cloud [command] [options]",
+    options: [
+      "--vm <name>          Target a specific cloud VM (e.g. dev-example-rl)",
+      "--code               Open the selected cloud workspace in VS Code Remote-SSH",
+      "--agent codex|claude|agy  Start an agent after entering the cloud workspace",
+      "--resume             Resume a saved agent conversation in the cloud workspace",
+    ],
+    notes: [
+      "With no subcommand, opens an interactive picker of cloud repositories and workspaces.",
+      "Picker shortcuts: Enter opens an SSH shell in the remote directory, Alt-O opens VS Code, Alt-R reviews locally, Alt-C checks out locally.",
+      "Configures ~/.ssh/config automatically for IAP tunneling and connection multiplexing.",
+    ],
+    examples: [
+      "rl cloud",
+      "rl cloud repos",
+      "rl cloud list",
+      "rl cloud review",
+      "rl cloud checkout ROS-2484-mobile-slow-load",
+      "rl cloud ssh-config",
+      "rl cloud tunnel 3000",
+    ],
+    related: ["list", "review"],
+  },
+  "cloud open": {
+    description: "Pick or enter a cloud repository or workspace",
+    usage:
+      "rl cloud [open] [selector] [--vm <name>] [--code] [--agent codex|claude|agy] [--resume]",
+  },
+  "cloud repos": {
+    description: "List repositories on the cloud VM",
+    usage: "rl cloud repos [--vm <name>] [--json]",
+  },
+  "cloud list": {
+    description: "List RL workspaces on the cloud VM",
+    usage: "rl cloud list [--vm <name>] [--fetch] [--include-deleted] [--json]",
+  },
+  "cloud code": {
+    description: "Open a cloud repository or workspace in VS Code Remote-SSH",
+    usage: "rl cloud code [selector] [--vm <name>]",
+  },
+  "cloud fetch": {
+    description: "Fetch a branch directly from the cloud VM over SSH",
+    usage: "rl cloud fetch [selector] [--vm <name>] [--remote] [--json]",
+  },
+  "cloud checkout": {
+    description: "Fetch a cloud branch over SSH into a local RL workspace",
+    usage: "rl cloud checkout [selector] [--vm <name>] [--include-uncommitted]",
+  },
+  "cloud review": {
+    description:
+      "Review committed and uncommitted cloud workspace changes locally",
+    usage:
+      "rl cloud review [selector] [--vm <name>] [--diff] [--json] [--remote]",
+  },
+  "cloud ssh-config": {
+    description: "Configure ~/.ssh/config for IAP SSH, Git, scp and VS Code",
+    usage: "rl cloud ssh-config [vm] [--dry-run] [--json]",
+  },
+  "cloud vms": {
+    description: "List shared cloud dev VMs",
+    usage: "rl cloud vms [--json]",
+  },
+  "cloud use": {
+    description: "Set the default cloud dev VM",
+    usage: "rl cloud use [vm]",
+  },
+  "cloud ssh": {
+    description: "Connect to a cloud VM or run a remote command",
+    usage: "rl cloud ssh [vm] [-- <command...>]",
+  },
+  "cloud tunnel": {
+    description: "Forward a web port from a cloud VM to localhost",
+    usage: "rl cloud tunnel [vm] [port] [--local-port <port>]",
+  },
+  "cloud create": {
+    description: "Create a shared cloud dev VM from template",
+    usage: "rl cloud create <dev-name> [machine-type]",
+  },
+  "cloud start": {
+    description: "Start a stopped cloud dev VM",
+    usage: "rl cloud start [vm]",
+  },
+  "cloud stop": {
+    description: "Stop a cloud dev VM while preserving its disk",
+    usage: "rl cloud stop [vm]",
+  },
+  "cloud delete": {
+    description: "Delete a cloud dev VM and its boot disk",
+    usage: "rl cloud delete <vm>",
   },
   doctor: {
     group: "Project",

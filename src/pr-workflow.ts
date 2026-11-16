@@ -10,14 +10,16 @@ import {
   git,
   inside,
   locked,
+  now,
 } from "./common.js";
 import { UsageError } from "./errors.js";
 import { GIT_WORKFLOW_DIRECTORY, GIT_WORKFLOW_LOCK } from "./git-safety.js";
 import { resolveGitHubRepository, runGh } from "./github/client.js";
 import { isJsonObject, parseJsonObject } from "./json.js";
+import { writeCachedBranchPr } from "./pr-discovery.js";
 
 const PR_FIELDS =
-  "number,url,headRefName,headRefOid,baseRefName,isCrossRepository,headRepository,headRepositoryOwner";
+  "number,url,state,title,headRefName,headRefOid,baseRefName,isDraft,updatedAt,isCrossRepository,headRepository,headRepositoryOwner";
 const FETCH_PREFIX = "refs/rl/pr-fetch/";
 
 /** Bound requests and ignore a caller's unrelated GH_REPO override. */
@@ -97,9 +99,12 @@ export async function main(argv: string[]): Promise<number> {
     );
   }
 
+  const prNumber = raw.number;
+  const prUrl = raw.url;
+  const headRefName = raw.headRefName;
   const head = raw.headRefOid;
   const base = raw.baseRefName;
-  git(context.repo, "check-ref-format", `refs/heads/${raw.headRefName}`);
+  git(context.repo, "check-ref-format", `refs/heads/${headRefName}`);
   git(context.repo, "check-ref-format", `refs/heads/${base}`);
 
   return locked(
@@ -151,8 +156,34 @@ export async function main(argv: string[]): Promise<number> {
         }
         fs.mkdirSync(path.dirname(destination), { recursive: true });
         git(context.repo, "worktree", "add", "-b", name, destination, head);
+        const snapshot = {
+          number: prNumber,
+          url: prUrl,
+          headRefName,
+          baseRefName: base,
+          ...(typeof raw.state === "string" ? { state: raw.state } : {}),
+          ...(typeof raw.title === "string" ? { title: raw.title } : {}),
+          ...(typeof raw.isDraft === "boolean" ? { isDraft: raw.isDraft } : {}),
+          ...(typeof raw.updatedAt === "string"
+            ? { updatedAt: raw.updatedAt }
+            : {}),
+          syncedAt: now(),
+        };
         try {
-          await context.store.adopt(destination, base);
+          const [recordFile] = await context.store.adopt(destination, base);
+          await context.store.locked(() => {
+            const [currentFile, current] = context.store.current(destination);
+            if (currentFile === recordFile) {
+              current.pr = snapshot;
+              context.store.save(recordFile, current);
+            }
+            writeCachedBranchPr(
+              context.store,
+              snapshot.headRefName,
+              snapshot,
+              snapshot.syncedAt,
+            );
+          });
         } catch (error) {
           throw new Error(
             `Created ${destination}, but RL adoption failed: ${error instanceof Error ? error.message : "unknown error"}. Run rl setup adopt inside it`,

@@ -60,6 +60,50 @@ function loadValidCache(file: string): Map<string, CacheEntry> {
   return cached;
 }
 
+export function readCachedBranchPr(
+  store: Store,
+  branch: string,
+): Instance["pr"] {
+  return (
+    loadValidCache(path.join(store.root, "pr-cache.json")).get(branch)?.pr ??
+    null
+  );
+}
+
+export function writeCachedBranchPr(
+  store: Store,
+  branch: string,
+  pr: Instance["pr"],
+  checkedAt = now(),
+): void {
+  if (pr !== null && pr?.headRefName !== branch) {
+    return;
+  }
+  const cacheFile = path.join(store.root, "pr-cache.json");
+  let existing: Record<string, unknown> = {};
+  try {
+    const data = readJson(cacheFile);
+    if (object(data.branches)) {
+      existing = data.branches;
+    }
+  } catch {
+    // Initialize disposable cache cleanly.
+  }
+  const merged = new Map(Object.entries(existing));
+  const previous = merged.get(branch);
+  if (
+    !object(previous) ||
+    typeof previous.checkedAt !== "string" ||
+    Date.parse(previous.checkedAt) <= Date.parse(checkedAt)
+  ) {
+    merged.set(branch, { pr, checkedAt });
+    writeJson(cacheFile, {
+      schemaVersion: 1,
+      branches: Object.fromEntries(merged),
+    });
+  }
+}
+
 function selectBranchPrFromGraphql(
   repositoryNode: Record<string, unknown>,
   index: number,
@@ -84,7 +128,17 @@ function selectBranchPrFromGraphql(
         !object(pr) ||
         pr.headRefName !== branch ||
         typeof pr.url !== "string" ||
-        !pr.url.startsWith(urlPrefix) ||
+        !pr.url.startsWith(urlPrefix)
+      ) {
+        throw new Error("Invalid branch PR identity");
+      }
+
+      // Deleted source forks return headRepository: null in GraphQL.
+      if (pr.headRepository === null) {
+        continue;
+      }
+
+      if (
         !object(pr.headRepository) ||
         typeof pr.headRepository.nameWithOwner !== "string"
       ) {
@@ -128,12 +182,20 @@ export async function discoverPrs(
   const cacheFile = path.join(store.root, "pr-cache.json");
   const cached = loadValidCache(cacheFile);
   const results = new Map<string, PrLookup>();
+  const remoteBranchByLocal = new Map<string, string>();
 
   for (const [, data] of store.records()) {
     if (data.status !== "active" || !data.pr) {
       continue;
     }
-    const previous = cached.get(data.branch);
+    const remoteBranch =
+      typeof data.pr.headRefName === "string" && data.pr.headRefName
+        ? data.pr.headRefName
+        : data.branch;
+    if (remoteBranch !== data.branch) {
+      remoteBranchByLocal.set(data.branch, remoteBranch);
+    }
+    const previous = cached.get(remoteBranch);
     const stamp = data.pr.syncedAt;
     if (
       !previous ||
@@ -153,25 +215,51 @@ export async function discoverPrs(
       results.set(branch, { ...entry, stale: false });
     }
   }
+  for (const [localBranch, remoteBranch] of remoteBranchByLocal) {
+    if (!results.has(localBranch)) {
+      const entry = cached.get(remoteBranch);
+      if (entry) {
+        results.set(localBranch, { ...entry, stale: false });
+      }
+    }
+  }
 
-  const pending = [...new Set(branches.filter(Boolean))].filter((branch) => {
-    const existing = results.get(branch);
-    const age = existing?.checkedAt
-      ? Date.now() - Date.parse(existing.checkedAt)
-      : Infinity;
-    return !(age >= 0 && age < TTL_MS);
-  });
+  const pendingLocal = [...new Set(branches.filter(Boolean))].filter(
+    (branch) => {
+      const existing = results.get(branch);
+      const age = existing?.checkedAt
+        ? Date.now() - Date.parse(existing.checkedAt)
+        : Infinity;
+      return !(age >= 0 && age < TTL_MS);
+    },
+  );
 
-  if (pending.length === 0) {
+  if (pendingLocal.length === 0) {
     return results;
   }
 
-  const markStale = (branch: string) =>
-    results.set(branch, {
-      pr: results.get(branch)?.pr ?? null,
-      checkedAt: results.get(branch)?.checkedAt,
+  const localBranchesByLookup = new Map<string, string[]>();
+  for (const localBranch of pendingLocal) {
+    const lookupBranch = remoteBranchByLocal.get(localBranch) ?? localBranch;
+    const targets = localBranchesByLookup.get(lookupBranch) ?? [];
+    targets.push(localBranch);
+    localBranchesByLookup.set(lookupBranch, targets);
+  }
+  const pending = [...localBranchesByLookup.keys()];
+
+  const markLocalStale = (localBranch: string) =>
+    results.set(localBranch, {
+      pr: results.get(localBranch)?.pr ?? null,
+      checkedAt: results.get(localBranch)?.checkedAt,
       stale: true,
     });
+  const markStale = (lookupBranch: string) => {
+    for (const localBranch of localBranchesByLookup.get(lookupBranch) ?? [
+      lookupBranch,
+    ]) {
+      markLocalStale(localBranch);
+    }
+  };
 
   if (process.env.RL_PR_OFFLINE === "1") {
     pending.forEach(markStale);
@@ -284,7 +372,11 @@ export async function discoverPrs(
             );
             const entry: CacheEntry = { pr: selected, checkedAt: started };
             refreshed.set(branch, entry);
-            results.set(branch, { ...entry, stale: false });
+            for (const localBranch of localBranchesByLookup.get(branch) ?? [
+              branch,
+            ]) {
+              results.set(localBranch, { ...entry, stale: false });
+            }
           } catch (error) {
             markStale(branch);
             failures.push(`${branch}: ${message(error)}`);
@@ -331,14 +423,24 @@ export async function discoverPrs(
         });
 
         for (const [record, data] of store.records()) {
-          const entry = refreshed.get(data.branch);
-          if (data.status !== "active" || !entry) {
+          if (data.status !== "active") {
+            continue;
+          }
+          const lookupBranch =
+            typeof data.pr?.headRefName === "string" && data.pr.headRefName
+              ? data.pr.headRefName
+              : data.branch;
+          const entry = refreshed.get(lookupBranch);
+          if (!entry) {
             continue;
           }
           if (
             typeof data.pr?.syncedAt === "string" &&
             Date.parse(data.pr.syncedAt) > Date.parse(started)
           ) {
+            continue;
+          }
+          if (lookupBranch !== data.branch && entry.pr === null) {
             continue;
           }
           data.pr = entry.pr;

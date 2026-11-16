@@ -173,9 +173,10 @@ test("pr opens the current branch or saved URL, keeps a link on browser failure,
       .trim()
       .split("\n")
       .map((line) => JSON.parse(line));
+  const webCalls = () => calls().filter((call) => call.args.includes("--web"));
   fs.mkdirSync(path.join(w.a, "nested"));
   w.rl(["pr"], { cwd: path.join(w.a, "nested") });
-  assert.deepEqual(calls()[0], {
+  assert.deepEqual(webCalls()[0], {
     args: ["pr", "view", "feature/a", "--web"],
     cwd: w.a,
     repo: null,
@@ -184,13 +185,14 @@ test("pr opens the current branch or saved URL, keeps a link on browser failure,
   const before = read(file);
   const opened = w.rl(["pr", "open"], { cwd: w.a }).stdout;
   assert.ok(opened.includes(PR.url));
-  assert.deepEqual(calls()[1].args, ["pr", "view", PR.url, "--web"]);
+  assert.deepEqual(webCalls()[1].args, ["pr", "view", PR.url, "--web"]);
   assert.deepEqual(JSON.parse(w.rl(["pr", "--json"], { cwd: w.a }).stdout), PR);
   assert.deepEqual(
     JSON.parse(w.rl(["pr", "open", "--json"], { cwd: w.a }).stdout),
     PR,
   );
-  assert.equal(calls().length, 2);
+  assert.equal(webCalls().length, 2);
+  assert.ok(calls().every((call) => call.repo === null));
   w.env.BROWSER_FAIL = "1";
   const fallback = w.rl(["pr"], { cwd: w.a });
   assert.ok(fallback.stdout.includes(PR.url));
@@ -205,4 +207,153 @@ test("pr opens the current branch or saved URL, keeps a link on browser failure,
     /Invalid saved PR URL/,
   );
   assert.equal(calls().length, count);
+});
+
+test("pr detects newly created and superseded PRs and works in unadopted checkouts", (t) => {
+  const w = new Workspace(t);
+  delete w.env.RL_PR_OFFLINE;
+  const log = path.join(w.root, "live-pr.jsonl");
+  w.env.GH_LOG = log;
+  w.env.LIVE_PRS = JSON.stringify({
+    "feature/a": [
+      {
+        ...PR,
+        number: 99,
+        url: "https://github.com/example/repo/pull/99",
+        state: "OPEN",
+        title: "Current Open PR",
+        isDraft: false,
+      },
+      {
+        ...PR,
+        number: 41,
+        url: "https://github.com/example/repo/pull/41",
+        state: "CLOSED",
+        title: "Old Closed PR",
+        isDraft: false,
+      },
+    ],
+    develop: [
+      {
+        ...PR,
+        number: 77,
+        url: "https://github.com/example/repo/pull/77",
+        state: "OPEN",
+        title: "Main Checkout PR",
+        headRefName: "develop",
+        baseRefName: "main",
+        isDraft: false,
+      },
+    ],
+  });
+  w.stub(
+    "gh",
+    String.raw`
+const fs = require("node:fs");
+const args = process.argv.slice(2);
+fs.appendFileSync(process.env.GH_LOG, JSON.stringify(args) + "\n");
+if (args[0] === "repo") {
+  console.log(JSON.stringify({ nameWithOwner: "example/repo", url: "https://github.com/example/repo" }));
+  process.exit(0);
+}
+if (args.includes("--web")) {
+  if (process.env.WEB_FAIL === "1") {
+    console.error("No browser");
+    process.exit(1);
+  }
+  process.exit(0);
+}
+const prsByBranch = JSON.parse(process.env.LIVE_PRS);
+if (args[0] === "pr" && args[1] === "view") {
+  const selector = args[2];
+  const all = Object.values(prsByBranch).flat();
+  const byUrlOrNum = all.find((p) => p.url === selector || String(p.number) === selector);
+  if (byUrlOrNum) {
+    console.log(JSON.stringify({ ...byUrlOrNum, isCrossRepository: false }));
+    process.exit(0);
+  }
+  const list = prsByBranch[selector] || [];
+  const match = list.find((p) => p.state === "OPEN") || list[0];
+  if (!match) {
+    console.error('no pull requests found for branch "' + selector + '"');
+    process.exit(1);
+  }
+  console.log(JSON.stringify({ ...match, isCrossRepository: false }));
+  process.exit(0);
+}
+if (args[0] === "pr" && args[1] === "list") {
+  console.log(JSON.stringify(Object.values(prsByBranch).flat().map((p) => ({ ...p, isCrossRepository: false }))));
+  process.exit(0);
+}
+process.exit(2);
+`,
+  );
+  const webArgs = () =>
+    read(log)
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line) as string[])
+      .filter((args) => args.includes("--web"));
+
+  // 1. Stale closed PR in instance.json is replaced by the current OPEN PR on both rl pr and rl pr sync.
+  cachePr(w, {
+    ...PR,
+    number: 41,
+    url: "https://github.com/example/repo/pull/41",
+    state: "CLOSED",
+    title: "Old Closed PR",
+  });
+  const synced = JSON.parse(
+    w.rl(["pr", "sync", "--json"], { cwd: w.a }).stdout,
+  );
+  assert.equal(synced.number, 99);
+  assert.equal(w.status(w.a).pr.number, 99);
+
+  cachePr(w, {
+    ...PR,
+    number: 41,
+    url: "https://github.com/example/repo/pull/41",
+    state: "CLOSED",
+    title: "Old Closed PR",
+  });
+  const opened = w.rl(["pr"], { cwd: w.a }).stdout;
+  assert.match(opened, /PR #99: Current Open PR/);
+  assert.deepEqual(webArgs().at(-1), [
+    "pr",
+    "view",
+    "https://github.com/example/repo/pull/99",
+    "--web",
+  ]);
+  assert.equal(w.status(w.a).pr.number, 99);
+
+  // 2. Newly created PR (data.pr === null) is detected by rl pr --json and keeps a link on browser failure.
+  const instanceFile = path.join(w.status(w.a).stateDirectory, "instance.json");
+  const instanceData = readJson(instanceFile);
+  instanceData.pr = null;
+  write(instanceFile, JSON.stringify(instanceData));
+
+  w.env.WEB_FAIL = "1";
+  const firstTimeFallback = w.rl(["pr"], { cwd: w.a });
+  assert.ok(
+    firstTimeFallback.stdout.includes(
+      "https://github.com/example/repo/pull/99",
+    ),
+  );
+  assert.match(firstTimeFallback.stderr, /Use the PR link above/);
+  delete w.env.WEB_FAIL;
+
+  // 3. Unadopted main checkout (@) detects, caches, shows, and opens its branch PR without rl setup adopt.
+  const mainJson = JSON.parse(w.rl(["pr", "--json"], { cwd: w.repo }).stdout);
+  assert.equal(mainJson.number, 77);
+  assert.match(
+    w.rl(["pr", "show"], { cwd: w.repo }).stdout,
+    /PR #77: Main Checkout PR/,
+  );
+  w.rl(["pr"], { cwd: w.repo });
+  assert.deepEqual(webArgs().at(-1), [
+    "pr",
+    "view",
+    "https://github.com/example/repo/pull/77",
+    "--web",
+  ]);
 });

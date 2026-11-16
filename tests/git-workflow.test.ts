@@ -205,6 +205,9 @@ test("PR checkout fetches exact verified head into new adopted worktree without 
   ).stdout.trim();
   assert.equal(read(path.join(output, "pull-request")), "pull-request");
   assert.equal(w.status(output).status, "active");
+  assert.equal(w.status(output).pr.number, 12);
+  assert.equal(w.status(output).pr.headRefName, "feature/a");
+  assert.match(w.rl(["pr", "show"], { cwd: output }).stdout, /PR #12/);
   assert.equal(w.git(w.repo, "branch", "--show-current"), "develop");
   assert.equal(w.git(w.repo, "rev-parse", "HEAD"), before);
   assert.equal(

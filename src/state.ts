@@ -9,6 +9,7 @@ import {
   args,
   arity,
   canonical,
+  execute,
   git,
   json,
   message,
@@ -19,12 +20,19 @@ import {
 import { prText, statusText } from "./display.js";
 import { doctor } from "./doctor.js";
 import { UsageError } from "./errors.js";
-import { resolveGitHubRepository, runGh } from "./github/client.js";
+import { gitCommonDir } from "./git/base.js";
+import {
+  resolveGitHubRepository,
+  runGh,
+  type GitHubRepositoryIdentity,
+} from "./github/client.js";
 import { handleHook } from "./hooks.js";
-import { parseJsonObject } from "./json.js";
+import { parseJson, parseJsonObject } from "./json.js";
+import { readCachedBranchPr, writeCachedBranchPr } from "./pr-discovery.js";
 import { github } from "./pr-workflow.js";
 import { currentSessionId } from "./session.js";
 import { type Agent, branchStatus, type Instance, Store } from "./store.js";
+import { detectCurrentRepositoryRoot } from "./user-config.js";
 
 function parseAgent(value: string): Agent {
   return agentAdapter(value).name;
@@ -32,96 +40,675 @@ function parseAgent(value: string): Agent {
 
 const SYNC_PR_FIELDS =
   "number,url,state,title,headRefName,baseRefName,isDraft,updatedAt";
+const SYNC_PR_FIELD_LIST = SYNC_PR_FIELDS.split(",");
+const VIEW_PR_FIELDS = `${SYNC_PR_FIELDS},isCrossRepository`;
+const LIST_PR_FIELDS = `${SYNC_PR_FIELDS},headRefOid,baseRefOid,isCrossRepository`;
+const TRUNK_BRANCHES = new Set([
+  "main",
+  "master",
+  "develop",
+  "test",
+  "staging",
+  "production",
+  "trunk",
+]);
+
+interface PrWorktreeContext {
+  worktree: string;
+  branch: string;
+  file: string | null;
+  data: Instance | null;
+  savedPr: Instance["pr"];
+}
+
+interface ParsedPrCandidate {
+  snapshot: NonNullable<Instance["pr"]>;
+  isCrossRepository: boolean;
+  headRefOid?: string;
+  baseRefOid?: string;
+}
+
+type BranchPrResolution =
+  | { kind: "found"; pr: NonNullable<Instance["pr"]> }
+  | { kind: "missing"; message: string }
+  | { kind: "unavailable"; error: Error; nonZeroExit: boolean };
+
+function resolvePrStore(store: Store, cwd = process.cwd()): Store {
+  if (process.env.RL_REPO || process.env.RL_REPO_ROOT) {
+    return store;
+  }
+  try {
+    if (gitCommonDir(cwd) !== gitCommonDir(store.repo)) {
+      return new Store(detectCurrentRepositoryRoot(cwd), store.stateDir);
+    }
+  } catch {
+    // Let store.worktree() report non-Git directory errors.
+  }
+  return store;
+}
+
+function resolveWorktreeContext(
+  store: Store,
+  cwd = process.cwd(),
+): PrWorktreeContext {
+  const [worktree, branch] = store.worktree(cwd);
+  for (const [file, data] of store.records()) {
+    if (
+      data.status === "active" &&
+      data.worktree === worktree &&
+      data.branch === branch
+    ) {
+      return {
+        worktree,
+        branch,
+        file,
+        data,
+        savedPr: data.pr ?? readCachedBranchPr(store, branch),
+      };
+    }
+  }
+  return {
+    worktree,
+    branch,
+    file: null,
+    data: null,
+    savedPr: readCachedBranchPr(store, branch),
+  };
+}
+
+function validateSavedPrUrl(urlText: string): void {
+  let url: URL;
+  try {
+    url = new URL(urlText);
+  } catch {
+    throw new Error("Invalid saved PR URL; run rl pr sync to refresh");
+  }
+  if (
+    url.protocol !== "https:" ||
+    url.username ||
+    url.password ||
+    !/\/pull\/[1-9]\d*$/.test(url.pathname)
+  ) {
+    throw new Error("Invalid saved PR URL; run rl pr sync to refresh");
+  }
+}
+
+async function persistResolvedPr(
+  store: Store,
+  context: PrWorktreeContext,
+  pr: NonNullable<Instance["pr"]>,
+): Promise<void> {
+  await store.locked(() => {
+    if (context.file) {
+      const current = resolveWorktreeContext(store, context.worktree);
+      if (current.file !== context.file || !current.data) {
+        throw new Error("Instance changed while fetching PR state");
+      }
+      current.data.pr = pr;
+      store.save(context.file, current.data);
+    }
+    if (typeof pr.headRefName === "string" && pr.headRefName) {
+      writeCachedBranchPr(
+        store,
+        pr.headRefName,
+        pr,
+        typeof pr.syncedAt === "string" ? pr.syncedAt : now(),
+      );
+    }
+  });
+}
+
+async function upstreamHeadBranch(
+  worktree: string,
+  branch: string,
+  baseBranch?: string,
+): Promise<string | null> {
+  const [remoteRes, mergeRes, originHeadRes] = await Promise.all([
+    execute(["git", "config", "--get", `branch.${branch}.remote`], worktree),
+    execute(["git", "config", "--get", `branch.${branch}.merge`], worktree),
+    execute(
+      ["git", "symbolic-ref", "-q", "refs/remotes/origin/HEAD"],
+      worktree,
+    ),
+  ]);
+  if (remoteRes.code !== 0 || mergeRes.code !== 0) {
+    return null;
+  }
+  if (remoteRes.stdout.trim() !== "origin") {
+    return null;
+  }
+  const mergeRef = mergeRes.stdout.trim();
+  if (!mergeRef.startsWith("refs/heads/")) {
+    return null;
+  }
+  const remoteBranch = mergeRef.slice("refs/heads/".length).trim();
+  if (!remoteBranch || remoteBranch === branch) {
+    return null;
+  }
+  if (remoteBranch.toLowerCase() === branch.toLowerCase()) {
+    return remoteBranch;
+  }
+
+  const excluded = new Set<string>(TRUNK_BRANCHES);
+  if (baseBranch) {
+    excluded.add(baseBranch.replace(/^origin\//, "").toLowerCase());
+  }
+  if (originHeadRes.code === 0) {
+    const symref = originHeadRes.stdout
+      .trim()
+      .replace(/^refs\/remotes\/origin\//, "");
+    if (symref) {
+      excluded.add(symref.toLowerCase());
+    }
+  }
+  if (excluded.has(remoteBranch.toLowerCase())) {
+    return null;
+  }
+  return remoteBranch;
+}
+
+function parsePrCandidate(
+  raw: unknown,
+  prefix: string,
+  expectedRepoName: string,
+  syncedAt: string,
+): ParsedPrCandidate {
+  if (!object(raw) || SYNC_PR_FIELD_LIST.some((field) => !(field in raw))) {
+    throw new Error("GitHub returned incomplete PR metadata");
+  }
+  if (typeof raw.url !== "string" || !raw.url.startsWith(prefix)) {
+    throw new Error("PR does not belong to this GitHub repository");
+  }
+
+  let isCrossRepository = raw.isCrossRepository === true;
+  if ("headRepository" in raw && raw.headRepository === null) {
+    isCrossRepository = true;
+  } else if (
+    object(raw.headRepository) &&
+    typeof raw.headRepository.nameWithOwner === "string" &&
+    raw.headRepository.nameWithOwner.toLowerCase() !==
+      expectedRepoName.toLowerCase()
+  ) {
+    isCrossRepository = true;
+  } else if (
+    object(raw.headRepositoryOwner) &&
+    typeof raw.headRepositoryOwner.login === "string" &&
+    object(raw.headRepository) &&
+    typeof raw.headRepository.name === "string" &&
+    `${raw.headRepositoryOwner.login}/${raw.headRepository.name}`.toLowerCase() !==
+      expectedRepoName.toLowerCase()
+  ) {
+    isCrossRepository = true;
+  }
+
+  return {
+    snapshot: {
+      number: raw.number,
+      url: raw.url,
+      state: raw.state,
+      title: raw.title,
+      headRefName: raw.headRefName,
+      baseRefName: raw.baseRefName,
+      isDraft: raw.isDraft,
+      updatedAt: raw.updatedAt,
+      syncedAt,
+    },
+    isCrossRepository,
+    headRefOid: typeof raw.headRefOid === "string" ? raw.headRefOid : undefined,
+    baseRefOid: typeof raw.baseRefOid === "string" ? raw.baseRefOid : undefined,
+  };
+}
+
+function selectPreferredCandidate(
+  candidates: ParsedPrCandidate[],
+): NonNullable<Instance["pr"]> | null {
+  const local = candidates.filter((item) => !item.isCrossRepository);
+  if (local.length === 0) {
+    return null;
+  }
+  const open = local.find(
+    (item) => String(item.snapshot.state).toUpperCase() === "OPEN",
+  );
+  return (open ?? local[0]).snapshot;
+}
+
+async function listBranchCandidates(
+  worktree: string,
+  repoSlug: string,
+  prefix: string,
+  expectedRepoName: string,
+  syncedAt: string,
+  headBranch?: string,
+): Promise<ParsedPrCandidate[] | null> {
+  const result = await runGh(worktree, [
+    "pr",
+    "list",
+    "--repo",
+    repoSlug,
+    ...(headBranch ? ["--head", headBranch] : []),
+    "--state",
+    "all",
+    "--limit",
+    headBranch ? "30" : "100",
+    "--json",
+    headBranch ? VIEW_PR_FIELDS : LIST_PR_FIELDS,
+  ]);
+  if (result.code !== 0) {
+    return null;
+  }
+  const parsed = parseJson(result.stdout);
+  if (!Array.isArray(parsed)) {
+    return null;
+  }
+  const candidates: ParsedPrCandidate[] = [];
+  for (const item of parsed) {
+    try {
+      candidates.push(
+        parsePrCandidate(item, prefix, expectedRepoName, syncedAt),
+      );
+    } catch {
+      // Ignore malformed list items from non-matching stubs.
+    }
+  }
+  return candidates;
+}
+
+async function viewBranchCandidate(
+  worktree: string,
+  selector: string,
+  repository: GitHubRepositoryIdentity,
+  syncedAt: string,
+  expectedBranch?: string,
+): Promise<
+  | { status: "found"; pr: NonNullable<Instance["pr"]> }
+  | { status: "not_found"; stderr: string }
+  | { status: "error"; error: Error; nonZeroExit: boolean }
+> {
+  const repoSlug = `${repository.host}/${repository.name}`;
+  const prefix = `${repository.url}/pull/`;
+  const result = await runGh(worktree, [
+    "pr",
+    "view",
+    selector,
+    "--repo",
+    repoSlug,
+    "--json",
+    VIEW_PR_FIELDS,
+  ]);
+  if (result.code !== 0) {
+    const stderr = result.stderr.trim();
+    if (/no pull requests? found/i.test(stderr)) {
+      return { status: "not_found", stderr };
+    }
+    return {
+      status: "error",
+      error: new Error(stderr || "Could not load PR metadata"),
+      nonZeroExit: true,
+    };
+  }
+
+  let candidate: ParsedPrCandidate;
+  try {
+    candidate = parsePrCandidate(
+      parseJsonObject(result.stdout),
+      prefix,
+      repository.name,
+      syncedAt,
+    );
+  } catch (error) {
+    return {
+      status: "error",
+      error: error instanceof Error ? error : new Error(message(error)),
+      nonZeroExit: false,
+    };
+  }
+
+  if (
+    !candidate.isCrossRepository &&
+    (!expectedBranch ||
+      String(candidate.snapshot.headRefName).toLowerCase() ===
+        expectedBranch.toLowerCase())
+  ) {
+    return { status: "found", pr: candidate.snapshot };
+  }
+
+  if (expectedBranch) {
+    const listed = await listBranchCandidates(
+      worktree,
+      repoSlug,
+      prefix,
+      repository.name,
+      syncedAt,
+      expectedBranch,
+    );
+    const preferred = listed ? selectPreferredCandidate(listed) : null;
+    if (preferred) {
+      return { status: "found", pr: preferred };
+    }
+  }
+
+  return {
+    status: "not_found",
+    stderr: `No pull requests found for branch "${expectedBranch ?? selector}"`,
+  };
+}
+
+async function isCommitAheadOfBase(
+  worktree: string,
+  headOid: string,
+  pr: ParsedPrCandidate,
+  context: PrWorktreeContext,
+): Promise<boolean> {
+  if (context.data?.reviewBaseCommit === headOid) {
+    return false;
+  }
+  if (pr.baseRefOid) {
+    if (pr.baseRefOid === headOid) {
+      return false;
+    }
+    const check = await execute(
+      ["git", "merge-base", "--is-ancestor", headOid, pr.baseRefOid],
+      worktree,
+    );
+    if (check.code === 0) {
+      return false;
+    }
+    if (check.code === 1) {
+      return true;
+    }
+  }
+  const baseRef =
+    typeof pr.snapshot.baseRefName === "string"
+      ? `origin/${pr.snapshot.baseRefName}`
+      : context.data?.baseBranch;
+  if (baseRef) {
+    const check = await execute(
+      ["git", "merge-base", "--is-ancestor", headOid, baseRef],
+      worktree,
+    );
+    if (check.code === 0) {
+      return false;
+    }
+  }
+  return true;
+}
+
+async function resolveCurrentBranchPr(
+  context: PrWorktreeContext,
+  strictJsonErrors = false,
+): Promise<BranchPrResolution> {
+  let repository: GitHubRepositoryIdentity;
+  try {
+    repository = await resolveGitHubRepository(context.worktree);
+  } catch (error) {
+    return {
+      kind: "unavailable",
+      error: error instanceof Error ? error : new Error(message(error)),
+      nonZeroExit:
+        !(error instanceof SyntaxError) && !/JSON/i.test(message(error)),
+    };
+  }
+
+  const syncedAt = now();
+  const primary = await viewBranchCandidate(
+    context.worktree,
+    context.branch,
+    repository,
+    syncedAt,
+    context.branch,
+  );
+  if (primary.status === "found") {
+    return { kind: "found", pr: primary.pr };
+  }
+  if (primary.status === "error") {
+    if (strictJsonErrors) {
+      throw primary.error;
+    }
+    return {
+      kind: "unavailable",
+      error: primary.error,
+      nonZeroExit: primary.nonZeroExit,
+    };
+  }
+
+  const upstream = await upstreamHeadBranch(
+    context.worktree,
+    context.branch,
+    context.data?.baseBranch,
+  );
+  if (upstream && upstream !== context.branch) {
+    const viaUpstream = await viewBranchCandidate(
+      context.worktree,
+      upstream,
+      repository,
+      syncedAt,
+      upstream,
+    );
+    if (viaUpstream.status === "found") {
+      return { kind: "found", pr: viaUpstream.pr };
+    }
+  }
+
+  const savedDifferentHead =
+    context.savedPr &&
+    typeof context.savedPr.headRefName === "string" &&
+    context.savedPr.headRefName !== context.branch
+      ? context.savedPr.url
+      : undefined;
+  const prBranchMatch = /^pr-([1-9]\d*)$/.exec(context.branch);
+  const checkoutSelector = savedDifferentHead ?? prBranchMatch?.[1];
+  if (checkoutSelector) {
+    const viaCheckout = await viewBranchCandidate(
+      context.worktree,
+      checkoutSelector,
+      repository,
+      syncedAt,
+    );
+    if (viaCheckout.status === "found") {
+      return { kind: "found", pr: viaCheckout.pr };
+    }
+  }
+
+  const repoSlug = `${repository.host}/${repository.name}`;
+  const prefix = `${repository.url}/pull/`;
+  const listed = await listBranchCandidates(
+    context.worktree,
+    repoSlug,
+    prefix,
+    repository.name,
+    syncedAt,
+  );
+  if (listed && listed.length > 0) {
+    const caseMatches = listed.filter(
+      (item) =>
+        String(item.snapshot.headRefName).toLowerCase() ===
+        context.branch.toLowerCase(),
+    );
+    const byCase = selectPreferredCandidate(caseMatches);
+    if (byCase) {
+      return { kind: "found", pr: byCase };
+    }
+
+    let localHead = "";
+    try {
+      localHead = git(context.worktree, "rev-parse", "HEAD");
+    } catch {
+      localHead = "";
+    }
+    if (/^[a-f0-9]{40,64}$/.test(localHead)) {
+      const openOidMatches: ParsedPrCandidate[] = [];
+      for (const item of listed) {
+        const headName = String(item.snapshot.headRefName);
+        if (
+          !item.isCrossRepository &&
+          String(item.snapshot.state).toUpperCase() === "OPEN" &&
+          item.headRefOid === localHead &&
+          !TRUNK_BRANCHES.has(headName.toLowerCase()) &&
+          headName !== item.snapshot.baseRefName &&
+          (await isCommitAheadOfBase(
+            context.worktree,
+            localHead,
+            item,
+            context,
+          ))
+        ) {
+          openOidMatches.push(item);
+        }
+      }
+      if (openOidMatches.length === 1) {
+        return { kind: "found", pr: openOidMatches[0].snapshot };
+      }
+    }
+  }
+
+  return {
+    kind: "missing",
+    message:
+      primary.stderr || `No pull requests found for branch "${context.branch}"`,
+  };
+}
 
 async function syncPr(
   store: Store,
   requested?: string,
   asJson = false,
 ): Promise<number> {
-  const [file, data] = await store.locked(() => store.current());
-  const selector = requested || data.pr?.url || data.branch;
-  if (selector.startsWith("-")) {
-    throw new UsageError("PR selector must be a branch, number, or URL");
-  }
+  const prStore = resolvePrStore(store);
+  const context = await prStore.locked(() => resolveWorktreeContext(prStore));
 
-  const repository = await resolveGitHubRepository(data.worktree);
-  const prefix = `${repository.url}/pull/`;
-  if (selector.includes("://") && !selector.startsWith(prefix)) {
-    throw new Error("PR URL does not belong to this GitHub repository");
-  }
-
-  const prResult = await runGh(data.worktree, [
-    "pr",
-    "view",
-    selector,
-    "--repo",
-    `${repository.host}/${repository.name}`,
-    "--json",
-    SYNC_PR_FIELDS,
-  ]);
-  if (prResult.code !== 0) {
-    throw new Error(prResult.stderr.trim() || "Could not load PR metadata");
-  }
-
-  const pr = parseJsonObject(prResult.stdout) as Record<string, unknown>;
-  if (
-    !object(pr) ||
-    SYNC_PR_FIELDS.split(",").some((field) => !(field in pr))
-  ) {
-    throw new Error("GitHub returned incomplete PR metadata");
-  }
-  if (pr.headRefName !== data.branch) {
-    throw new Error("PR head branch does not match the RL instance branch");
-  }
-  if (typeof pr.url !== "string" || !pr.url.startsWith(prefix)) {
-    throw new Error("PR does not belong to this GitHub repository");
-  }
-
-  pr.syncedAt = now();
-  await store.locked(() => {
-    const [currentFile, current] = store.current(data.worktree);
-    if (currentFile !== file) {
-      throw new Error("Instance changed while fetching PR state");
+  if (requested !== undefined) {
+    if (requested.startsWith("-")) {
+      throw new UsageError("PR selector must be a branch, number, or URL");
     }
-    current.pr = pr as Instance["pr"];
-    store.save(file, current);
-  });
+    const repository = await resolveGitHubRepository(context.worktree);
+    const prefix = `${repository.url}/pull/`;
+    if (requested.includes("://") && !requested.startsWith(prefix)) {
+      throw new Error("PR URL does not belong to this GitHub repository");
+    }
 
+    const prResult = await runGh(context.worktree, [
+      "pr",
+      "view",
+      requested,
+      "--repo",
+      `${repository.host}/${repository.name}`,
+      "--json",
+      VIEW_PR_FIELDS,
+    ]);
+    if (prResult.code !== 0) {
+      throw new Error(prResult.stderr.trim() || "Could not load PR metadata");
+    }
+
+    const candidate = parsePrCandidate(
+      parseJsonObject(prResult.stdout),
+      prefix,
+      repository.name,
+      now(),
+    );
+    if (candidate.isCrossRepository) {
+      throw new Error("PR belongs to a fork, not this repository");
+    }
+
+    const upstream = await upstreamHeadBranch(
+      context.worktree,
+      context.branch,
+      context.data?.baseBranch,
+    );
+    const headName = String(candidate.snapshot.headRefName);
+    const prNumber = candidate.snapshot.number;
+    const matchesBranch =
+      headName.toLowerCase() === context.branch.toLowerCase() ||
+      (upstream !== null &&
+        headName.toLowerCase() === upstream.toLowerCase()) ||
+      (context.savedPr !== null && context.savedPr.number === prNumber) ||
+      context.branch === `pr-${String(prNumber)}`;
+
+    if (!matchesBranch) {
+      throw new Error("PR head branch does not match the RL instance branch");
+    }
+
+    await persistResolvedPr(prStore, context, candidate.snapshot);
+    if (asJson) {
+      json(candidate.snapshot);
+    } else {
+      console.log(prText(candidate.snapshot));
+    }
+    return 0;
+  }
+
+  const resolved = await resolveCurrentBranchPr(context, true);
+  if (resolved.kind === "unavailable") {
+    throw resolved.error;
+  }
+  if (resolved.kind === "missing") {
+    throw new Error(resolved.message);
+  }
+
+  await persistResolvedPr(prStore, context, resolved.pr);
   if (asJson) {
-    json(pr);
+    json(resolved.pr);
   } else {
-    console.log(prText(pr as Instance["pr"]));
+    console.log(prText(resolved.pr));
   }
   return 0;
 }
 
 async function openPr(store: Store, asJson: boolean): Promise<number> {
-  const [, data] = await store.locked(() => store.current());
+  const prStore = resolvePrStore(store);
+  const context = await prStore.locked(() => resolveWorktreeContext(prStore));
+
+  if (context.savedPr) {
+    validateSavedPrUrl(context.savedPr.url);
+  }
+
+  let resolved: BranchPrResolution | null = null;
+  if (process.env.RL_PR_OFFLINE !== "1") {
+    resolved = await resolveCurrentBranchPr(context, false);
+    if (resolved.kind === "found") {
+      validateSavedPrUrl(resolved.pr.url);
+      await persistResolvedPr(prStore, context, resolved.pr);
+    }
+  }
+
   if (asJson) {
-    json(data.pr);
+    if (resolved?.kind === "found") {
+      json(resolved.pr);
+      return 0;
+    }
+    if (resolved?.kind === "missing") {
+      json(null);
+      return 0;
+    }
+    if (
+      resolved?.kind === "unavailable" &&
+      resolved.nonZeroExit &&
+      !context.savedPr
+    ) {
+      throw resolved.error;
+    }
+    json(context.savedPr);
     return 0;
   }
 
-  if (data.pr) {
-    const url = new URL(data.pr.url);
-    if (
-      url.protocol !== "https:" ||
-      url.username ||
-      url.password ||
-      !/\/pull\/[1-9]\d*$/.test(url.pathname)
-    ) {
-      throw new Error("Invalid saved PR URL; run rl pr sync to refresh");
-    }
-    console.log(prText(data.pr));
+  if (resolved?.kind === "missing") {
+    throw new Error(resolved.message);
+  }
+
+  const activePr = resolved?.kind === "found" ? resolved.pr : context.savedPr;
+
+  if (activePr) {
+    console.log(prText(activePr));
+  } else if (resolved?.kind === "unavailable" && resolved.nonZeroExit) {
+    throw resolved.error;
   } else {
-    console.log(`Opening PR for ${data.branch}…`);
+    console.log(`Opening PR for ${context.branch}…`);
   }
 
   try {
-    const result = await github(data.worktree, [
+    const result = await github(context.worktree, [
       "pr",
       "view",
-      data.pr?.url ?? data.branch,
+      activePr?.url ?? context.branch,
       "--web",
     ]);
     if (result.code !== 0) {
@@ -134,7 +721,7 @@ async function openPr(store: Store, asJson: boolean): Promise<number> {
     }
     return 0;
   } catch (error) {
-    if (!data.pr) {
+    if (!activePr) {
       throw error;
     }
     console.error(
@@ -228,6 +815,18 @@ export async function main(argv: string[]): Promise<number> {
   if (command === "pr" && (!rest.length || rest[0] === "open")) {
     arity(rest, 0, rest[0] === "open" ? 1 : 0);
     return openPr(store, Boolean(values.json));
+  }
+
+  if (command === "pr" && rest[0] === "show") {
+    arity(rest, 1);
+    const prStore = resolvePrStore(store);
+    const context = await prStore.locked(() => resolveWorktreeContext(prStore));
+    if (values.json) {
+      json(context.savedPr);
+    } else {
+      console.log(prText(context.savedPr));
+    }
+    return 0;
   }
 
   if (command === "status") {
@@ -341,16 +940,6 @@ export async function main(argv: string[]): Promise<number> {
       throw new UsageError(
         `Usage: rl ${command} show|path|set <file>|append <file>`,
       );
-    }
-
-    if (command === "pr" && rest[0] === "show") {
-      arity(rest, 1);
-      if (values.json) {
-        json(data.pr);
-      } else {
-        console.log(prText(data.pr));
-      }
-      return 0;
     }
 
     throw new UsageError("Unknown state command");

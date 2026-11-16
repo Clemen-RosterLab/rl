@@ -70,14 +70,45 @@ export async function resolveGitHubRepository(
     signal?: AbortSignal;
   } = {},
 ): Promise<GitHubRepositoryIdentity> {
-  const result = await runGh(
+  let originTarget: string | undefined;
+  if (!options.verifyOrigin) {
+    try {
+      const remotes = git(cwd, "remote")
+        .split("\n")
+        .map((item) => item.trim())
+        .filter(Boolean);
+      if (remotes.length > 1 && remotes.includes("origin")) {
+        const originUrl = git(cwd, "remote", "get-url", "origin");
+        const normalized = normalizeGitRemoteHostPath(originUrl);
+        if (/^[^/\s]+\/[\w.-]+\/[\w.-]+$/.test(normalized)) {
+          originTarget = normalized;
+        }
+      }
+    } catch {
+      // Fall back to default gh repository resolution when remotes cannot be inspected.
+    }
+  }
+
+  let result = await runGh(
     cwd,
-    ["repo", "view", "--json", "nameWithOwner,url"],
+    [
+      "repo",
+      "view",
+      ...(originTarget ? [originTarget] : []),
+      "--json",
+      "nameWithOwner,url",
+    ],
     {
       timeoutMs: options.timeoutMs,
       signal: options.signal,
     },
   );
+  if (result.code !== 0 && originTarget) {
+    result = await runGh(cwd, ["repo", "view", "--json", "nameWithOwner,url"], {
+      timeoutMs: options.timeoutMs,
+      signal: options.signal,
+    });
+  }
   if (result.code !== 0) {
     throw new RlError(
       result.stderr.trim() || "Cannot determine GitHub repository",

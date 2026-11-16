@@ -298,6 +298,137 @@ test("PR sync validates repository and branch and retains cached data on errors"
   w.rl(["pr", "sync"], { cwd: w.a, ok: false });
   assert.deepEqual(w.status().pr, saved);
 });
+test("PR detection handles upstream branch renames, case/HEAD fallbacks, multi-remote origin, and fork collisions", (t) => {
+  const w = new Workspace(t);
+  delete w.env.RL_PR_OFFLINE;
+  w.git(
+    w.repo,
+    "remote",
+    "add",
+    "origin",
+    "https://github.com/example/repo.git",
+  );
+  w.git(
+    w.repo,
+    "remote",
+    "add",
+    "upstream",
+    "https://github.com/other/upstream.git",
+  );
+  w.git(w.a, "commit", "-q", "--allow-empty", "-m", "Ahead commit");
+  const headA = w.git(w.a, "rev-parse", "HEAD");
+  const baseOid = w.git(w.repo, "rev-parse", "HEAD");
+  w.env.BASE_OID = baseOid;
+  w.env.HEAD_A = headA;
+  w.env.MODE = "upstream";
+  w.stub(
+    "gh",
+    String.raw`
+const args = process.argv.slice(2);
+if (args[0] === "repo") {
+  const target = args[2] && !args[2].startsWith("-") ? args[2] : "other/upstream";
+  if (target === "github.com/example/repo") {
+    console.log(JSON.stringify({ nameWithOwner: "example/repo", url: "https://github.com/example/repo" }));
+  } else {
+    console.log(JSON.stringify({ nameWithOwner: "other/upstream", url: "https://github.com/other/upstream" }));
+  }
+  process.exit(0);
+}
+const mode = process.env.MODE;
+const makePr = (num, headRefName, extra = {}) => ({
+  number: num,
+  url: "https://github.com/example/repo/pull/" + num,
+  state: "OPEN",
+  title: "PR " + num,
+  headRefName,
+  baseRefName: "develop",
+  isDraft: false,
+  updatedAt: "2026-10-02T00:00:00Z",
+  isCrossRepository: false,
+  ...extra,
+});
+if (args[0] === "pr" && args[1] === "view") {
+  const sel = args[2];
+  if (mode === "upstream" && sel === "pushed/custom-a") {
+    console.log(JSON.stringify(makePr(51, "pushed/custom-a")));
+    process.exit(0);
+  }
+  if (mode === "fork" && sel === "feature/a") {
+    console.log(JSON.stringify(makePr(60, "feature/a", { isCrossRepository: true })));
+    process.exit(0);
+  }
+  console.error('no pull requests found for branch "' + sel + '"');
+  process.exit(1);
+}
+if (args[0] === "pr" && args[1] === "list") {
+  if (mode === "fork" && args.includes("--head")) {
+    console.log(JSON.stringify([
+      makePr(60, "feature/a", { isCrossRepository: true }),
+      makePr(61, "feature/a", { isCrossRepository: false }),
+    ]));
+    process.exit(0);
+  }
+  if (mode === "case") {
+    console.log(JSON.stringify([makePr(71, "FEATURE/A")]));
+    process.exit(0);
+  }
+  if (mode === "oid") {
+    console.log(JSON.stringify([
+      makePr(81, "codex/feature-a", { headRefOid: process.env.HEAD_A, baseRefOid: process.env.BASE_OID }),
+    ]));
+    process.exit(0);
+  }
+  if (mode === "trunk-upstream") {
+    console.log(JSON.stringify([
+      makePr(91, "develop", { headRefOid: process.env.BASE_OID, baseRefOid: process.env.BASE_OID }),
+    ]));
+    process.exit(0);
+  }
+  console.log("[]");
+  process.exit(0);
+}
+process.exit(2);
+`,
+  );
+
+  // 1. Pushed to differently named remote branch on origin (plus multi-remote origin selection).
+  w.git(w.a, "config", "branch.feature/a.remote", "origin");
+  w.git(w.a, "config", "branch.feature/a.merge", "refs/heads/pushed/custom-a");
+  assert.equal(
+    JSON.parse(w.rl(["pr", "--json"], { cwd: w.a }).stdout).number,
+    51,
+  );
+  w.git(w.a, "config", "--unset", "branch.feature/a.remote");
+  w.git(w.a, "config", "--unset", "branch.feature/a.merge");
+
+  // 2. Trunk upstream (e.g. git checkout -b feature/b origin/develop) must NOT match a trunk PR, nor match base OID.
+  w.env.MODE = "trunk-upstream";
+  w.git(w.b, "config", "branch.feature/b.remote", "origin");
+  w.git(w.b, "config", "branch.feature/b.merge", "refs/heads/develop");
+  assert.equal(JSON.parse(w.rl(["pr", "--json"], { cwd: w.b }).stdout), null);
+
+  // 3. Fork PR sharing headRefName is skipped in favor of this repository's PR.
+  w.env.MODE = "fork";
+  assert.equal(
+    JSON.parse(w.rl(["pr", "sync", "--json"], { cwd: w.a }).stdout).number,
+    61,
+  );
+
+  // 4. Case-insensitive headRefName match.
+  w.env.MODE = "case";
+  assert.equal(
+    JSON.parse(w.rl(["pr", "--json"], { cwd: w.a }).stdout).number,
+    71,
+  );
+
+  // 5. Unique open PR matching local HEAD commit (ahead of base) when pushed without -u under another branch name.
+  w.env.MODE = "oid";
+  assert.equal(
+    JSON.parse(w.rl(["pr", "--json"], { cwd: w.a }).stdout).number,
+    81,
+  );
+  assert.equal(JSON.parse(w.rl(["pr", "--json"], { cwd: w.b }).stdout), null);
+});
 test("legacy Python timestamps retain microsecond ordering and unknown fields survive writes", (t) => {
   const w = new Workspace(t),
     status = w.status(),
