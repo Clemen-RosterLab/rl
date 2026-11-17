@@ -4,6 +4,9 @@ import { setImmediate as yieldTurn } from "node:timers/promises";
 import { isIgnoredWatchDirectory } from "./core/protected-paths.js";
 import type { LiveState } from "./review-live-engine.js";
 
+const SUPPORTS_RECURSIVE_WATCH =
+  process.platform === "darwin" || process.platform === "win32";
+
 function hasIgnoredSegment(
   worktreeRoot: string | undefined,
   dir: string,
@@ -18,6 +21,10 @@ function hasIgnoredSegment(
   return rel.split(path.sep).some((part) => isIgnoredWatchDirectory(part));
 }
 
+function splitWatchPath(filename: string): string[] {
+  return filename.split(/[/\\]/).filter(Boolean);
+}
+
 /** Reconcile bounded batches so a large checkout cannot monopolize keyboard input. */
 export class ReviewWatcher {
   private watches = new Map<string, fs.FSWatcher>();
@@ -29,6 +36,7 @@ export class ReviewWatcher {
   constructor(
     private refresh: () => void,
     pollMs = 2500,
+    private recursive = SUPPORTS_RECURSIVE_WATCH,
   ) {
     this.polling = setInterval(() => this.schedule(), pollMs);
   }
@@ -47,7 +55,105 @@ export class ReviewWatcher {
     if (this.stopped) {
       return;
     }
-    void this.reconcile(state, ++this.generation).catch(() => this.schedule());
+    const generation = ++this.generation;
+    if (this.recursive && this.reconcileRecursive(state)) {
+      return;
+    }
+    void this.reconcile(state, generation).catch(() => this.schedule());
+  }
+
+  private reconcileRecursive(state: LiveState): boolean {
+    const desired = new Map<
+      string,
+      {
+        dir: string;
+        recursive: boolean;
+        ignore: (filename: string) => boolean;
+      }
+    >();
+    const worktreeRoot = state.directories[0];
+    if (worktreeRoot) {
+      desired.set(`tree:${worktreeRoot}`, {
+        dir: worktreeRoot,
+        recursive: true,
+        ignore: (filename) =>
+          Boolean(filename) &&
+          splitWatchPath(filename).some((part) =>
+            isIgnoredWatchDirectory(part),
+          ),
+      });
+    }
+
+    for (const base of new Set([state.gitDir, state.commonDir])) {
+      if (!base) continue;
+      desired.set(`git:${base}`, {
+        dir: base,
+        recursive: false,
+        ignore: (filename) => {
+          const first = splitWatchPath(filename)[0];
+          return Boolean(
+            first &&
+            (first.endsWith(".lock") ||
+              /^(objects|rl|live-review)$/.test(first)),
+          );
+        },
+      });
+      const refsDir = path.join(base, "refs");
+      if (fs.existsSync(refsDir)) {
+        desired.set(`refs:${refsDir}`, {
+          dir: refsDir,
+          recursive: true,
+          ignore: (filename) => {
+            const parts = splitWatchPath(filename);
+            return Boolean(
+              parts[0] === "rl" || parts[parts.length - 1]?.endsWith(".lock"),
+            );
+          },
+        });
+      }
+    }
+
+    for (const [key, spec] of desired) {
+      if (this.watches.has(key)) continue;
+      try {
+        const watch = fs.watch(
+          spec.dir,
+          { persistent: false, recursive: spec.recursive },
+          (_event, name) => {
+            const filename = name ? name.toString() : "";
+            if (spec.ignore(filename)) {
+              return;
+            }
+            this.schedule();
+          },
+        );
+        watch.on("error", () => {
+          watch.close();
+          if (this.watches.get(key) === watch) {
+            this.watches.delete(key);
+          }
+          this.schedule();
+        });
+        this.watches.set(key, watch);
+      } catch {
+        if (spec.recursive) {
+          this.recursive = false;
+          for (const watch of this.watches.values()) {
+            watch.close();
+          }
+          this.watches.clear();
+          return false;
+        }
+      }
+    }
+
+    for (const [key, watch] of this.watches) {
+      if (!desired.has(key)) {
+        watch.close();
+        this.watches.delete(key);
+      }
+    }
+    return true;
   }
 
   private async reconcile(state: LiveState, generation: number): Promise<void> {

@@ -195,6 +195,78 @@ test("watching detects atomic replacement, nested untracked creation, commits, i
   assert.notEqual(state.gitDir, state.commonDir);
 });
 
+test("watcher keeps a constant handle count on recursive platforms, ignores private Git writes, closes quickly and preserves fallback mode", async (t) => {
+  const w = new Workspace(t);
+  for (let i = 0; i < 40; i++) {
+    const dir = path.join(w.a, `pkg-${i}`, "src", "components");
+    fs.mkdirSync(dir, { recursive: true });
+    write(path.join(dir, "index.ts"), `export const v = ${i};\n`);
+  }
+  w.git(w.a, "add", ".");
+  w.git(w.a, "commit", "-qm", "Nested tree");
+
+  const repo = new engine.LiveRepository(w.a);
+  const state = repo.refresh();
+  assert.ok(state.directories.length > 100);
+
+  if (process.platform === "darwin" || process.platform === "win32") {
+    let recursiveEvents = 0;
+    const recursiveWatcher = new watching.ReviewWatcher(
+      () => recursiveEvents++,
+      60000,
+      true,
+    );
+    t.after(() => recursiveWatcher.close());
+    recursiveWatcher.update(state);
+    assert.ok(
+      (recursiveWatcher as any).watches.size <= 5,
+      `expected bounded recursive watches, got ${(recursiveWatcher as any).watches.size}`,
+    );
+
+    await new Promise((r) => setTimeout(r, 250));
+    recursiveEvents = 0;
+
+    // Internal snapshot capture, freeze refs, and ignored directories must not self-trigger refreshes.
+    const refreshed = repo.refresh(true);
+    repo.freeze(refreshed.snapshot, refreshed.snapshot.worktreeTree, [
+      refreshed.snapshot.head,
+    ]);
+    repo.releaseFreeze();
+    fs.mkdirSync(path.join(w.a, "node_modules/example"), { recursive: true });
+    write(path.join(w.a, "node_modules/example/index.js"), "ignored\n");
+    await new Promise((r) => setTimeout(r, 350));
+    assert.equal(recursiveEvents, 0);
+
+    const closeStarted = performance.now();
+    recursiveWatcher.close();
+    const closeElapsed = performance.now() - closeStarted;
+    assert.ok(
+      closeElapsed < 150,
+      `expected fast watcher close, took ${closeElapsed.toFixed(1)}ms`,
+    );
+  }
+
+  // Per-directory fallback mode remains functional for platforms without recursive fs.watch.
+  let fallbackEvents = 0;
+  const hasFallbackEvents = () => fallbackEvents > 0;
+  const fallbackWatcher = new watching.ReviewWatcher(
+    () => fallbackEvents++,
+    100,
+    false,
+  );
+  t.after(() => fallbackWatcher.close());
+  fallbackWatcher.update(state);
+  write(
+    path.join(w.a, "pkg-0/src/components/index.ts"),
+    "export const v = 99;\n",
+  );
+  const deadline = Date.now() + 5000;
+  while (!hasFallbackEvents() && Date.now() < deadline) {
+    await new Promise((r) => setTimeout(r, 20));
+  }
+  assert.ok(hasFallbackEvents());
+});
+
 test(
   "Git worker reports failures without terminating and safely reads a specific worktree",
   { timeout: 30000 },

@@ -116,9 +116,14 @@ class GitWorker {
   );
   private readonly freezeId = randomUUID();
   private queue = Promise.resolve();
+  private queueDepth = 0;
+  private isReady = false;
   private signalReady!: () => void;
   private readonly ready = new Promise<void>((resolve) => {
-    this.signalReady = resolve;
+    this.signalReady = () => {
+      this.isReady = true;
+      resolve();
+    };
   });
   private serial = 0;
   private failure?: Error;
@@ -196,8 +201,7 @@ class GitWorker {
   }
 
   request<T>(op: string, data: Record<string, unknown> = {}): Promise<T> {
-    const result = this.queue.then(async () => {
-      await this.ready;
+    const send = () => {
       if (this.closed) throw new Error("Review closed");
       if (this.failure) throw this.failure;
       if (op === "freeze") this.frozenRefs = true;
@@ -216,10 +220,28 @@ class GitWorker {
           }
         });
       });
-    });
+    };
+    let result: Promise<T>;
+    if (this.isReady && this.queueDepth === 0 && !this.active) {
+      try {
+        result = send();
+      } catch (error) {
+        result = Promise.reject(error);
+      }
+    } else {
+      result = this.queue.then(async () => {
+        if (!this.isReady) await this.ready;
+        return send();
+      });
+    }
+    this.queueDepth++;
     this.queue = result.then(
-      () => {},
-      () => {},
+      () => {
+        this.queueDepth--;
+      },
+      () => {
+        this.queueDepth--;
+      },
     );
     return result;
   }
@@ -236,7 +258,7 @@ class GitWorker {
       const finished = await Promise.race([
         this.queue.then(() => true),
         new Promise<boolean>((resolve) => {
-          timer = setTimeout(() => resolve(false), 350);
+          timer = setTimeout(() => resolve(false), 50);
         }),
       ]);
       clearTimeout(timer);
