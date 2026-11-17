@@ -2,7 +2,14 @@ import { createHash, randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import type { Stage, WorkflowRun } from "./agent-runner.js";
-import { canonical, gitRaw, inside, now, sessionId } from "./common.js";
+import {
+  agentSessionId,
+  canonical,
+  gitRaw,
+  inside,
+  now,
+  sessionId,
+} from "./common.js";
 import type { JsonObject } from "./json.js";
 import {
   evaluate,
@@ -534,11 +541,11 @@ export function collaborationTool(
 
   if (name === "rl_workflow_bind") {
     const childId = prose(input.childId, "native child identifier", 200);
-    if (run.owner?.agent === "agy") {
-      sessionId(childId);
+    if (run.owner?.agent === "agy" || run.owner?.agent === "opencode") {
+      agentSessionId(run.owner.agent, childId);
       if (childId === run.owner.sessionId)
         throw new Error(
-          "The main Antigravity conversation cannot be bound as its own subagent",
+          `The main ${run.owner.agent === "agy" ? "Antigravity conversation" : "OpenCode session"} cannot be bound as its own subagent`,
         );
     }
     if (

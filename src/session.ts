@@ -1,11 +1,16 @@
 import type { Agent } from "./agents.js";
-import { sessionId } from "./common.js";
+import { agentSessionId, sessionId } from "./common.js";
 
 export function currentSessionId(agent: Agent, explicit?: unknown): string {
   if (explicit !== undefined) {
-    return sessionId(explicit);
+    return agentSessionId(agent, explicit);
   }
   if (agent !== "codex") {
+    if (agent === "opencode") {
+      throw new Error(
+        "Supply the OpenCode session ID (ses_... or UUID) explicitly",
+      );
+    }
     const label =
       agent === "agy" ? "Antigravity conversation" : "Claude session";
     throw new Error(`Supply the ${label} UUID explicitly`);

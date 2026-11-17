@@ -1,9 +1,9 @@
 import { agentAdapter } from "./agent-registry.js";
-import { reconcileAntigravitySessions } from "./agent-runner.js";
+import { reconcileNativeSessions } from "./agent-runner.js";
 import { desktopAgent, desktopLaunch } from "./agent-desktop.js";
 import type { Agent } from "./agents.js";
 import { syncCodexSessions } from "./codex-sessions.js";
-import { execute, message, now, sessionId, timestamp } from "./common.js";
+import { agentSessionId, execute, message, now, timestamp } from "./common.js";
 import type { Store } from "./store.js";
 import { sanitizeTerminalText } from "./tui/ansi.js";
 import { runFzf } from "./tui/fzf.js";
@@ -20,19 +20,25 @@ export async function resumeSessions(
   }
   const [, data] = await store.locked(() => {
     const record = store.current();
-    if (!kind || kind === "agy") reconcileAntigravitySessions(store, ...record);
+    if (!kind || kind === "agy" || kind === "opencode") {
+      reconcileNativeSessions(
+        store,
+        ...record,
+        kind === "agy" || kind === "opencode" ? [kind] : ["agy", "opencode"],
+      );
+    }
     return record;
   });
   const kinds: Agent[] = kind
     ? [kind]
     : options.desktop
       ? ["codex", "claude"]
-      : ["codex", "claude", "agy"];
+      : ["codex", "claude", "agy", "opencode"];
   const choices = kinds
     .flatMap((agent) =>
       (data.sessions[agent] ?? []).map((session) => ({ ...session, agent })),
     )
-    .toSorted((a, b) => {
+    .sort((a, b) => {
       const recent = timestamp(b.lastUsedAt) - timestamp(a.lastUsedAt);
       if (recent > 0n) return 1;
       if (recent < 0n) return -1;
@@ -113,24 +119,25 @@ export async function resumeAgent(
     if (options.expectedKey && instance.key !== options.expectedKey) {
       throw new Error("Instance changed before agent launch");
     }
-    if (kind === "agy")
-      reconcileAntigravitySessions(store, instanceFile, instance);
+    if (kind === "agy" || kind === "opencode")
+      reconcileNativeSessions(store, instanceFile, instance, [kind]);
     const sessions = instance.sessions[kind] ?? [];
     const item =
       options.sessionId !== undefined
-        ? sessions.find((s) => s.id === sessionId(options.sessionId))
+        ? sessions.find((s) => s.id === agentSessionId(kind, options.sessionId))
         : sessions.reduce<(typeof sessions)[number] | undefined>(
             (a, b) =>
               !a || timestamp(b.lastUsedAt) > timestamp(a.lastUsedAt) ? b : a,
             undefined,
           );
     if (!item) {
-      const uuidHint = kind !== "codex" ? " <UUID>" : "";
+      const uuidHint =
+        kind === "opencode" ? " <ID>" : kind !== "codex" ? " <UUID>" : "";
       throw new Error(
         `No ${kind} session recorded for ${instance.id}. Use 'rl agent save ${kind}${uuidHint}'`,
       );
     }
-    return [instanceFile, instance, sessionId(item.id)] as const;
+    return [instanceFile, instance, agentSessionId(kind, item.id)] as const;
   });
 
   const stamp = now();

@@ -20,10 +20,10 @@ export async function doctor(
     ? [agentAdapter(selected)]
     : Object.values(adapters).filter(
         (adapter) =>
-          adapter.name !== "agy" ||
-          Boolean(findExecutable("agy")) ||
-          Boolean(data.sessions.agy?.length) ||
-          Boolean(data.activity?.agy?.length),
+          (adapter.name !== "agy" && adapter.name !== "opencode") ||
+          Boolean(findExecutable(adapter.name)) ||
+          Boolean(data.sessions[adapter.name]?.length) ||
+          Boolean(data.activity?.[adapter.name]?.length),
       );
 
   const agents = await Promise.all(
@@ -68,10 +68,14 @@ export async function doctor(
             (adapter.name === "codex"
               ? /codex exec/.test(helpResult.stdout) &&
                 /PROMPT/.test(helpResult.stdout)
-              : /--print/.test(helpResult.stdout) &&
-                (adapter.name === "agy"
-                  ? /--conversation/.test(helpResult.stdout)
-                  : /--resume/.test(helpResult.stdout)));
+              : adapter.name === "opencode"
+                ? /\brun\b/.test(helpResult.stdout) &&
+                  /--session/.test(helpResult.stdout) &&
+                  /--prompt/.test(helpResult.stdout)
+                : /--print/.test(helpResult.stdout) &&
+                  (adapter.name === "agy"
+                    ? /--conversation/.test(helpResult.stdout)
+                    : /--resume/.test(helpResult.stdout)));
         }
       } catch (error) {
         cliError = message(error);

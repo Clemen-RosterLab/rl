@@ -4,122 +4,108 @@ import fs from "node:fs";
 import path from "node:path";
 import { Workspace, read, write } from "./helpers.js";
 
-function cloudFixture(t: TestContext) {
+function fixture(t: TestContext) {
   const w = new Workspace(t, { minimal: true });
   for (const key of [
+    "RL_CLOUD_HOST",
+    "RL_CLOUD_VM",
     "RL_CLOUD_PROJECT",
     "RL_CLOUD_ZONE",
     "RL_CLOUD_TEMPLATE",
-    "RL_CLOUD_VM",
   ])
     delete w.env[key];
-  const calls = path.join(w.root, "cloud-calls.jsonl");
+  const calls = path.join(w.root, "ssh-calls.jsonl");
   w.env.CLOUD_CONFIG_CALLS = calls;
   w.stub(
-    "gcloud",
+    "ssh",
     `const fs = require('node:fs');
-const argv = process.argv.slice(2);
-fs.appendFileSync(process.env.CLOUD_CONFIG_CALLS, JSON.stringify(argv) + '\\n');
-if (argv[0] === 'config') console.log('developer@example.invalid');
-else console.log('[]');`,
+fs.appendFileSync(process.env.CLOUD_CONFIG_CALLS, JSON.stringify(process.argv.slice(2)) + '\\n');
+console.log(JSON.stringify({home:'/remote',rlInstalled:true,defaultRepo:null,repositories:[],instances:[],errors:[]}));`,
+  );
+  w.stub(
+    "gcloud",
+    `require('node:fs').writeFileSync(process.env.CLOUD_CONFIG_CALLS + '.gcloud', 'called'); process.exit(99);`,
   );
   return { w, calls };
 }
 
-test("GCP commands fail before contacting gcloud when project or zone is missing", (t) => {
-  const { w, calls } = cloudFixture(t);
-  for (const argv of [
-    ["vms"],
-    ["start", "dev-box"],
-    ["stop", "dev-box"],
-    ["create", "dev-box"],
-    ["ssh-config", "dev-box", "--dry-run"],
+test("host selection honors flags, environment, private config and saved hosts without using GCP", (t) => {
+  const { w, calls } = fixture(t);
+  w.rl(["cloud", "use", "saved-host"]);
+  const host = (flags: string[] = []) => {
+    w.rl(["cloud", "list", "--json", ...flags]);
+    return JSON.parse(read(calls).trim().split("\n").at(-1)!)[2];
+  };
+  assert.equal(host(), "saved-host");
+  write(w.config, 'cloudVm = "legacy-host"\n');
+  assert.equal(host(), "legacy-host");
+  const config =
+    'cloudHost = "config-host"\ncloudProject = "ignored"\ncloudZone = "ignored"\ncloudTemplate = "ignored"\n';
+  write(w.config, config);
+  assert.equal(host(), "config-host");
+  w.env.RL_CLOUD_VM = "legacy-env";
+  assert.equal(host(), "legacy-env");
+  w.env.RL_CLOUD_HOST = "env-host";
+  assert.equal(host(), "env-host");
+  assert.equal(host(["--host", "flag-host"]), "flag-host");
+  assert.equal(host(["--vm", "legacy-flag"]), "legacy-flag");
+  assert.match(
+    w.rl(["cloud", "list", "--host", "one", "--vm", "two"], { ok: false })
+      .stderr,
+    /different hosts/,
+  );
+  assert.equal(read(w.config), config);
+  assert.ok(!fs.existsSync(calls + ".gcloud"));
+});
+
+test("removed infrastructure commands and invalid creation never contact the server", (t) => {
+  const { w, calls } = fixture(t);
+  for (const command of [
+    "vms",
+    "ssh-config",
+    "ssh",
+    "tunnel",
+    "start",
+    "stop",
+    "delete",
   ]) {
     assert.match(
-      w.rl(["cloud", ...argv], { ok: false }).stderr,
-      /No Google Cloud project configured/,
+      w.rl(["cloud", command], { ok: false }).stderr,
+      /infrastructure commands have been removed/,
     );
   }
-  write(w.config, 'cloudProject = "example-project"\n');
-  for (const argv of [
-    ["start", "dev-box"],
-    ["stop", "dev-box"],
-    ["create", "dev-box"],
-    ["ssh-config", "dev-box", "--dry-run"],
-  ]) {
-    assert.match(
-      w.rl(["cloud", ...argv], { ok: false }).stderr,
-      /No Google Cloud zone configured/,
-    );
-  }
-  assert.ok(
-    !fs.existsSync(calls),
-    "Missing settings must not contact a cloud account",
+  assert.match(
+    w.rl(["cloud", "list"], { ok: false }).stderr,
+    /No cloud host configured/,
+  );
+  w.rl(["cloud", "create", "bad name", "--host", "dev-box"], { ok: false });
+  w.rl(["cloud", "create", "--host", "dev-box"], { ok: false });
+  w.rl(["cloud", "create", "new-work", "--host", "-bad"], { ok: false });
+  assert.ok(!fs.existsSync(calls));
+  assert.ok(!fs.existsSync(calls + ".gcloud"));
+  const help = w.rl(["cloud", "--help"]).stdout;
+  assert.match(help, /create\s+Create a workspace/);
+  assert.doesNotMatch(
+    help,
+    /\n  (vms|start|stop|delete|ssh-config|tunnel|ssh)\s/,
   );
 });
 
-test("cloud settings resolve from private config, then environment, then command flags", (t) => {
-  const { w, calls } = cloudFixture(t);
-  const config = [
-    'cloudProject = "file-project"',
-    'cloudZone = "us-central1-a"',
-    'cloudTemplate = "file-template"',
-    'cloudVm = "file-vm"',
-    "",
-  ].join("\n");
-  write(w.config, config);
-  const invocation = () => JSON.parse(read(calls).trim().split("\n").at(-1)!);
-  w.rl(["cloud", "start"]);
-  assert.deepEqual(invocation(), [
-    "compute",
-    "instances",
-    "start",
-    "file-vm",
-    "--project=file-project",
-    "--billing-project=file-project",
-    "--zone=us-central1-a",
-  ]);
-  w.env.RL_CLOUD_PROJECT = "env-project";
-  w.env.RL_CLOUD_ZONE = "us-east1-b";
-  w.env.RL_CLOUD_TEMPLATE = "env-template";
-  w.env.RL_CLOUD_VM = "env-vm";
-  w.rl(["cloud", "start"]);
-  assert.deepEqual(invocation(), [
-    "compute",
-    "instances",
-    "start",
-    "env-vm",
-    "--project=env-project",
-    "--billing-project=env-project",
-    "--zone=us-east1-b",
-  ]);
-  w.rl([
-    "cloud",
-    "start",
-    "--project",
-    "flag-project",
-    "--zone",
-    "us-west1-a",
-    "--vm",
-    "flag-vm",
-  ]);
-  assert.deepEqual(invocation(), [
-    "compute",
-    "instances",
-    "start",
-    "flag-vm",
-    "--project=flag-project",
-    "--billing-project=flag-project",
-    "--zone=us-west1-a",
-  ]);
-  w.rl(["cloud", "create", "new-vm"]);
-  assert.ok(invocation().includes("--source-instance-template=env-template"));
-  delete w.env.RL_CLOUD_TEMPLATE;
-  w.rl(["cloud", "create", "another-vm"]);
-  assert.ok(invocation().includes("--source-instance-template=file-template"));
-  assert.equal(
-    read(w.config),
-    config,
-    "Commands must not rewrite private configuration",
+test("workspace creation requires a registered repository and remote rl", (t) => {
+  const { w, calls } = fixture(t);
+  assert.match(
+    w.rl(["cloud", "create", "new-work", "--host", "dev-box"], { ok: false })
+      .stderr,
+    /No registered remote repositories/,
+  );
+  assert.equal(read(calls).trim().split("\n").length, 1);
+  w.stub(
+    "ssh",
+    `console.log(JSON.stringify({home:'/remote',rlInstalled:false,defaultRepo:null,repositories:[],instances:[],errors:[]}));`,
+  );
+  assert.match(
+    w.rl(["cloud", "create", "new-work", "--host", "dev-box"], { ok: false })
+      .stderr,
+    /Install rl on the SSH host/,
   );
 });

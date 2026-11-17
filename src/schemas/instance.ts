@@ -5,6 +5,7 @@ import {
   AGENTS,
   GitOidSchema,
   IsoTimestampSchema,
+  OpenCodeSessionIdSchema,
   StrictLowerUuidSchema,
 } from "./common.js";
 
@@ -23,9 +24,19 @@ export const SessionSchema = z.strictObject({
   lastUsedAt: IsoTimestampSchema,
 });
 
-function uniqueSessionList() {
+function uniqueSessionList(
+  idSchema: z.ZodType<string> = StrictLowerUuidSchema,
+) {
+  const schema =
+    idSchema === StrictLowerUuidSchema
+      ? SessionSchema
+      : z.strictObject({
+          id: idSchema,
+          createdAt: IsoTimestampSchema,
+          lastUsedAt: IsoTimestampSchema,
+        });
   return z
-    .array(SessionSchema)
+    .array(schema)
     .refine(
       (items) => new Set(items.map((item) => item.id)).size === items.length,
       "Duplicate session ID in instance metadata",
@@ -97,7 +108,7 @@ export const TaskHandoffSchema = z
   .strictObject({
     id: StrictLowerUuidSchema,
     agent: AgentNameSchema,
-    sessionId: StrictLowerUuidSchema,
+    sessionId: z.string().min(1),
     savedAt: IsoTimestampSchema,
     summary: z.string(),
     changes: z.string(),
@@ -106,6 +117,17 @@ export const TaskHandoffSchema = z
     blockers: z.string(),
   })
   .superRefine((val, ctx) => {
+    const sessionCheck = (
+      val.agent === "opencode" ? OpenCodeSessionIdSchema : StrictLowerUuidSchema
+    ).safeParse(val.sessionId);
+    if (!sessionCheck.success) {
+      ctx.addIssue({
+        code: "custom",
+        path: ["sessionId"],
+        message:
+          sessionCheck.error.issues[0]?.message ?? "Invalid task session ID",
+      });
+    }
     const check = HandoffNotesInputSchema.safeParse(val);
     if (!check.success) {
       ctx.addIssue({
@@ -163,6 +185,7 @@ export const InstanceDiskSchema = z.looseObject({
     codex: uniqueSessionList(),
     claude: uniqueSessionList(),
     agy: uniqueSessionList().optional(),
+    opencode: uniqueSessionList(OpenCodeSessionIdSchema).optional(),
   }),
   pr: z.union([z.null(), z.looseObject({ url: z.string() })]),
   hookCommands: z
@@ -170,6 +193,7 @@ export const InstanceDiskSchema = z.looseObject({
       codex: z.string(),
       claude: z.string(),
       agy: z.string(),
+      opencode: z.string(),
     })
     .partial()
     .optional(),

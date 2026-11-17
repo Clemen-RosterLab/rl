@@ -12,11 +12,13 @@ import {
   resolveWorkspace,
 } from "./command-context.js";
 import {
+  agentSessionId,
   args,
   arity,
   atomicWrite,
   json,
   now,
+  openCodeSessionId,
   sessionId,
   timestamp,
 } from "./common.js";
@@ -119,7 +121,7 @@ export async function feedback(
     const [, current] = review.store.current(review.data.worktree);
     const allowedAgents = options.agent
       ? [agentAdapter(options.agent).name]
-      : (["codex", "claude", "agy"] as const);
+      : (["codex", "claude", "agy", "opencode"] as const);
 
     let choices = allowedAgents
       .flatMap((agent) =>
@@ -128,7 +130,7 @@ export async function feedback(
           agent,
         })),
       )
-      .toSorted((a, b) => {
+      .sort((a, b) => {
         const diff = timestamp(b.lastUsedAt) - timestamp(a.lastUsedAt);
         if (diff > 0n) return 1;
         if (diff < 0n) return -1;
@@ -136,8 +138,10 @@ export async function feedback(
       });
 
     if (options.session) {
-      sessionId(options.session);
-      choices = choices.filter((choice) => choice.id === options.session);
+      const normalized = options.agent
+        ? agentSessionId(agentAdapter(options.agent).name, options.session)
+        : openCodeSessionId(options.session);
+      choices = choices.filter((choice) => choice.id === normalized);
     }
 
     let selected = choices[0];

@@ -33,7 +33,7 @@ import {
 } from "./workflow-config.js";
 
 const SETUP_LOCK_DIR = ".workspace-setup";
-const SUPPORTED_AGENTS = new Set(["codex", "claude", "agy"]);
+const SUPPORTED_AGENTS = new Set(["codex", "claude", "agy", "opencode"]);
 
 const COMMAND_OPTIONS: Readonly<Record<string, readonly string[]>> = {
   path: [],
@@ -301,7 +301,7 @@ export async function main(argv: string[]): Promise<number> {
   arity(names, 1);
   const agent = typeof values.agent === "string" ? values.agent : undefined;
   if (agent && !SUPPORTED_AGENTS.has(agent)) {
-    throw new UsageError("Agent must be codex, claude or agy");
+    throw new UsageError("Agent must be codex, claude, agy or opencode");
   }
 
   const base =

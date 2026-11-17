@@ -36,6 +36,7 @@ import {
   sanitizeTerminalText,
 } from "./tui/ansi.js";
 import { runFzf } from "./tui/fzf.js";
+import { formatOverviewTable } from "./overview-table.js";
 
 export interface Repository {
   root: string;
@@ -103,6 +104,14 @@ function inferRepositoryName(root: string): string {
   } catch {
     return path.basename(root);
   }
+  return repositorySourceName(source);
+}
+
+function isRemoteSource(source: string): boolean {
+  return /^[a-z][a-z0-9+.-]*:\/\//i.test(source) || /^[^/\s:]+:.+/.test(source);
+}
+
+function repositorySourceName(source: string): string {
   if (source.includes("://")) {
     try {
       source = new URL(source).pathname;
@@ -194,7 +203,7 @@ class Registry {
   async checkout(name?: string, output?: string): Promise<void> {
     const data = this.read();
     const repos = Object.entries(data.repositories)
-      .toSorted(([a], [b]) => a.localeCompare(b))
+      .sort(([a], [b]) => a.localeCompare(b))
       .map(([repoName, repo]) => ({ name: repoName, ...repo }));
 
     if (repos.length === 0) {
@@ -278,6 +287,90 @@ class Registry {
     writeWorkspaceOutput(selected.root, output);
   }
 
+  async clone(rest: string[], values: Record<string, unknown>): Promise<void> {
+    arity(rest, 2, 3);
+    const source = rest[1];
+    if (!source || source.startsWith("-") || /[\x00-\x1f\x7f]/.test(source)) {
+      throw new UsageError("Expected a Git URL or local repository path");
+    }
+    const name = String(values.alias ?? repositorySourceName(source));
+    const directoryName = values["worktree-name"] ?? name;
+    if (!isValidRepoAlias(name) || !isValidRepoAlias(directoryName)) {
+      throw new UsageError("Invalid repository name; supply --alias <name>");
+    }
+    if (
+      values.base !== undefined &&
+      (typeof values.base !== "string" ||
+        !values.base ||
+        /[\r\n]/.test(values.base))
+    ) {
+      throw new UsageError("Invalid repository base");
+    }
+    const repos = this.read().repositories;
+    if (Object.hasOwn(repos, name)) {
+      throw new Error(
+        `Repository name already registered: ${name}; choose --alias <name>`,
+      );
+    }
+    if (
+      Object.values(repos).some((repo) => repo.worktreeName === directoryName)
+    ) {
+      throw new Error(
+        "Worktree directory name is already in use; choose --worktree-name",
+      );
+    }
+
+    const destination = path.resolve(expandHome(rest[2] ?? name));
+    if (/[\x00-\x1f\x7f]/.test(destination)) {
+      throw new UsageError("Invalid clone destination");
+    }
+    // Reserve a new directory exclusively, including rejecting dangling symlinks.
+    // Never delete a failed clone: another process may have written into it.
+    fs.mkdirSync(path.dirname(destination), { recursive: true });
+    try {
+      fs.mkdirSync(destination);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "EEXIST") {
+        throw new Error(
+          `Clone destination already exists: ${destination}. Use 'rl repo add <path>' to register an existing checkout.`,
+          { cause: error },
+        );
+      }
+      throw error;
+    }
+    const result = await execute(
+      [
+        "git",
+        "clone",
+        "--origin",
+        "origin",
+        "--",
+        expandHome(source),
+        destination,
+      ],
+      process.cwd(),
+      { interactive: true },
+    );
+    if (result.code !== 0) {
+      throw new Error(
+        `Git clone failed; repository was not registered. Inspect ${destination} before retrying.`,
+      );
+    }
+    try {
+      // Registration takes its usual lock and rechecks collisions after the clone.
+      await this.manage(["add", destination], { ...values, alias: name });
+    } catch (error) {
+      throw new Error(
+        `Cloned to ${destination}, but registration failed: ${message(error)}. The checkout has been kept; register it with 'rl repo add <path>'.`,
+        { cause: error },
+      );
+    }
+    writeWorkspaceOutput(
+      canonical(destination),
+      values["output-path"] as string | undefined,
+    );
+  }
+
   async manage(rest: string[], values: Record<string, unknown>): Promise<void> {
     await locked(
       path.dirname(this.file),
@@ -297,7 +390,7 @@ class Registry {
               "No registered repositories; using legacy RL_REPO_ROOT configuration.",
             );
           } else {
-            for (const key of Object.keys(repos).toSorted()) {
+            for (const key of Object.keys(repos).sort()) {
               const repo = repos[key];
               const marker = key === data.default ? "*" : " ";
               console.log(
@@ -434,6 +527,7 @@ async function repositoryRows(
   settings: Settings,
   fetch: boolean,
   includeDeleted: boolean,
+  includeExisting = false,
 ) {
   const store = new Store(repo.root, settings.stateDir);
   const rows: OverviewRow[] = [];
@@ -489,13 +583,19 @@ async function repositoryRows(
     try {
       for (const item of worktrees(repo.root).slice(1)) {
         const root = canonical(item.worktree);
-        if (!inside(root, managedBase) || activePaths.has(root)) {
+        if (
+          (!includeExisting && !inside(root, managedBase)) ||
+          activePaths.has(root)
+        ) {
           continue;
         }
         pendingTargets.push({
           kind: "unregistered",
           row: {
-            id: path.relative(managedBase, root),
+            id: inside(root, managedBase)
+              ? path.relative(managedBase, root)
+              : (item.branch ?? "").replace(/^refs\/heads\//, "") ||
+                path.basename(root),
             key: null,
             repository: repo.root,
             worktree: root,
@@ -551,86 +651,11 @@ async function repositoryRows(
   };
 }
 
-export function renderOverviewTable(rows: OverviewRow[]): void {
-  const hasAgy = rows.some((row) => row.sessions?.agy?.length);
-  const table: string[][] = [
-    [
-      "REPOSITORY",
-      "INSTANCE",
-      "BRANCH",
-      "WORKTREE",
-      "CHANGES",
-      "UPSTREAM",
-      "COMMITS + / −",
-      "PR (cached)",
-      "CODEX",
-      "CLAUDE",
-      ...(hasAgy ? ["AGY"] : []),
-      "TASK",
-    ],
-  ];
-
-  for (const row of rows) {
-    const s = row.gitStatus;
-    let changes: string;
-    if (s.availability !== "ok") {
-      changes = s.availability;
-    } else if (!s.dirty) {
-      changes = "clean";
-    } else {
-      changes = (
-        [
-          ["staged", "S"],
-          ["unstaged", "M"],
-          ["untracked", "?"],
-          ["conflicts", "!"],
-        ] as const
-      )
-        .filter(([key]) => s[key] > 0)
-        .map(([key, letter]) => `${s[key]}${letter}`)
-        .join("/");
-    }
-
-    let sync: string;
-    if (!s.upstream) {
-      sync = "no upstream";
-    } else if (s.ahead === null) {
-      sync = "unavailable";
-    } else {
-      sync = `+${s.ahead}/-${s.behind}`;
-    }
-
-    table.push([
-      sanitizeTerminalText(row.repositoryName),
-      sanitizeTerminalText(row.id),
-      sanitizeTerminalText(s.branch || row.branch || "(detached)") +
-        (s.branchChanged ? " [changed]" : ""),
-      sanitizeTerminalText(row.status),
-      sanitizeTerminalText(changes),
-      sanitizeTerminalText(s.upstream || "-"),
-      sync,
-      row.pr ? sanitizeTerminalText(`#${row.pr.number} ${row.pr.state}`) : "-",
-      String(row.sessions?.codex.length ?? 0),
-      String(row.sessions?.claude.length ?? 0),
-      ...(hasAgy ? [String(row.sessions?.agy?.length ?? 0)] : []),
-      sanitizeTerminalText(row.task?.state ?? "-"),
-    ]);
-  }
-
-  const widths = table[0].map((_, col) =>
-    Math.max(...table.map((row) => row[col].length)),
-  );
-  for (const row of table) {
-    console.log(
-      row
-        .map((value, col) => value.padEnd(widths[col]))
-        .join("  ")
-        .trimEnd(),
-    );
-  }
-  if (rows.length === 0) {
-    console.log("No RL instances found.");
-  }
+export function renderOverviewTable(
+  rows: OverviewRow[],
+  fetched = false,
+): void {
+  console.log(formatOverviewTable(rows, { fetched }));
 }
 
 async function repositoryStatus(
@@ -705,6 +730,14 @@ async function repositoryStatus(
             ),
           }
         : {}),
+      ...(result.rows.some((row) => row.sessions?.opencode?.length)
+        ? {
+            opencode: result.rows.reduce(
+              (n, row) => n + (row.sessions?.opencode?.length ?? 0),
+              0,
+            ),
+          }
+        : {}),
     },
     fetched: fetch,
     errors: result.errors,
@@ -737,7 +770,7 @@ async function repositoryStatus(
         ),
         formatField(
           "Sessions",
-          `${status.sessions.codex} Codex · ${status.sessions.claude} Claude${status.sessions.agy ? ` · ${status.sessions.agy} Antigravity` : ""} saved`,
+          `${status.sessions.codex} Codex · ${status.sessions.claude} Claude${status.sessions.agy ? ` · ${status.sessions.agy} Antigravity` : ""}${status.sessions.opencode ? ` · ${status.sessions.opencode} OpenCode` : ""} saved`,
         ),
         formatField("Default", data.default ?? "legacy configuration"),
         "",
@@ -788,6 +821,7 @@ export async function main(argv: string[]): Promise<number> {
       "json",
       "fetch",
       "include-deleted",
+      "include-existing",
       "cloud",
       "include-cloud",
     ],
@@ -808,8 +842,24 @@ export async function main(argv: string[]): Promise<number> {
 
   const registry = new Registry(settings);
   const [command, ...rest] = positionals;
+  if (
+    values["include-existing"] &&
+    !(command === "status" && (values.list || values.all))
+  )
+    throw new UsageError("--include-existing requires rl list");
+  if (values["include-existing"] && values.cloud)
+    throw new UsageError(
+      "--include-existing applies to local Git worktrees; omit --cloud",
+    );
 
   if (command === "repo") {
+    if (
+      rest[0] === "clone" ||
+      (rest[0] === "add" && isRemoteSource(rest[1] ?? ""))
+    ) {
+      await registry.clone(rest, values);
+      return 0;
+    }
     if (rest[0] === "list" && (values.cloud || values["include-cloud"])) {
       arity(rest, 1);
       const { fetchCloudRepositories } = await import("./cloud.js");
@@ -837,7 +887,7 @@ export async function main(argv: string[]): Promise<number> {
         );
       } else {
         if (localData) {
-          for (const key of Object.keys(localData.repositories).toSorted()) {
+          for (const key of Object.keys(localData.repositories).sort()) {
             const repo = localData.repositories[key]!;
             const marker = key === localData.default ? "*" : " ";
             console.log(
@@ -913,10 +963,7 @@ export async function main(argv: string[]): Promise<number> {
         fetched: Boolean(values.fetch),
       });
     } else {
-      renderOverviewTable(cloud.rows);
-      console.log(
-        "S=staged M=unstaged ?=untracked !=conflicts; +ahead/-behind relative to upstream.",
-      );
+      renderOverviewTable(cloud.rows, Boolean(values.fetch));
       for (const err of cloud.errors) {
         console.error(
           `${sanitizeTerminalText(err.repository)}: ${sanitizeTerminalText(err.message)}`,
@@ -928,7 +975,7 @@ export async function main(argv: string[]): Promise<number> {
 
   let repos = values.all
     ? Object.keys(data.repositories)
-        .toSorted()
+        .sort()
         .map((name) => ({ name, ...data.repositories[name] }))
     : [registry.resolve(data)];
   if (repos.length === 0) {
@@ -942,6 +989,7 @@ export async function main(argv: string[]): Promise<number> {
         settings,
         Boolean(values.fetch),
         Boolean(values["include-deleted"]),
+        true,
       ),
     ),
     values["include-cloud"]
@@ -960,7 +1008,7 @@ export async function main(argv: string[]): Promise<number> {
   const combinedRows = [
     ...localRows,
     ...(cloudResult ? cloudResult.rows : []),
-  ].toSorted((a, b) =>
+  ].sort((a, b) =>
     [a.repositoryName, a.id, a.status]
       .join("\0")
       .localeCompare([b.repositoryName, b.id, b.status].join("\0")),
@@ -978,16 +1026,7 @@ export async function main(argv: string[]): Promise<number> {
       ...(cloudResult ? { cloudVm: cloudResult.vm } : {}),
     });
   } else {
-    renderOverviewTable(combinedRows);
-    console.log(
-      "S=staged M=unstaged ?=untracked !=conflicts; +ahead/-behind relative to upstream.",
-    );
-    console.log(
-      "Remote refs: " +
-        (values.fetch
-          ? "fetch requested (see errors if any)."
-          : "locally cached; use --fetch to refresh."),
-    );
+    renderOverviewTable(combinedRows, Boolean(values.fetch));
     for (const err of errors) {
       console.error(
         `${sanitizeTerminalText(err.repository)}: ${sanitizeTerminalText(err.message)}`,

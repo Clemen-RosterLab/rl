@@ -242,6 +242,7 @@ export function shellQuote(value: string): string {
     ? value
     : "'" + value.replaceAll("'", "'\"'\"'") + "'";
 }
+export const OPENCODE_SESSION_ID_REGEX = /^ses_[A-Za-z0-9_-]{4,128}$/;
 export function sessionId(value: unknown): string {
   if (
     typeof value !== "string" ||
@@ -251,6 +252,21 @@ export function sessionId(value: unknown): string {
       "Expected the agent's full session UUID, not a name or prefix",
     );
   return value.toLowerCase();
+}
+export function openCodeSessionId(value: unknown): string {
+  if (typeof value === "string" && OPENCODE_SESSION_ID_REGEX.test(value)) {
+    return value;
+  }
+  try {
+    return sessionId(value);
+  } catch {
+    throw new Error(
+      "Expected the OpenCode session ID (ses_...) or full session UUID, not a name or prefix",
+    );
+  }
+}
+export function agentSessionId(agent: string, value: unknown): string {
+  return agent === "opencode" ? openCodeSessionId(value) : sessionId(value);
 }
 // Normalize timezone offsets while retaining Python's microsecond timestamp precision.
 export function timestamp(value: string): bigint {

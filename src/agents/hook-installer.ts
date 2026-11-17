@@ -1,5 +1,9 @@
 import fs from "node:fs";
 import path from "node:path";
+import {
+  OPENCODE_PLUGIN_HEADER,
+  renderOpenCodePlugin,
+} from "../agent-opencode.js";
 import { adapters } from "../agent-registry.js";
 import type { Agent, AgentAdapter } from "../agents.js";
 import {
@@ -35,7 +39,7 @@ export function buildHookCommand(
     "hook",
     data.key,
     agent,
-    ...(agent === "agy" && event ? [event] : []),
+    ...((agent === "agy" || agent === "opencode") && event ? [event] : []),
   ];
   return tokens.map(shellQuote).join(" ") + HOOK_MARKER;
 }
@@ -60,21 +64,55 @@ function hasManagedHookEntry(existing: Record<string, unknown>): boolean {
   );
 }
 
+function hasSymlinkInHookPath(worktree: string, target: string): boolean {
+  let current = target;
+  while (current !== worktree && current.startsWith(worktree + path.sep)) {
+    if (isSymlink(current)) {
+      return true;
+    }
+    current = path.dirname(current);
+  }
+  return false;
+}
+
 export function installWorkspaceHooks(
   store: Store,
   file: string,
   data: Instance,
 ): void {
   const updates: [string, Record<string, unknown>][] = [];
+  const textUpdates: [string, string][] = [];
   const commands = {} as Record<Agent, string>;
 
   for (const adapter of Object.values(adapters)) {
     const agent = adapter.name;
     const target = path.join(data.worktree, adapter.configPath);
-    if (isSymlink(target) || isSymlink(path.dirname(target))) {
+    if (hasSymlinkInHookPath(data.worktree, target)) {
       throw new Error(
         `Refusing to install workspace hooks through a symlink: ${target}`,
       );
+    }
+
+    if (agent === "opencode") {
+      commands[agent] = buildHookCommand(store, data, agent);
+      if (fs.existsSync(target)) {
+        const existing = fs.readFileSync(target, "utf8");
+        if (!existing.startsWith(OPENCODE_PLUGIN_HEADER)) {
+          throw new Error(
+            `The existing OpenCode plugin in ${target} is not managed by RL`,
+          );
+        }
+      }
+      textUpdates.push([
+        target,
+        renderOpenCodePlugin({
+          repo: store.repo,
+          stateDir: store.stateDir,
+          key: data.key,
+          command: commands[agent],
+        }),
+      ]);
+      continue;
     }
 
     const config = fs.existsSync(target) ? readJson(target) : {};
@@ -173,6 +211,12 @@ export function installWorkspaceHooks(
     }
   }
 
+  for (const [target, content] of textUpdates) {
+    if (!fs.existsSync(target) || fs.readFileSync(target, "utf8") !== content) {
+      atomicWrite(target, content);
+    }
+  }
+
   const exclude = path.resolve(
     data.worktree,
     git(data.worktree, "rev-parse", "--git-path", "info/exclude"),
@@ -183,6 +227,7 @@ export function installWorkspaceHooks(
     "/.claude/settings.local.json",
     "/.agents/hooks.json",
     "/.agents/mcp_config.json",
+    "/.opencode/plugins/rl.js",
   ].filter((entry) => !text.split(/\r?\n/).includes(entry));
 
   if (missing.length > 0) {
@@ -216,54 +261,68 @@ export function inspectInstalledHooks(
   let installedEvents: string[] = [];
 
   try {
-    if (isSymlink(configPath) || isSymlink(path.dirname(configPath))) {
+    if (hasSymlinkInHookPath(data.worktree, configPath)) {
       throw new Error("Hook configuration is a symlink");
     }
-    const config = readJsonObject(configPath);
-    const hooks = config[adapter.hookNamespace ?? "hooks"];
-    if (!isJsonObject(hooks)) {
-      throw new Error("Missing hooks object");
-    }
-    if (hooks.enabled === false) {
-      throw new Error("RL hooks are explicitly disabled");
-    }
+    if (adapter.name === "opencode") {
+      const source = fs.readFileSync(configPath, "utf8");
+      if (!source.startsWith(OPENCODE_PLUGIN_HEADER)) {
+        throw new Error("OpenCode plugin is not managed by RL");
+      }
+      const expectedPlugin = renderOpenCodePlugin({
+        repo: store.repo,
+        stateDir: store.stateDir,
+        key: data.key,
+        command: buildHookCommand(store, data, "opencode"),
+      });
+      installedEvents = source === expectedPlugin ? expectedEvents : [];
+    } else {
+      const config = readJsonObject(configPath);
+      const hooks = config[adapter.hookNamespace ?? "hooks"];
+      if (!isJsonObject(hooks)) {
+        throw new Error("Missing hooks object");
+      }
+      if (hooks.enabled === false) {
+        throw new Error("RL hooks are explicitly disabled");
+      }
 
-    installedEvents = expectedEvents.filter((event) => {
-      const expectedCommand = buildHookCommand(
-        store,
-        data,
-        adapter.name,
-        event,
-      );
-      const groups = hooks[event];
-      if (!Array.isArray(groups)) {
-        return false;
-      }
-      if (adapter.directHookEvents?.includes(event)) {
-        return groups.some(
-          (handler) =>
-            isJsonObject(handler) &&
-            handler.type === "command" &&
-            handler.command === expectedCommand &&
-            handler.async !== true,
+      installedEvents = expectedEvents.filter((event) => {
+        const expectedCommand = buildHookCommand(
+          store,
+          data,
+          adapter.name,
+          event,
         );
-      }
-      return groups.some(
-        (group) =>
-          isJsonObject(group) &&
-          (group.matcher === undefined ||
-            group.matcher === "" ||
-            group.matcher === "*") &&
-          Array.isArray(group.hooks) &&
-          group.hooks.some(
+        const groups = hooks[event];
+        if (!Array.isArray(groups)) {
+          return false;
+        }
+        if (adapter.directHookEvents?.includes(event)) {
+          return groups.some(
             (handler) =>
               isJsonObject(handler) &&
               handler.type === "command" &&
               handler.command === expectedCommand &&
               handler.async !== true,
-          ),
-      );
-    });
+          );
+        }
+        return groups.some(
+          (group) =>
+            isJsonObject(group) &&
+            (group.matcher === undefined ||
+              group.matcher === "" ||
+              group.matcher === "*") &&
+            Array.isArray(group.hooks) &&
+            group.hooks.some(
+              (handler) =>
+                isJsonObject(handler) &&
+                handler.type === "command" &&
+                handler.command === expectedCommand &&
+                handler.async !== true,
+            ),
+        );
+      });
+    }
   } catch (error) {
     configError = message(error);
   }

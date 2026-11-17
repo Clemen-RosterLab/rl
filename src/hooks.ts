@@ -3,7 +3,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { recordActivity } from "./activity.js";
 import { agentAdapter } from "./agent-registry.js";
-import { boundAntigravityPeer } from "./agent-runner.js";
+import { boundNativePeer } from "./agent-runner.js";
 import type { Agent, AgentAdapter, AgentEvent } from "./agents.js";
 import {
   git,
@@ -28,6 +28,10 @@ const EDIT_TOOL_NAMES = new Set([
   "Edit",
   "Write",
   "MultiEdit",
+  "edit",
+  "write",
+  "patch",
+  "multiedit",
   "apply_patch",
   "write_to_file",
   "replace_file_content",
@@ -88,7 +92,7 @@ function extractHookToolMetadata(
   const coordination =
     Boolean(tool) &&
     (tool!.includes("rl_workflow_") ||
-      (["Bash", "run_command"].includes(tool!) &&
+      (["Bash", "bash", "run_command"].includes(tool!) &&
         [input.command, input.cmd].some(
           (value) =>
             typeof value === "string" &&
@@ -150,14 +154,14 @@ function extractHookToolMetadata(
 function buildPeerContextText(
   store: Store,
   instanceFile: string,
-  peer: NonNullable<ReturnType<typeof boundAntigravityPeer>>,
+  peer: NonNullable<ReturnType<typeof boundNativePeer>>,
 ): string {
   const roleInstructions = peer.stage.agent
     ? peer.run.config.agents[peer.stage.agent].instructions
     : "";
   return [
     `You are the bound native RL peer ${peer.stage.id}, not a workflow coordinator. Do not create workflows or delegate. Run status: ${peer.run.status}.`,
-    `Parent identity: agent=agy, sessionId=${peer.run.owner!.sessionId}. Use this parent identity for RL collaboration tools, with run=${peer.run.id}, step=${peer.stage.id}, claim=${peer.stage.claim}. Follow the parent and your assigned role.`,
+    `Parent identity: agent=${peer.run.owner!.agent}, sessionId=${peer.run.owner!.sessionId}. Use this parent identity for RL collaboration tools, with run=${peer.run.id}, step=${peer.stage.id}, claim=${peer.stage.claim}. Follow the parent and your assigned role.`,
     roleInstructions,
     `Shared context (excerpt):\n${store.readDocument(instanceFile, "context").slice(0, 12000)}`,
     `Recorded progress claims (excerpt):\n${store.readDocument(instanceFile, "progress").slice(0, 12000)}`,
@@ -228,26 +232,23 @@ export async function handleHook(
 
     try {
       const event = adapter.parse(payload);
-      const peer =
-        adapter.name === "agy"
-          ? boundAntigravityPeer(file, data, event.sessionId)
-          : undefined;
-
-      const knownChild =
-        adapter.name === "agy" &&
-        data.activity?.agy?.some(
+      let peer: ReturnType<typeof boundNativePeer>;
+      if (adapter.name === "agy" || adapter.name === "opencode") {
+        peer = boundNativePeer(file, data, adapter.name, event.sessionId);
+        const knownChild = data.activity?.[adapter.name]?.some(
           (entry) =>
             entry.sessionId === event.sessionId &&
             entry.childId === event.sessionId &&
             !entry.resumable,
         );
-      if (peer || knownChild) {
-        event.childId = event.sessionId;
-        event.resumable = false;
-        // SessionStart can arrive before the parent has received and bound the
-        // new handle. Reclassify only when the persisted binding proves it.
-        store.markAntigravityChild(data, event.sessionId);
-        scrubPrematurePeerRequests(file, "agy", event.sessionId);
+        if (peer || knownChild) {
+          event.childId = event.sessionId;
+          event.resumable = false;
+          // SessionStart can arrive before the parent has received and bound the
+          // new handle. Reclassify only when the persisted binding proves it.
+          store.markNativeChild(data, adapter.name, event.sessionId);
+          scrubPrematurePeerRequests(file, adapter.name, event.sessionId);
+        }
       }
 
       const sharedContext = () =>

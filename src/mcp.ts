@@ -129,18 +129,20 @@ function buildCoreToolDescriptor(tool: (typeof TOOLS)[number]): JsonObject {
           },
         ]),
       ),
-      agent: { type: "string", enum: ["codex", "claude", "agy"] },
+      agent: { type: "string", enum: ["codex", "claude", "agy", "opencode"] },
       sessionId: {
         type: "string",
-        description: "Full UUID of the current conversation.",
+        description:
+          "Full UUID (or OpenCode ses_... session ID) of the current conversation.",
       },
     };
   } else if (tool.name === "rl_session_save") {
     properties = {
-      agent: { type: "string", enum: ["codex", "claude", "agy"] },
+      agent: { type: "string", enum: ["codex", "claude", "agy", "opencode"] },
       sessionId: {
         type: "string",
-        description: "Full session UUID; never a name or prefix.",
+        description:
+          "Full session UUID or OpenCode ses_... ID; never a name or prefix.",
       },
     };
   } else if (tool.append) {
@@ -221,7 +223,7 @@ async function callTool(
     switch (name) {
       case "rl_session_save": {
         if (input.agent !== undefined && typeof input.agent !== "string") {
-          throw new Error("agent must be codex, claude or agy");
+          throw new Error("agent must be codex, claude, agy or opencode");
         }
         const agent = agentAdapter(input.agent ?? "codex").name;
         const sid = currentSessionId(agent, input.sessionId);
@@ -240,6 +242,9 @@ async function callTool(
             claude: activityView(data.activity?.claude),
             ...(data.activity?.agy
               ? { agy: activityView(data.activity.agy) }
+              : {}),
+            ...(data.activity?.opencode
+              ? { opencode: activityView(data.activity.opencode) }
               : {}),
           },
         });

@@ -124,7 +124,7 @@ export function scopedFingerprint(
   run: WorkflowRun,
   files: readonly string[],
 ): string {
-  const unique = [...new Set(files)].toSorted();
+  const unique = [...new Set(files)].sort();
   let bytes = 0;
   const versions = unique.map((file) => {
     RelativeWorkspaceFileSchema.parse(file);
@@ -184,7 +184,7 @@ export function checkScope(
   if (check.scope.kind !== "files") return undefined;
   const files = [
     ...new Set([...check.scope.files, ...check.scope.dependencies]),
-  ].toSorted();
+  ].sort();
   return { files, fingerprint: scopedFingerprint(run, files) };
 }
 

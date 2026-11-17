@@ -12,14 +12,15 @@ const REASONING_BY_PROVIDER: Record<string, readonly string[]> = {
   codex: ["low", "medium", "high", "xhigh"],
   claude: ["low", "medium", "high", "max"],
   agy: ["low", "medium", "high", "xhigh", "max"],
-  inherit: ["low", "medium", "high", "xhigh", "max"],
+  opencode: ["minimal", "low", "medium", "high", "max"],
+  inherit: ["minimal", "low", "medium", "high", "xhigh", "max"],
 };
 
 const ModelSchema = nonNullTextSchema(64000, "model").refine(
   (val) => !val.startsWith("-"),
   "Invalid model",
 );
-const hostSettings = (host: "codex" | "claude" | "agy") =>
+const hostSettings = (host: "codex" | "claude" | "agy" | "opencode") =>
   z.strictObject({
     model: ModelSchema.optional(),
     reasoning: z
@@ -34,7 +35,9 @@ const hostSettings = (host: "codex" | "claude" | "agy") =>
 
 export const AgentProfileSchema = z
   .strictObject({
-    provider: z.enum(["inherit", "codex", "claude", "agy"]).optional(),
+    provider: z
+      .enum(["inherit", "codex", "claude", "agy", "opencode"])
+      .optional(),
     description: nonNullTextSchema(64000, "description"),
     instructions: nonNullTextSchema(64000, "instructions"),
     model: ModelSchema.optional(),
@@ -45,6 +48,7 @@ export const AgentProfileSchema = z
         codex: hostSettings("codex").optional(),
         claude: hostSettings("claude").optional(),
         agy: hostSettings("agy").optional(),
+        opencode: hostSettings("opencode").optional(),
       })
       .optional(),
   })

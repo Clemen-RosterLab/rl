@@ -455,7 +455,7 @@ export async function main(argv: string[]): Promise<number> {
     const candidateNumbers = await discoverMatchingSessionPrNumbers({
       worktree: data.worktree,
       repositoryUrl: repository.url,
-      branches: [...owners.keys()].toSorted(),
+      branches: [...owners.keys()].sort(),
       base,
       limit,
     });
@@ -472,7 +472,7 @@ export async function main(argv: string[]): Promise<number> {
     }
 
     selectedNumbers = await selectPrNumbersInteractively(
-      [...initialInspections.values()].toSorted((a, b) => a.number - b.number),
+      [...initialInspections.values()].sort((a, b) => a.number - b.number),
       data.worktree,
       base,
       dryRun,

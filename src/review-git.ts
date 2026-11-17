@@ -372,7 +372,7 @@ export function pinSnapshot(
     root,
     ["mktree"],
     Object.entries(trees)
-      .toSorted(([a], [b]) => a.localeCompare(b))
+      .sort(([a], [b]) => a.localeCompare(b))
       .map(([name, oid]) => `040000 tree ${oid}\t${name}\n`)
       .join(""),
   ).trim();

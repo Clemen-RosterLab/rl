@@ -122,6 +122,7 @@ test("npm tarball ships built JavaScript and bundled runtime dependencies, with 
     "orchestration/status",
     "orchestration/lean-protocol",
     "agent-agy",
+    "agent-opencode",
     "mcp",
     "mcp-setup",
     "bootstrap",
@@ -153,9 +154,62 @@ test("npm tarball ships built JavaScript and bundled runtime dependencies, with 
     [...manifest.bundleDependencies].sort(),
     "Every runtime dependency must be bundled for an offline installation",
   );
-  for (const script of ["install", "preinstall", "postinstall"])
+  for (const script of ["install", "preinstall"])
     assert.ok(!(script in manifest.scripts));
+  assert.match(manifest.scripts.postinstall, /autoConfigureShell/);
 });
+test(
+  "fresh global npm installation automatically enables workspace switching in a new shell",
+  { skip: process.getuid?.() === 0 },
+  (t) => {
+    const w = new Workspace(t),
+      archive = pack(w);
+    const home = path.join(w.root, "fresh-home");
+    const prefix = path.join(w.root, "global-prefix");
+    fs.mkdirSync(home);
+    Object.assign(w.env, {
+      HOME: home,
+      ZDOTDIR: home,
+      SHELL: "/bin/zsh",
+      CI: "false",
+      RL_SKIP_SHELL_SETUP: "0",
+      SUDO_USER: undefined,
+      SUDO_UID: undefined,
+    });
+    // Verify isolation before allowing an actual lifecycle script to edit dotfiles.
+    assert.equal(
+      w
+        .command([process.execPath, "-p", "require('node:os').homedir()"])
+        .stdout.trim(),
+      home,
+    );
+    w.command([
+      "npm",
+      "install",
+      "--global",
+      "--prefix",
+      prefix,
+      "--cache",
+      path.join(w.root, "cache"),
+      "--ignore-scripts=false",
+      "--foreground-scripts",
+      "--offline",
+      "--no-audit",
+      "--no-fund",
+      archive,
+    ]);
+    assert.match(read(path.join(home, ".zshrc")), /setup shell zsh/);
+    w.rl(["repo", "add", w.repo, "--alias", "fixture"]);
+    w.env.EXPECTED_ROOT = w.repo;
+    w.command([
+      "/bin/zsh",
+      "-i",
+      "-c",
+      '[[ $(whence -w rl) == "rl: function" ]] || exit 90; rl checkout fixture || exit 91; [[ "$PWD" == "$EXPECTED_ROOT" ]] || exit 92',
+    ]);
+  },
+);
+
 test("offline npm install, relocation and reinstall preserve hooks, sessions and shell integration", (t) => {
   const w = new Workspace(t),
     archive = pack(w);
@@ -195,7 +249,7 @@ test("offline npm install, relocation and reinstall preserve hooks, sessions and
   );
   assert.match(
     w.command([cli, "resume", "--help"]).stdout,
-    /rl resume \[codex\|claude\|agy\]/,
+    /rl resume \[codex\|claude\|agy\|opencode\]/,
   );
   w.command([cli, "setup", "adopt"], { cwd: w.a });
   assert.equal(
@@ -363,7 +417,7 @@ test("offline npm install, relocation and reinstall preserve hooks, sessions and
   assert.equal(w.calls().at(-1).cwd, w.a);
 });
 
-test("global npm installation leaves dotfiles untouched until rl setup install configures the shell", (t) => {
+test("global npm installation honors shell setup opt-out and still supports manual setup", (t) => {
   const w = new Workspace(t),
     archive = pack(w);
   const home = path.join(w.root, "new user home"),
@@ -377,6 +431,7 @@ test("global npm installation leaves dotfiles untouched until rl setup install c
   w.env.NODE_OPTIONS =
     `${w.env.NODE_OPTIONS ?? ""} --require ${JSON.stringify(preload)}`.trim();
   w.env.SHELL = "/bin/zsh";
+  w.env.RL_SKIP_SHELL_SETUP = "1";
   delete w.env.ZDOTDIR;
   fs.symlinkSync("/bin/zsh", path.join(w.bin, "zsh"));
   w.stub(
@@ -400,7 +455,7 @@ test("global npm installation leaves dotfiles untouched until rl setup install c
   assert.ok(
     !fs.existsSync(path.join(home, ".zshrc")) &&
       !fs.existsSync(path.join(home, ".bashrc")),
-    "npm install must not modify shell dotfiles before rl setup install",
+    "npm install must not modify shell dotfiles when automatic setup is disabled",
   );
   const cli = path.join(prefix, "bin/rl");
   w.command([cli, "setup", "install"]);
@@ -424,51 +479,62 @@ test("global npm installation leaves dotfiles untouched until rl setup install c
   );
 });
 
-test("global npm installation succeeds when system tools are missing and rl setup install repairs setup once resolved", (t) => {
-  const w = new Workspace(t),
-    archive = pack(w);
-  const home = path.join(w.root, "incomplete setup home"),
-    prefix = path.join(w.root, "incomplete npm prefix");
-  fs.mkdirSync(home);
-  const preload = path.join(w.root, "incomplete-home.cjs");
-  write(
-    preload,
-    `require('node:os').homedir = () => ${JSON.stringify(home)}; require('node:module').syncBuiltinESMExports();`,
-  );
-  w.env.NODE_OPTIONS =
-    `${w.env.NODE_OPTIONS ?? ""} --require ${JSON.stringify(preload)}`.trim();
-  w.env.SHELL = "/bin/zsh";
-  delete w.env.ZDOTDIR;
-  fs.symlinkSync("/bin/zsh", path.join(w.bin, "zsh"));
-  w.stub("fzf", "process.exit(1)");
-  w.stub("gh", "console.log('gh 1.0')");
-  w.stub(
-    "brew",
-    "console.error('Simulated package manager failure');process.exit(1)",
-  );
-  w.command([
-    "npm",
-    "install",
-    "--global",
-    "--prefix",
-    prefix,
-    "--cache",
-    path.join(w.root, "cache"),
-    "--offline",
-    "--no-audit",
-    "--no-fund",
-    archive,
-  ]);
-  const cli = path.join(prefix, "bin/rl");
-  assert.equal(
-    w.command([cli, "--version"]).stdout.trim(),
-    readJson(path.join(ROOT, "package.json")).version,
-  );
-  assert.ok(!fs.existsSync(path.join(home, ".zshrc")));
-  const failed = w.command([cli, "setup", "install"], { ok: false });
-  assert.match(failed.stderr, /Could not install RL tools/);
-  assert.ok(!fs.existsSync(path.join(home, ".zshrc")));
-  w.stub("fzf", "console.log('fzf 1.0')");
-  w.command([cli, "setup", "install"]);
-  assert.match(read(path.join(home, ".zshrc")), /rl shell integration/);
-});
+test(
+  "global npm installation enables the shell even with missing tools; manual repair preserves settings",
+  { skip: process.getuid?.() === 0 },
+  (t) => {
+    const w = new Workspace(t),
+      archive = pack(w);
+    const home = path.join(w.root, "incomplete setup home"),
+      prefix = path.join(w.root, "incomplete npm prefix");
+    fs.mkdirSync(home);
+    const preload = path.join(w.root, "incomplete-home.cjs");
+    write(
+      preload,
+      `require('node:os').homedir = () => ${JSON.stringify(home)}; require('node:module').syncBuiltinESMExports();`,
+    );
+    w.env.NODE_OPTIONS =
+      `${w.env.NODE_OPTIONS ?? ""} --require ${JSON.stringify(preload)}`.trim();
+    w.env.SHELL = "/bin/zsh";
+    Object.assign(w.env, {
+      CI: "false",
+      RL_SKIP_SHELL_SETUP: "0",
+      SUDO_USER: undefined,
+      SUDO_UID: undefined,
+    });
+    delete w.env.ZDOTDIR;
+    fs.symlinkSync("/bin/zsh", path.join(w.bin, "zsh"));
+    w.stub("fzf", "process.exit(1)");
+    w.stub("gh", "console.log('gh 1.0')");
+    w.stub(
+      "brew",
+      "console.error('Simulated package manager failure');process.exit(1)",
+    );
+    w.command([
+      "npm",
+      "install",
+      "--global",
+      "--prefix",
+      prefix,
+      "--cache",
+      path.join(w.root, "cache"),
+      "--offline",
+      "--no-audit",
+      "--no-fund",
+      archive,
+    ]);
+    const cli = path.join(prefix, "bin/rl");
+    assert.equal(
+      w.command([cli, "--version"]).stdout.trim(),
+      readJson(path.join(ROOT, "package.json")).version,
+    );
+    const before = read(path.join(home, ".zshrc"));
+    assert.match(before, /rl shell integration/);
+    const failed = w.command([cli, "setup", "install"], { ok: false });
+    assert.match(failed.stderr, /Could not install RL tools/);
+    assert.equal(read(path.join(home, ".zshrc")), before);
+    w.stub("fzf", "console.log('fzf 1.0')");
+    w.command([cli, "setup", "install"]);
+    assert.match(read(path.join(home, ".zshrc")), /rl shell integration/);
+  },
+);

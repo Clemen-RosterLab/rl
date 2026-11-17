@@ -70,7 +70,7 @@ export interface WorkflowRun {
   quality?: WorkflowQuality;
   version: 1;
   execution?: "native";
-  owner?: { agent: "codex" | "claude" | "agy"; sessionId: string };
+  owner?: { agent: "codex" | "claude" | "agy" | "opencode"; sessionId: string };
   requestId?: string;
   id: string;
   key: string;
@@ -363,8 +363,9 @@ export function readRun(
             .filter((entryId) => /^[a-f0-9-]{36}$/.test(entryId))
             .map((entryId) => load(runDirectory(file, entryId)))
         : [];
-      id = entries.toSorted((a, b) => b.createdAt.localeCompare(a.createdAt))[0]
-        ?.id;
+      id = [...entries].sort((a, b) =>
+        b.createdAt.localeCompare(a.createdAt),
+      )[0]?.id;
     }
     if (!id) {
       throw new Error("No workflow runs in this RL workspace");
@@ -427,9 +428,10 @@ export type WorkflowReviewState = NonNullable<
 >;
 
 /** Resolve only explicit native bindings in this instance, never inferred peers. */
-export function boundAntigravityPeer(
+export function boundNativePeer(
   instanceFile: string,
   data: Instance,
+  agent: "agy" | "opencode",
   conversation: string,
 ): { run: WorkflowRun; stage: Stage } | undefined {
   const parent = runsParentDirectory(instanceFile);
@@ -443,7 +445,7 @@ export function boundAntigravityPeer(
     const candidate = readJsonObject(path.join(directory, "run.json"));
     if (
       !object(candidate.owner) ||
-      candidate.owner.agent !== "agy" ||
+      candidate.owner.agent !== agent ||
       candidate.owner.sessionId === conversation ||
       !Array.isArray(candidate.stages) ||
       !candidate.stages.some(
@@ -490,27 +492,46 @@ export function boundAntigravityPeer(
   return undefined;
 }
 
+export function boundAntigravityPeer(
+  instanceFile: string,
+  data: Instance,
+  conversation: string,
+): { run: WorkflowRun; stage: Stage } | undefined {
+  return boundNativePeer(instanceFile, data, "agy", conversation);
+}
+
 /** Repair sessions recorded before a child binding, including older RL records.
  * Call under the instance lock before presenting or launching resume choices. */
+export function reconcileNativeSessions(
+  store: Store,
+  file: string,
+  data: Instance,
+  agents: readonly ("agy" | "opencode")[] = ["agy", "opencode"],
+): void {
+  let changed = false;
+  for (const agent of agents) {
+    for (const session of data.sessions[agent] ?? []) {
+      const knownChild = data.activity?.[agent]?.some(
+        (entry) =>
+          entry.sessionId === session.id &&
+          entry.childId === session.id &&
+          !entry.resumable,
+      );
+      if (knownChild || boundNativePeer(file, data, agent, session.id)) {
+        store.markNativeChild(data, agent, session.id);
+        changed = true;
+      }
+    }
+  }
+  if (changed) store.save(file, data);
+}
+
 export function reconcileAntigravitySessions(
   store: Store,
   file: string,
   data: Instance,
 ): void {
-  let changed = false;
-  for (const session of data.sessions.agy ?? []) {
-    const knownChild = data.activity?.agy?.some(
-      (entry) =>
-        entry.sessionId === session.id &&
-        entry.childId === session.id &&
-        !entry.resumable,
-    );
-    if (knownChild || boundAntigravityPeer(file, data, session.id)) {
-      store.markAntigravityChild(data, session.id);
-      changed = true;
-    }
-  }
-  if (changed) store.save(file, data);
+  reconcileNativeSessions(store, file, data, ["agy"]);
 }
 
 export async function controlRun(

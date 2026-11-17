@@ -97,7 +97,7 @@ export class Workspace {
     fs.mkdirSync(this.bin);
     this.env.PATH = this.bin + path.delimiter + this.env.PATH;
     this.env.AGENT_LOG = this.log;
-    for (const agent of ["codex", "claude", "agy"])
+    for (const agent of ["codex", "claude", "agy", "opencode"])
       this.stub(
         agent,
         `if (process.argv[2] === 'app-server') process.exit(0); const fs = require('node:fs'); fs.appendFileSync(process.env.AGENT_LOG, JSON.stringify({ argv: process.argv.slice(1), cwd: process.cwd() }) + '\\n'); process.exit(Number(process.env.AGENT_EXIT || 0));`,

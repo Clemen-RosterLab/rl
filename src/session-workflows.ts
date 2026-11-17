@@ -23,6 +23,7 @@ import {
   type WorkflowTrigger,
 } from "./automation-config.js";
 import {
+  agentSessionId,
   atomicWrite,
   canonical,
   execute,
@@ -31,7 +32,6 @@ import {
   now,
   object,
   readJson,
-  sessionId,
   writeJson,
 } from "./common.js";
 import { parseJsonObject, type JsonObject } from "./json.js";
@@ -152,8 +152,13 @@ const sameOwner = (a: Owner, b: Owner): boolean =>
 
 function owner(input: Record<string, unknown>): Owner {
   const agent = input.agent === undefined ? "codex" : input.agent;
-  if (agent !== "codex" && agent !== "claude" && agent !== "agy") {
-    throw new Error("agent must be codex, claude or agy");
+  if (
+    agent !== "codex" &&
+    agent !== "claude" &&
+    agent !== "agy" &&
+    agent !== "opencode"
+  ) {
+    throw new Error("agent must be codex, claude, agy or opencode");
   }
   const id =
     input.sessionId !== undefined
@@ -184,7 +189,7 @@ function text(value: unknown, label: string): string {
 
 function associate(store: Store, parent: Owner): void {
   try {
-    sessionId(parent.sessionId);
+    agentSessionId(parent.agent, parent.sessionId);
   } catch {
     // Observed Codex thread IDs coordinate workflows but are not verified resume UUIDs.
     return;
@@ -576,11 +581,11 @@ export function workflowToolSchema(tool: (typeof WORKFLOW_TOOLS)[number]) {
   return {
     type: "object",
     properties: {
-      agent: { type: "string", enum: ["codex", "claude", "agy"] },
+      agent: { type: "string", enum: ["codex", "claude", "agy", "opencode"] },
       sessionId: {
         type: "string",
         description:
-          "Current parent conversation ID. Claude and Antigravity require a UUID; Codex also accepts observed thr_ IDs and may inherit it.",
+          "Current parent conversation ID. Claude and Antigravity require a UUID; OpenCode accepts ses_... or UUID; Codex also accepts observed thr_ IDs and may inherit it.",
       },
       ...tool.properties,
     },
@@ -688,7 +693,8 @@ export async function callWorkflowTool(
       if (
         input.agent !== "codex" &&
         input.agent !== "claude" &&
-        input.agent !== "agy"
+        input.agent !== "agy" &&
+        input.agent !== "opencode"
       ) {
         throw new Error("Unsupported agent");
       }
@@ -1155,8 +1161,15 @@ export async function callWorkflowTool(
     }
 
     if (COLLABORATION_TOOLS.some((tool) => tool.name === name)) {
-      if (name === "rl_workflow_bind" && parent.agent === "agy")
-        store.assertSessionOwner(file, "agy", sessionId(input.childId));
+      if (
+        name === "rl_workflow_bind" &&
+        (parent.agent === "agy" || parent.agent === "opencode")
+      )
+        store.assertSessionOwner(
+          file,
+          parent.agent,
+          agentSessionId(parent.agent, input.childId),
+        );
       const result = collaborationTool(run, directory, name, input);
       if (name !== "rl_workflow_inbox") {
         persist(run, directory);
@@ -1174,8 +1187,8 @@ export async function callWorkflowTool(
               },
             ],
           });
-          if (parent.agent === "agy") {
-            store.markAntigravityChild(data, input.childId);
+          if (parent.agent === "agy" || parent.agent === "opencode") {
+            store.markNativeChild(data, parent.agent, input.childId);
             store.save(file, data);
           }
         }
@@ -1414,13 +1427,13 @@ export async function callWorkflowTool(
       assertCollaborationCompletion(run, stage, writtenScope?.scope.files);
     }
     if (input.childId !== undefined) {
-      if (parent.agent === "agy") {
-        const child = sessionId(input.childId);
+      if (parent.agent === "agy" || parent.agent === "opencode") {
+        const child = agentSessionId(parent.agent, input.childId);
         if (child === parent.sessionId)
           throw new Error(
-            "The main Antigravity conversation cannot be reported as its own subagent",
+            `The main ${parent.agent === "agy" ? "Antigravity conversation" : "OpenCode session"} cannot be reported as its own subagent`,
           );
-        store.assertSessionOwner(file, "agy", child);
+        store.assertSessionOwner(file, parent.agent, child);
       }
       if (collaboration && stage.childId !== input.childId) {
         throw new Error("The report must use the bound native child identity");
@@ -1567,8 +1580,11 @@ export async function callWorkflowTool(
     }
 
     persist(run, directory);
-    if (parent.agent === "agy" && stage.childId) {
-      store.markAntigravityChild(data, stage.childId);
+    if (
+      (parent.agent === "agy" || parent.agent === "opencode") &&
+      stage.childId
+    ) {
+      store.markNativeChild(data, parent.agent, stage.childId);
       store.save(file, data);
     }
     settleRequest(file, data, run);

@@ -136,7 +136,7 @@ test("overview reports staged, unstaged, untracked and diverged upstream counts"
   );
   const table = w.rl(["list", "--all"]).stdout;
   assert.match(table, /1S\/1M\/1\?/);
-  assert.match(table, /\+1\/-1/);
+  assert.match(table, /↑1 ↓1/);
 });
 test("unadopted managed worktrees are visible without state mutations", (t) => {
   const { w, overview } = fixture(t),
@@ -158,7 +158,7 @@ test("overview exposes detached, switched, missing and archived worktrees", (t) 
   assert.equal(row().gitStatus.branch, "(detached)");
   assert.equal(row().gitStatus.branchChanged, true);
   w.git(w.a, "checkout", "-q", "-b", "switched");
-  assert.match(w.rl(["list", "--all"]).stdout, /switched \[changed\]/);
+  assert.match(w.rl(["list", "--all"]).stdout, /\[changed\] switched/);
   w.git(w.repo, "worktree", "remove", "--force", w.a);
   assert.equal(row().gitStatus.availability, "missing");
   w.rl(["--repo", "beta", "switch", "-c", "deleted-task"]);

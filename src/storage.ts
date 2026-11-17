@@ -122,7 +122,7 @@ function measureTree(
     let counted = true;
 
     if (stat.isDirectory()) {
-      for (const child of fs.readdirSync(item.path).toSorted().toReversed()) {
+      for (const child of fs.readdirSync(item.path).sort().reverse()) {
         pending.push({
           path: path.join(item.path, child),
           relative: path.join(item.relative, child),
@@ -170,7 +170,7 @@ function measureTree(
 
   usage.largestPaths = [...largest]
     .map(([entryPath, allocatedBytes]) => ({ path: entryPath, allocatedBytes }))
-    .toSorted(
+    .sort(
       (a, b) =>
         b.allocatedBytes - a.allocatedBytes || a.path.localeCompare(b.path),
     );
@@ -179,7 +179,7 @@ function measureTree(
 }
 
 function deduplicateCleanRoots(clean: string[]): string[] {
-  const sorted = [...new Set(clean)].toSorted(
+  const sorted = [...new Set(clean)].sort(
     (a, b) => a.length - b.length || a.localeCompare(b),
   );
   return sorted.filter(
@@ -359,7 +359,7 @@ function stageAndRemove(
         { cause: error },
       );
     }
-    for (const item of staged.toReversed()) {
+    for (const item of [...staged].reverse()) {
       if (!fs.existsSync(item.path)) continue;
       try {
         containedPath(workspace, item.target.relative);

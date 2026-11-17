@@ -17,6 +17,9 @@ export interface UserConfigValues {
   cloudZone?: string;
   cloudTemplate?: string;
   cloudVm?: string;
+  cloudHost?: string;
+  /** Accepted from the earlier preview; list layout is now automatic. */
+  listColumns?: string;
 }
 
 export interface ResolvedCliEnvironment {
@@ -49,6 +52,10 @@ const KEY_MAP: Readonly<Record<string, keyof UserConfigValues>> = {
   RL_CLOUD_TEMPLATE: "cloudTemplate",
   cloudVm: "cloudVm",
   RL_CLOUD_VM: "cloudVm",
+  cloudHost: "cloudHost",
+  RL_CLOUD_HOST: "cloudHost",
+  listColumns: "listColumns",
+  RL_LIST_COLUMNS: "listColumns",
 };
 
 const PATH_KEYS = new Set<keyof UserConfigValues>([

@@ -214,7 +214,7 @@ function collectCopies(
     ) {
       throw new Error(`Copy destination is not a directory: ${destination}`);
     }
-    for (const child of fs.readdirSync(source).toSorted()) {
+    for (const child of fs.readdirSync(source).sort()) {
       collectCopies(
         repo,
         workspace,

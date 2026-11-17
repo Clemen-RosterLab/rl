@@ -5,7 +5,7 @@ import os from "node:os";
 import { randomUUID } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import { fork, spawn, type ChildProcess } from "node:child_process";
-import { execute, message } from "./common.js";
+import { message } from "./common.js";
 import { visible } from "./review-terminal.js";
 import {
   ReviewInput,
@@ -280,64 +280,31 @@ class GitWorker {
         if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error;
       }
     }
-    await this.exit;
-    try {
-      if (this.frozenRefs && gitDir) await this.releaseFrozenRefs(gitDir);
-    } finally {
-      await fs.promises.rm(this.temporaryRoot, {
-        recursive: true,
-        force: true,
-      });
-    }
-  }
-
-  private async releaseFrozenRefs(gitDir: string): Promise<void> {
-    const prefix = `refs/rl/live-freeze/${this.freezeId}/`;
-    const command = [
-      "git",
-      `--git-dir=${gitDir}`,
-      "-c",
-      "core.hooksPath=/dev/null",
-    ];
-    const options = {
-      signal: AbortSignal.timeout(100),
-      processGroup: true,
-      abortGraceMs: 0,
-    };
-    try {
-      const refs = await execute(
-        [...command, "for-each-ref", "--format=%(refname)", prefix],
+    // A killed process can take time to reap on a busy filesystem. Neither
+    // reaping nor deleting its private files should hold the terminal hostage.
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    await Promise.race([
+      this.exit,
+      new Promise<void>((resolve) => {
+        timer = setTimeout(resolve, 100);
+      }),
+    ]);
+    clearTimeout(timer);
+    if (this.worker.connected) this.worker.disconnect();
+    this.worker.unref();
+    this.worker.channel?.unref();
+    const cleanup = spawn(
+      process.execPath,
+      [
+        fileURLToPath(new URL("./review-live-cleanup.js", import.meta.url)),
+        this.frozenRefs ? (gitDir ?? "") : "",
+        this.freezeId,
         this.temporaryRoot,
-        options,
-      );
-      if (refs.code) throw new Error("Private ref cleanup deferred");
-      const names = refs.stdout
-        .split("\n")
-        .filter((ref) => ref.startsWith(prefix));
-      if (names.length) {
-        const deleted = await execute(
-          [...command, "update-ref", "--stdin"],
-          this.temporaryRoot,
-          {
-            ...options,
-            input: names.map((ref) => `delete ${ref}\n`).join(""),
-          },
-        );
-        if (deleted.code) throw new Error("Private ref cleanup deferred");
-      }
-    } catch {
-      const cleanup = spawn(
-        process.execPath,
-        [
-          fileURLToPath(new URL("./review-live-cleanup.js", import.meta.url)),
-          gitDir,
-          this.freezeId,
-        ],
-        { detached: true, stdio: "ignore" },
-      );
-      cleanup.once("error", () => {});
-      cleanup.unref();
-    }
+      ],
+      { detached: true, stdio: "ignore" },
+    );
+    cleanup.once("error", () => {});
+    cleanup.unref();
   }
 }
 export interface LiveOptions {
@@ -2896,8 +2863,9 @@ export async function liveReview(options: LiveOptions): Promise<void> {
           { label: "Codex" },
           { label: "Claude" },
           { label: "Antigravity" },
+          { label: "OpenCode" },
         ],
-        values: ["codex", "claude", "agy"],
+        values: ["codex", "claude", "agy", "opencode"],
       });
       return;
     }

@@ -363,59 +363,60 @@ export async function runPublicCli(rawArgv: string[]): Promise<number> {
       envSettings.stateDir,
     ];
 
-    if (command === undefined) {
-      const store = new Store(repoRoot, envSettings.stateDir);
-      const selected = await select(
-        store,
-        candidates(store.repo, canonical(managedDir), store),
-        defaultBase,
-        false,
-      );
-      if (selected.length > 0) {
-        await store.adopt(selected[0].path, defaultBase);
-        writeWorkspaceOutput(selected[0].path);
-      }
-      return 0;
-    }
-
-    if (command === "--cloud" || command === "--include-cloud") {
+    if (
+      command === undefined ||
+      ["--include-existing", "--cloud", "--include-cloud"].includes(command)
+    ) {
       const { parseArgs } = await import("node:util");
       const parsedPicker = parseArgs({
         args,
         options: {
           cloud: { type: "boolean" },
           "include-cloud": { type: "boolean" },
+          "include-existing": { type: "boolean" },
           vm: { type: "string" },
         },
         allowPositionals: false,
         strict: true,
       });
-      if (parsedPicker.values.cloud && parsedPicker.values["include-cloud"]) {
+      const pickerOptions = parsedPicker.values;
+      if (pickerOptions.cloud && pickerOptions["include-cloud"])
         throw new UsageError("Choose either --cloud or --include-cloud");
-      }
-      const { pickWorkspaceWithCloud } = await import("./cloud.js");
-      if (parsedPicker.values.cloud) {
-        const store = new Store(repoRoot, envSettings.stateDir);
+      if (pickerOptions.cloud && pickerOptions["include-existing"])
+        throw new UsageError(
+          "--include-existing applies to local worktrees; use --include-cloud to include remote workspaces",
+        );
+      if (
+        pickerOptions.vm &&
+        !pickerOptions.cloud &&
+        !pickerOptions["include-cloud"]
+      )
+        throw new UsageError("--vm requires --cloud or --include-cloud");
+      const store = new Store(repoRoot, envSettings.stateDir);
+      const items = pickerOptions.cloud
+        ? []
+        : candidates(store.repo, canonical(managedDir), store, true);
+      if (pickerOptions.cloud || pickerOptions["include-cloud"]) {
+        const { pickWorkspaceWithCloud } = await import("./cloud.js");
         return await pickWorkspaceWithCloud({
           store,
-          localCandidates: [],
+          localCandidates: items,
           defaultBase,
           stateDir: envSettings.stateDir,
           worktreeDir: envSettings.worktreeDir,
-          cloudOnly: true,
-          vm: parsedPicker.values.vm,
+          cloudOnly: Boolean(pickerOptions.cloud),
+          vm: pickerOptions.vm,
         });
       }
-      const store = new Store(repoRoot, envSettings.stateDir);
-      return await pickWorkspaceWithCloud({
-        store,
-        localCandidates: candidates(store.repo, canonical(managedDir), store),
-        defaultBase,
-        stateDir: envSettings.stateDir,
-        worktreeDir: envSettings.worktreeDir,
-        cloudOnly: false,
-        vm: parsedPicker.values.vm,
-      });
+      const selected = await select(store, items, defaultBase, false);
+      if (selected.length > 0) {
+        const [root, branch] = store.worktree(selected[0].path);
+        if (branch !== selected[0].branch)
+          throw new Error("Workspace branch changed during selection; retry");
+        await store.adopt(root, defaultBase);
+        writeWorkspaceOutput(root);
+      }
+      return 0;
     }
 
     switch (command) {

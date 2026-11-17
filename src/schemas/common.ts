@@ -1,9 +1,9 @@
 import path from "node:path";
 import { z } from "zod";
-import { sessionId, timestamp } from "../common.js";
+import { openCodeSessionId, sessionId, timestamp } from "../common.js";
 import { StateValidationError } from "../errors.js";
 
-export const AGENTS = ["codex", "claude", "agy"] as const;
+export const AGENTS = ["codex", "claude", "agy", "opencode"] as const;
 export const AgentNameSchema = z.enum(AGENTS);
 
 export const SEVERITIES = ["critical", "high", "medium", "low"] as const;
@@ -52,6 +52,14 @@ export const StrictLowerUuidSchema = z.string().refine((val) => {
     return false;
   }
 }, "Expected lowercase canonical UUID");
+
+export const OpenCodeSessionIdSchema = z.string().refine((val) => {
+  try {
+    return openCodeSessionId(val) === val;
+  } catch {
+    return false;
+  }
+}, "Expected OpenCode session ID (ses_...) or lowercase canonical UUID");
 
 export const IsoTimestampSchema = z.string().refine((val) => {
   try {

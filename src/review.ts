@@ -106,13 +106,13 @@ function scopedEntry(entry: Entry, scopes: Scope[]): Entry {
 }
 
 function observed(review: ReviewStore) {
-  const activity = (["codex", "claude", "agy"] as const)
+  const activity = (["codex", "claude", "agy", "opencode"] as const)
     .flatMap((agent) =>
       activityView(review.data.activity?.[agent])
         .filter((item) => !item.childId)
         .map((item) => ({ ...item, agent })),
     )
-    .toSorted((a, b) => b.observedAt.localeCompare(a.observedAt));
+    .sort((a, b) => b.observedAt.localeCompare(a.observedAt));
 
   const working = activity.find((item) => item.state === "working");
   const latest = working ?? activity[0];

@@ -10,6 +10,7 @@ import {
 } from "./agents/hook-installer.js";
 import type { Agent } from "./agents.js";
 import {
+  agentSessionId,
   atomicWrite,
   canonical,
   execute,
@@ -21,7 +22,6 @@ import {
   now,
   object,
   readJson,
-  sessionId,
   timestamp,
   writeJson,
 } from "./common.js";
@@ -62,6 +62,7 @@ export interface Instance extends Tracking {
     codex: Session[];
     claude: Session[];
     agy?: Session[];
+    opencode?: Session[];
   };
   pr: PullRequestSnapshot | null;
   hookCommands?: Partial<Record<Agent, string>>;
@@ -346,7 +347,7 @@ export class Store {
       return [];
     }
     const entries: RecordEntry[] = [];
-    for (const key of fs.readdirSync(this.root).toSorted()) {
+    for (const key of fs.readdirSync(this.root).sort()) {
       const file = path.join(this.root, key, "instance.json");
       if (!fs.existsSync(file)) {
         continue;
@@ -529,12 +530,14 @@ export class Store {
   }
 
   /** Mutate the supplied record; callers persist session and activity together. */
-  markAntigravityChild(data: Instance, id: string): void {
-    const sid = sessionId(id);
-    const sessions = data.sessions.agy?.filter((session) => session.id !== sid);
-    if (sessions?.length) data.sessions.agy = sessions;
-    else delete data.sessions.agy;
-    const activity = ((data.activity ??= {}).agy ??= []);
+  markNativeChild(data: Instance, agent: "agy" | "opencode", id: string): void {
+    const sid = agentSessionId(agent, id);
+    const sessions = data.sessions[agent]?.filter(
+      (session) => session.id !== sid,
+    );
+    if (sessions?.length) data.sessions[agent] = sessions;
+    else delete data.sessions[agent];
+    const activity = ((data.activity ??= {})[agent] ??= []);
     const existing = activity.filter((entry) => entry.sessionId === sid);
     for (const entry of existing) {
       entry.childId = sid;
@@ -554,6 +557,11 @@ export class Store {
   }
 
   /** Mutate the supplied record; callers persist session and activity together. */
+  markAntigravityChild(data: Instance, id: string): void {
+    this.markNativeChild(data, "agy", id);
+  }
+
+  /** Mutate the supplied record; callers persist session and activity together. */
   associateSession(
     file: string,
     data: Instance,
@@ -561,17 +569,17 @@ export class Store {
     id: string,
     stamp = now(),
   ): void {
-    const sid = sessionId(id);
+    const sid = agentSessionId(agent, id);
     this.assertSessionOwner(file, agent, sid);
     if (
-      agent === "agy" &&
-      data.activity?.agy?.some(
+      (agent === "agy" || agent === "opencode") &&
+      data.activity?.[agent]?.some(
         (entry) =>
           entry.sessionId === sid && entry.childId === sid && !entry.resumable,
       )
     )
       throw new Error(
-        "This Antigravity conversation is a native subagent; resume its main conversation instead",
+        `This ${agent === "agy" ? "Antigravity conversation" : "OpenCode session"} is a native subagent; resume its main conversation instead`,
       );
     const sessions = (data.sessions[agent] ??= []);
     const existing = sessions.find((s) => s.id === sid);

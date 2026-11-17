@@ -33,7 +33,7 @@ const topics: Record<string, Topic> = {
       "-b, --base <ref>      Creation base (default: origin/test unless configured)",
       "--no-fetch           Use cached refs when opening or creating",
       "--setup              Run configured project setup",
-      "--agent codex|claude|agy  Start an agent after switching",
+      "--agent codex|claude|agy|opencode  Start an agent after switching",
       "-- <agent args>      Forward options to the selected agent",
     ],
     notes: [
@@ -62,7 +62,11 @@ const topics: Record<string, Topic> = {
       "--include-deleted    Include archived records",
     ],
     notes: [
-      "Commit counts are relative to each row's displayed upstream; CHANGES counts files.",
+      "Workspaces are grouped by repository; layout adapts automatically to terminal width.",
+      "↑/↓ show commits ahead/behind upstream. PR and session columns appear when useful.",
+      "Long names use ellipses. --json retains full names and all details.",
+      "Existing Git worktrees appear automatically, labelled not initialized until added to RL.",
+      "Pick one with rl to initialize it in place; listing does not initialize worktrees.",
     ],
   },
   status: {
@@ -142,7 +146,7 @@ const topics: Record<string, Topic> = {
       "--ready                   Mark this snapshot ready for human review",
       "--ai-review               Run an independent AI review",
       "--groups                  Browse logical groups backed by Git file/hunk IDs",
-      "--provider codex|claude|agy    Select the AI provider",
+      "--provider codex|claude|agy|opencode    Select the AI provider",
       "--profile <name>           Editable RL agent profile (default: reviewer)",
       "--no-ai                   Use Git evidence without invoking a model",
       "--worktree-diff            Uncommitted source and staged content only",
@@ -183,7 +187,7 @@ const topics: Record<string, Topic> = {
     options: [
       "--send          Run a noninteractive turn in a validated saved session",
       "--resume        Open the coding conversation with feedback as its prompt",
-      "--agent <name>  Filter saved sessions to codex, claude or agy",
+      "--agent <name>  Filter saved sessions to codex, claude, agy or opencode",
       "--session UUID  Select a session associated with this worktree",
       "--retry UUID    Retry saved feedback without losing it on failure",
       "--list          Show saved feedback and delivery status",
@@ -249,7 +253,8 @@ const topics: Record<string, Topic> = {
   resume: {
     group: "Agents and tasks",
     description: "Resume a saved conversation",
-    usage: "rl resume [codex|claude|agy] [--latest|-l|--l] [--desktop]",
+    usage:
+      "rl resume [codex|claude|agy|opencode] [--latest|-l|--l] [--desktop]",
     options: [
       "--latest, -l, --l  Resume the most recently used matching session directly",
       "--desktop         Open Codex or Claude Desktop instead of the terminal",
@@ -274,7 +279,7 @@ const topics: Record<string, Topic> = {
   "agent start": {
     description: "Start an interactive agent",
     usage:
-      "rl agent start <codex|claude|agy> [--workspace <name>] [--desktop] [-- <agent args>]",
+      "rl agent start <codex|claude|agy|opencode> [--workspace <name>] [--desktop] [-- <agent args>]",
     options: [
       "--desktop  Open Codex or Claude Desktop on the resolved worktree",
     ],
@@ -290,7 +295,7 @@ const topics: Record<string, Topic> = {
   "agent run": {
     description: "Run an agent non-interactively",
     usage:
-      "rl agent run <codex|claude|agy> --prompt <text> [--workspace <name>] [-- <agent args>]",
+      "rl agent run <codex|claude|agy|opencode> --prompt <text> [--workspace <name>] [-- <agent args>]",
     notes: [
       "Returns the agent's exit status and preserves its native options.",
     ],
@@ -323,11 +328,11 @@ const topics: Record<string, Topic> = {
   },
   "agent sessions": {
     description: "List saved conversations",
-    usage: "rl agent sessions [codex|claude|agy]",
+    usage: "rl agent sessions [codex|claude|agy|opencode]",
   },
   "agent save": {
     description: "Save the current or an explicit conversation",
-    usage: "rl agent save [codex|claude|agy] [UUID] [--json]",
+    usage: "rl agent save [codex|claude|agy|opencode] [UUID] [--json]",
     notes: [
       "Defaults to the current Codex session ID. Claude requires an explicit UUID.",
     ],
@@ -335,7 +340,7 @@ const topics: Record<string, Topic> = {
   "agent handoff": {
     description: "Export shared task context",
     usage:
-      "rl agent handoff [codex|claude|agy] [--workspace <name>] [--stdout | --output <file>]",
+      "rl agent handoff [codex|claude|agy|opencode] [--workspace <name>] [--stdout | --output <file>]",
     notes: [
       "Exports notes; agent conversations remain in their original sessions.",
     ],
@@ -350,17 +355,33 @@ const topics: Record<string, Topic> = {
   },
   workflow: {
     group: "Agents and tasks",
-    description: "Define and track session-driven agent workflows",
+    description: "View, configure and track agent workflows",
     usage: "rl workflow <command>",
     notes: [
       "Run controls apply only to this adopted workspace.",
       "Omit a run UUID, or use latest, to select its most recently created run.",
+      "Agent coordination commands: rl workflow --help --all",
     ],
-    related: ["agent", "policy"],
+    examples: [
+      "rl workflow show",
+      "rl workflow configure",
+      "rl workflow status --follow",
+    ],
+  },
+  "workflow configure": {
+    description: "Edit this workspace's workflow settings",
+    usage: "rl workflow configure [--paths | --json]",
+    notes: [
+      "Creates editable defaults on first use; otherwise opens existing configuration files.",
+      "Opens profiles, policies and workflows in $VISUAL or $EDITOR (default: vi).",
+      "Use a waiting editor command, such as EDITOR='code --wait', for validation after editing.",
+      "--paths, --json or a non-interactive terminal prints paths without opening an editor.",
+    ],
   },
   "workflow init": {
     description: "Create editable profiles, policies and workflows",
-    usage: "rl workflow init [--provider inherit|codex|claude|agy] [--json]",
+    usage:
+      "rl workflow init [--provider inherit|codex|claude|agy|opencode] [--json]",
     notes: [
       "Creates .rl/agents.json, .rl/policies.json and .rl/agent-workflows.json.",
       "Existing configuration is never overwritten.",
@@ -372,8 +393,8 @@ const topics: Record<string, Topic> = {
     usage: "rl workflow list [--json]",
   },
   "workflow show": {
-    description: "Inspect steps and dependencies",
-    usage: "rl workflow show <name> [--json]",
+    description: "Show the default workflow or a named workflow",
+    usage: "rl workflow show [name] [--json]",
   },
   "workflow run": {
     description: "Prepare a workflow for this session's native agents",
@@ -385,7 +406,7 @@ const topics: Record<string, Topic> = {
       "--file <plan.json|->  Acceptance criteria and optional level; see workflow context schemas",
       "--dry-run        Preview scope and steps without launching agents",
       "--json           Print structured results",
-      "--agent codex|claude|agy  Parent session provider",
+      "--agent codex|claude|agy|opencode  Parent session provider",
       "--session <UUID>     Parent conversation (inferred inside Codex)",
       "--request <UUID>     Start a queued workflow request instead of choosing a name",
     ],
@@ -414,63 +435,65 @@ const topics: Record<string, Topic> = {
   },
   "workflow pending": {
     description: "Read queued workflows for the parent session",
-    usage: "rl workflow pending [--agent codex|claude|agy] [--session <UUID>]",
+    usage:
+      "rl workflow pending [--agent codex|claude|agy|opencode] [--session <UUID>]",
   },
   "workflow event": {
     description: "Report a milestone and match workflow triggers",
     usage:
-      "rl workflow event --file <event.json|-> [--agent codex|claude|agy] [--session <UUID>]",
+      "rl workflow event --file <event.json|-> [--agent codex|claude|agy|opencode] [--session <UUID>]",
   },
   "workflow claim": {
     description: "Claim a ready step for a native subagent",
     usage:
-      "rl workflow claim <run> [--step <name>] [--agent codex|claude|agy] [--session <UUID>]",
+      "rl workflow claim <run> [--step <name>] [--agent codex|claude|agy|opencode] [--session <UUID>]",
   },
   "workflow report": {
     description: "Submit a claimed native agent's evidence or a check result",
     usage:
-      "rl workflow report <run> --file <report.json|-> [--agent codex|claude|agy] [--session <UUID>]",
+      "rl workflow report <run> --file <report.json|-> [--agent codex|claude|agy|opencode] [--session <UUID>]",
   },
   "workflow dismiss": {
     description: "Dismiss an unavailable workflow with a reason",
     usage:
-      "rl workflow dismiss --file <dismissal.json|-> [--agent codex|claude|agy] [--session <UUID>]",
+      "rl workflow dismiss --file <dismissal.json|-> [--agent codex|claude|agy|opencode] [--session <UUID>]",
   },
   "workflow bind": {
     description: "Bind a role to the native peer spawned by this session",
     usage:
-      "rl workflow bind <run> --file <binding.json|-> [--agent codex|claude|agy] [--session <UUID>]",
+      "rl workflow bind <run> --file <binding.json|-> [--agent codex|claude|agy|opencode] [--session <UUID>]",
   },
   "workflow inbox": {
     description: "Read a peer's requests, review checkpoints and ratings",
     usage:
-      "rl workflow inbox <run> --step <step> --claim <token> [--agent codex|claude|agy] [--session <UUID>]",
+      "rl workflow inbox <run> --step <step> --claim <token> [--agent codex|claude|agy|opencode] [--session <UUID>]",
   },
   "workflow consult": {
     description: "Ask an existing peer through a configured workflow route",
     usage:
-      "rl workflow consult <run> --file <consultation.json|-> [--agent codex|claude|agy] [--session <UUID>]",
+      "rl workflow consult <run> --file <consultation.json|-> [--agent codex|claude|agy|opencode] [--session <UUID>]",
   },
   "workflow answer": {
     description: "Return reuse or duplication evidence to a requesting peer",
     usage:
-      "rl workflow answer <run> --file <answer.json|-> [--agent codex|claude|agy] [--session <UUID>]",
+      "rl workflow answer <run> --file <answer.json|-> [--agent codex|claude|agy|opencode] [--session <UUID>]",
   },
   "workflow submit": {
     description: "Submit writer work to the existing reviewer",
     usage:
-      "rl workflow submit <run> --file <submission.json|-> [--agent codex|claude|agy] [--session <UUID>]",
+      "rl workflow submit <run> --file <submission.json|-> [--agent codex|claude|agy|opencode] [--session <UUID>]",
   },
   "workflow review": {
     description: "Return a rating and evidence for a stable writer checkpoint",
     usage:
-      "rl workflow review <run> --file <review.json|-> [--agent codex|claude|agy] [--session <UUID>]",
+      "rl workflow review <run> --file <review.json|-> [--agent codex|claude|agy|opencode] [--session <UUID>]",
   },
   "workflow status": {
     description: "Inspect each agent's state, progress and waiting conditions",
-    usage: "rl workflow status [UUID|latest] [--json|--watch]",
+    usage: "rl workflow status [UUID|latest] [--json|--watch|--follow]",
     notes: [
       "--watch refreshes per-agent activity every second in the current terminal. j/k or arrows scroll; q, Escape or Ctrl-C closes it. Recorded claims and heartbeats do not independently establish native process liveness.",
+      "--follow streams timestamped activity, research choices and validation results as plain text. It checks every second and prints a waiting notice after 30 seconds without changes. Stops when the run completes, pauses or is cancelled; Ctrl-C closes the stream without cancelling the workflow.",
     ],
   },
   "workflow metrics": {
@@ -488,7 +511,7 @@ const topics: Record<string, Topic> = {
     description:
       "Record actual native host capabilities before claiming leveled work",
     usage:
-      "rl workflow preflight [UUID] --file <json|-> [--agent codex|claude|agy] [--session <UUID>]",
+      "rl workflow preflight [UUID] --file <json|-> [--agent codex|claude|agy|opencode] [--session <UUID>]",
     notes: [
       "Input: run and capabilities {delegation,messaging,readOnly,models,degradedReason?}. Capabilities are host-reported; unavailable delegation blocks execution.",
     ],
@@ -600,7 +623,7 @@ const topics: Record<string, Topic> = {
   "workflow resume": {
     description: "Continue unfinished workflow stages",
     usage:
-      "rl workflow resume [UUID|latest] [--agent codex|claude|agy] [--session <UUID>] [--json]",
+      "rl workflow resume [UUID|latest] [--agent codex|claude|agy|opencode] [--session <UUID>] [--json]",
     notes: [
       "Uses the saved configuration. Changed review scope requires a new run.",
     ],
@@ -639,7 +662,7 @@ const topics: Record<string, Topic> = {
       "--validation <text>  Checks actually run, or Not run",
       "--next <text>        Next steps",
       "--blockers <text>    Optional blockers",
-      "--agent codex|claude|agy Agent owning the handoff (default: codex)",
+      "--agent codex|claude|agy|opencode Agent owning the handoff (default: codex)",
       "--session <UUID>     Conversation ID; inferred inside Codex",
     ],
     notes: [
@@ -753,16 +776,33 @@ const topics: Record<string, Topic> = {
     ],
   },
   "repo add": {
-    description: "Register a repository",
+    description: "Register a local repository or clone a Git URL",
     usage:
-      "rl repo add [path] [--alias <name>] [--base <ref>] [--worktree-name <name>]",
+      "rl repo add [path|git-url] [directory] [--alias <name>] [--base <ref>] [--worktree-name <name>]",
     notes: [
       "Defaults to the current directory. Uses the origin repository name, or the main checkout directory name when there is no origin.",
+      "A Git URL clones into a new directory (default: ./<alias-or-repository-name>), registers it, and enters it with shell integration.",
       "Use --alias for a custom name. The existing <alias> <path> form also works.",
     ],
     examples: [
       "rl repo add .",
       "rl repo add . --alias frontend --base origin/test",
+      "rl repo add git@github.com:owner/project.git",
+    ],
+  },
+  "repo clone": {
+    description: "Clone, register and enter a repository",
+    usage:
+      "rl repo clone <git-url|path> [directory] [--alias <name>] [--base <ref>] [--worktree-name <name>]",
+    notes: [
+      "Defaults to ./<alias-or-repository-name>. Existing destinations are never overwritten, including empty directories.",
+      "Uses Git's normal authentication and the remote default branch. --base sets the workspace comparison base, not the clone branch.",
+      "Shell integration enters the clone; the standalone executable prints its path. Project setup scripts are not run.",
+      "Failed clones may leave a partial directory. If registration fails, the completed checkout is retained for manual registration.",
+    ],
+    examples: [
+      "rl repo clone https://github.com/owner/project.git",
+      "rl repo clone git@github.com:owner/project.git ./projects/frontend --alias frontend",
     ],
   },
   "repo list": {
@@ -802,16 +842,21 @@ const topics: Record<string, Topic> = {
     usage: "rl setup [run] [--workspace <name>] [--dry-run]",
   },
   "setup adopt": {
-    description: "Register the current workspace and install hooks",
-    usage: "rl setup adopt [--extended-hooks]",
-    notes: ["Preserves existing hooks. Review Codex hook trust with /hooks."],
+    description: "Register an existing workspace and install hooks",
+    usage: "rl setup adopt [path] [--extended-hooks]",
+    notes: [
+      "Defaults to the current directory. The worktree must belong to the selected repository and have a checked-out branch.",
+      "Registers it in place without moving it, checking out a branch or running project setup.",
+      "Preserves existing hooks. Review Codex hook trust with /hooks.",
+    ],
+    examples: ["rl setup adopt /path/to/worktree"],
   },
   "setup mcp": {
     description: "Connect this workspace's RL MCP server to your agent",
-    usage: "rl setup mcp [codex|claude|agy] [--dry-run] [--json]",
+    usage: "rl setup mcp [codex|claude|agy|opencode] [--dry-run] [--json]",
     notes: [
       "Configures both clients by default: .codex/config.toml and .mcp.json in this adopted workspace.",
-      "Select agy for .agents/mcp_config.json with an instance-specific server name. No global configuration is changed.",
+      "Select agy for .agents/mcp_config.json with an instance-specific server name, or opencode for opencode.json. No global configuration is changed.",
       "Preserves other settings and servers. Existing unmanaged entries named rl require manual resolution.",
       "Launches the installed Node/RL directly, with this workspace and its RL state bound explicitly. Rerun after moving the installation.",
       "Reload your client and review its normal project trust/MCP approval. Your existing session creates native subagents.",
@@ -843,18 +888,18 @@ const topics: Record<string, Topic> = {
   },
   cloud: {
     group: "Workspaces",
-    description: "Browse, connect and sync cloud dev workspaces",
+    description: "Open, list and create workspaces on an SSH host",
     usage: "rl cloud [command] [options]",
     options: [
-      "--vm <name>          Target a specific SSH host or cloud VM (e.g. dev-box)",
+      "--host <name>          Target an existing SSH host (e.g. dev-box)",
       "--code               Open the selected cloud workspace in VS Code Remote-SSH",
-      "--agent codex|claude|agy  Start an agent after entering the cloud workspace",
+      "--agent codex|claude|agy|opencode  Start an agent after entering the cloud workspace",
       "--resume             Resume a saved agent conversation in the cloud workspace",
     ],
     notes: [
       "With no subcommand, opens an interactive picker of cloud repositories and workspaces.",
       "Picker shortcuts: Enter opens an SSH shell in the remote directory, Alt-O opens VS Code, Alt-R reviews locally, Alt-C checks out locally.",
-      "Works with any SSH host via `rl cloud use <host>` or `cloudVm` in config.toml, or with GCP IAP VMs when `cloudProject` and `cloudZone` are configured.",
+      "Uses your existing SSH configuration. Set a host with rl cloud use <host> or cloudHost in config.toml; --vm and cloudVm remain compatible aliases.",
     ],
     examples: [
       "rl cloud",
@@ -862,82 +907,65 @@ const topics: Record<string, Topic> = {
       "rl cloud list",
       "rl cloud review",
       "rl cloud checkout feature/login",
-      "rl cloud ssh-config",
-      "rl cloud tunnel 3000",
+      "rl cloud create feature/login --repo frontend",
     ],
     related: ["list", "review"],
   },
   "cloud open": {
     description: "Pick or enter a cloud repository or workspace",
     usage:
-      "rl cloud [open] [selector] [--vm <name>] [--code] [--agent codex|claude|agy] [--resume]",
+      "rl cloud [open] [selector] [--host <name>] [--code] [--agent codex|claude|agy|opencode] [--resume]",
   },
   "cloud repos": {
-    description: "List repositories on the cloud VM",
-    usage: "rl cloud repos [--vm <name>] [--json]",
+    description: "List repositories on the SSH host",
+    usage: "rl cloud repos [--host <name>] [--json]",
   },
   "cloud list": {
-    description: "List RL workspaces on the cloud VM",
-    usage: "rl cloud list [--vm <name>] [--fetch] [--include-deleted] [--json]",
+    description: "List RL workspaces on the SSH host",
+    usage:
+      "rl cloud list [--host <name>] [--fetch] [--include-deleted] [--json]",
   },
   "cloud code": {
     description: "Open a cloud repository or workspace in VS Code Remote-SSH",
-    usage: "rl cloud code [selector] [--vm <name>]",
+    usage: "rl cloud code [selector] [--host <name>]",
   },
   "cloud fetch": {
-    description: "Fetch a branch directly from the cloud VM over SSH",
-    usage: "rl cloud fetch [selector] [--vm <name>] [--remote] [--json]",
+    description: "Fetch a branch directly from the SSH host over SSH",
+    usage: "rl cloud fetch [selector] [--host <name>] [--remote] [--json]",
   },
   "cloud checkout": {
     description: "Fetch a cloud branch over SSH into a local RL workspace",
-    usage: "rl cloud checkout [selector] [--vm <name>] [--include-uncommitted]",
+    usage:
+      "rl cloud checkout [selector] [--host <name>] [--include-uncommitted]",
   },
   "cloud review": {
     description:
       "Review committed and uncommitted cloud workspace changes locally",
     usage:
-      "rl cloud review [selector] [--vm <name>] [--diff] [--json] [--remote]",
-  },
-  "cloud ssh-config": {
-    description: "Configure ~/.ssh/config for IAP SSH, Git, scp and VS Code",
-    usage: "rl cloud ssh-config [vm] [--dry-run] [--json]",
-  },
-  "cloud vms": {
-    description: "List shared cloud dev VMs",
-    usage: "rl cloud vms [--json]",
+      "rl cloud review [selector] [--host <name>] [--diff] [--json] [--remote]",
   },
   "cloud use": {
-    description: "Set the default cloud dev VM",
-    usage: "rl cloud use [vm]",
-  },
-  "cloud ssh": {
-    description: "Connect to a cloud VM or run a remote command",
-    usage: "rl cloud ssh [vm] [-- <command...>]",
-  },
-  "cloud tunnel": {
-    description: "Forward a web port from a cloud VM to localhost",
-    usage: "rl cloud tunnel [vm] [port] [--local-port <port>]",
+    description: "Set the default SSH host",
+    usage: "rl cloud use <ssh-host>",
   },
   "cloud create": {
-    description: "Create a shared cloud dev VM from template",
-    usage: "rl cloud create <vm> [machine-type]",
-  },
-  "cloud start": {
-    description: "Start a stopped cloud dev VM",
-    usage: "rl cloud start [vm]",
-  },
-  "cloud stop": {
-    description: "Stop a cloud dev VM while preserving its disk",
-    usage: "rl cloud stop [vm]",
-  },
-  "cloud delete": {
-    description: "Delete a cloud dev VM and its boot disk",
-    usage: "rl cloud delete <vm>",
+    description: "Create a workspace on an existing SSH host",
+    usage:
+      "rl cloud create <name> [--repo <remote-repository>] [--host <host>] [--base <ref>] [--no-fetch]",
+    notes: [
+      "Requires rl and a registered repository on the server. Uses its default repository, or asks you to select one.",
+      "Creates a Git worktree and branch using the server's normal rl workflow, and prints its path. Use rl cloud open to enter it.",
+      "--repo selects a remote repository; it does not use your locally selected repository.",
+    ],
+    examples: [
+      "rl cloud create feature/login --repo frontend",
+      "rl cloud open frontend/feature/login",
+    ],
   },
   doctor: {
     group: "Project",
     description: "Check and repair agent integration",
-    usage: "rl doctor [codex|claude|agy] [--repair] [--json]",
+    usage: "rl doctor [codex|claude|agy|opencode] [--repair] [--json]",
     notes: [
       "Reports CLI availability, installed hooks and observed activity.",
       "--repair reinstalls this workspace's RL hooks.",
@@ -963,6 +991,22 @@ const children = (name: string) =>
   );
 const safe = (value: string) =>
   stripVTControlCharacters(value).replace(/[\x00-\x1f\x7f-\x9f]/g, " ");
+const workflowMenu = [
+  "show",
+  "configure",
+  "status",
+  "list",
+  "pause",
+  "resume",
+  "cancel",
+];
+const menuChildren = (name: string, all = false) =>
+  name === "workflow" && !all
+    ? workflowMenu.map((command): [string, Topic] => [
+        `workflow ${command}`,
+        topics[`workflow ${command}`],
+      ])
+    : children(name);
 
 export function mainHelp(): string {
   const lines = [
@@ -992,7 +1036,11 @@ function match(words: string[]): string | undefined {
       name = words.slice(0, length).join(" ");
   return name;
 }
-export function topicHelp(words: string[], strictLeaf = false): string {
+export function topicHelp(
+  words: string[],
+  strictLeaf = false,
+  all = false,
+): string {
   if (!words.length) return mainHelp();
   const name = match(words);
   if (
@@ -1003,7 +1051,7 @@ export function topicHelp(words: string[], strictLeaf = false): string {
     throw new Error(`Unknown help topic: ${safe(words.join(" "))}`);
   const topic = topics[name];
   const lines = [topic.description, "", `Usage: ${topic.usage}`];
-  const commands = children(name);
+  const commands = menuChildren(name, all);
   if (commands.length)
     lines.push(
       "",
@@ -1108,7 +1156,7 @@ export function usageHintForWords(words: string[], details = false): string {
     lines.push(
       "",
       "Commands:",
-      ...children(name).map(
+      ...menuChildren(name).map(
         ([key, child]) =>
           `  ${key.split(" ").at(-1)!.padEnd(12)}${child.description}`,
       ),
@@ -1131,15 +1179,19 @@ export function explicitHelp(argv: string[]): string {
   const separator = words.indexOf("--");
   if (separator >= 0) words = words.slice(0, separator);
   words = words.filter((word) => word !== "--help" && word !== "-h");
+  const all =
+    words.includes("--all") &&
+    words[words[0] === "help" ? 1 : 0] === "workflow";
+  if (all) words = words.filter((word) => word !== "--all");
   if (words[0] === "help") {
-    return topicHelp(words.slice(1), true);
+    return topicHelp(words.slice(1), true, all);
   }
   const leading: string[] = [];
   for (const word of words) {
     if (word.startsWith("-")) break;
     leading.push(word);
   }
-  return topicHelp(leading);
+  return topicHelp(leading, false, all);
 }
 if (
   process.argv[1] &&

@@ -764,9 +764,11 @@ export async function main(argv: string[]): Promise<number> {
     );
 
   if (command === "adopt") {
-    arity(rest, 0);
+    arity(rest, 0, 1);
+    if (rest[0] !== undefined && values.worktree !== undefined)
+      throw new UsageError("Choose a worktree path or --worktree, not both");
     const [file, data] = await store.adopt(
-      String(values.worktree ?? "."),
+      String(rest[0] ?? values.worktree ?? "."),
       typeof values.base === "string" ? values.base : undefined,
       values["extended-hooks"] ? true : undefined,
     );
@@ -801,8 +803,10 @@ export async function main(argv: string[]): Promise<number> {
 
   if (command === "hook") {
     arity(rest, 2, 3);
-    if (rest.length === 3 && rest[1] !== "agy") {
-      throw new UsageError("Only agy hooks accept an explicit native event");
+    if (rest.length === 3 && rest[1] !== "agy" && rest[1] !== "opencode") {
+      throw new UsageError(
+        "Only agy and opencode hooks accept an explicit native event",
+      );
     }
     return handleHook(store, rest[0], rest[1], rest[2]);
   }
@@ -875,6 +879,9 @@ export async function main(argv: string[]): Promise<number> {
           claude: activityView(data.activity?.claude),
           ...(data.activity?.agy
             ? { agy: activityView(data.activity.agy) }
+            : {}),
+          ...(data.activity?.opencode
+            ? { opencode: activityView(data.activity.opencode) }
             : {}),
         },
         stateDirectory: path.dirname(file),

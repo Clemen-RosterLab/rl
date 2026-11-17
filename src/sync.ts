@@ -378,7 +378,7 @@ export async function main(argv: string[]): Promise<number> {
           ? instance.baseBranch
           : context.defaultBase,
     }))
-    .toSorted((a, b) => a.branch.localeCompare(b.branch));
+    .sort((a, b) => a.branch.localeCompare(b.branch));
 
   const selected =
     positionals.length > 0

@@ -57,10 +57,13 @@ test("RL supplies the migrated team, rubric and coordinator without home agent d
   );
 });
 
-for (const host of ["codex", "claude", "agy"] as const) {
+for (const host of ["codex", "claude", "agy", "opencode"] as const) {
   test(`packaged profiles resolve ${host} settings in discovery and native claims`, (t) => {
     const w = new Workspace(t);
-    const identity = { agent: host, sessionId: randomUUID() };
+    const identity = {
+      agent: host,
+      sessionId: host === "opencode" ? "ses_preset1234" : randomUUID(),
+    };
     const call = (action: string, input: Record<string, unknown> = {}) => {
       const argv =
         action === "start"
@@ -91,6 +94,7 @@ for (const host of ["codex", "claude", "agy"] as const) {
         codex: "gpt-6-astra",
         claude: claudeModels[role],
         agy: undefined,
+        opencode: undefined,
       }[host];
       assert.equal(profile.model, expectedModel);
       assert.equal(
@@ -111,7 +115,12 @@ for (const host of ["codex", "claude", "agy"] as const) {
     }
     assert.equal(
       context.agents["regression-qa"].model,
-      { codex: "gpt-6-astra", claude: "sonnet", agy: undefined }[host],
+      {
+        codex: "gpt-6-astra",
+        claude: "sonnet",
+        agy: undefined,
+        opencode: undefined,
+      }[host],
     );
     const raw = JSON.parse(
       w.rl(["workflow", "context", "--json"], { cwd: w.a }).stdout,

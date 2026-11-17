@@ -83,10 +83,10 @@ test("ordinary Codex sessions are discovered, persisted, shown in overview and r
     2,
   );
   const table = w.rl(["list"], { cwd: w.a }).stdout;
-  assert.match(table, /CODEX\s+CLAUDE/);
+  assert.match(table, /SESSIONS/);
   assert.match(
     table.split("\n").find((line) => line.includes("feature/a")) ?? "",
-    /2\s+0\s+-$/,
+    /2$/,
   );
   sessionPicker(w);
   w.rl(["resume", "codex"], { cwd: w.a });

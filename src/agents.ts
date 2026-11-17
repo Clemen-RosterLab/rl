@@ -1,7 +1,7 @@
 import path from "node:path";
-import { object, sessionId } from "./common.js";
+import { agentSessionId, object } from "./common.js";
 
-export const AGENTS = ["codex", "claude", "agy"] as const;
+export const AGENTS = ["codex", "claude", "agy", "opencode"] as const;
 export type Agent = (typeof AGENTS)[number];
 export type EventType =
   | "session.started"
@@ -79,7 +79,7 @@ export function parseEvent(
     throw new Error("Subagent hook requires agent_id");
   let resumable = false;
   try {
-    sessionId(id);
+    agentSessionId(adapter.name, id);
     resumable = !childId;
   } catch {
     /* Observed IDs are not necessarily CLI resume IDs. */

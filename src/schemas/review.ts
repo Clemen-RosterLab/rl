@@ -3,6 +3,7 @@ import { ReviewResultSchema } from "./automation.js";
 import {
   AgentNameSchema,
   GitOidSchema,
+  OpenCodeSessionIdSchema,
   Sha256HexSchema,
   StrictLowerUuidSchema,
 } from "./common.js";
@@ -35,18 +36,35 @@ export const ReviewCheckpointSchema = z.strictObject({
   pr: z.number().int().safe().min(1).optional(),
 });
 
-export const ReviewFeedbackEntrySchema = z.strictObject({
-  id: StrictLowerUuidSchema,
-  at: z.string().min(1),
-  snapshot: StrictLowerUuidSchema,
-  fingerprint: Sha256HexSchema,
-  text: z.string(),
-  agent: AgentNameSchema.optional(),
-  sessionId: StrictLowerUuidSchema.optional(),
-  status: z.enum(["saved", "opened", "delivered", "failed"]),
-  error: z.string().optional(),
-  output: z.string().optional(),
-});
+export const ReviewFeedbackEntrySchema = z
+  .strictObject({
+    id: StrictLowerUuidSchema,
+    at: z.string().min(1),
+    snapshot: StrictLowerUuidSchema,
+    fingerprint: Sha256HexSchema,
+    text: z.string(),
+    agent: AgentNameSchema.optional(),
+    sessionId: z.string().min(1).optional(),
+    status: z.enum(["saved", "opened", "delivered", "failed"]),
+    error: z.string().optional(),
+    output: z.string().optional(),
+  })
+  .superRefine((val, ctx) => {
+    if (val.sessionId !== undefined) {
+      const idSchema =
+        val.agent === "opencode"
+          ? OpenCodeSessionIdSchema
+          : StrictLowerUuidSchema;
+      const check = idSchema.safeParse(val.sessionId);
+      if (!check.success) {
+        ctx.addIssue({
+          code: "custom",
+          path: ["sessionId"],
+          message: check.error.issues[0]?.message ?? "Invalid session ID",
+        });
+      }
+    }
+  });
 
 export const ReviewAnalysisMetaSchema = z.strictObject({
   id: StrictLowerUuidSchema,

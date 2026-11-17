@@ -892,8 +892,9 @@ def quit_scenario():
     with open(marker) as file:
         scratch = os.path.dirname(os.path.dirname(json.load(file)))
     assert os.path.basename(scratch).startswith('rl-review-live-')
+    started = time.monotonic()
     key('q')
-    return scratch
+    return scratch, started
 
 def handoff_scenario():
     expect_screen('+version-one')
@@ -969,7 +970,7 @@ try:
     elif scenario == "workflow":
         workflow_scenario()
     elif scenario == "quit":
-        scratch = quit_scenario()
+        scratch, quit_started = quit_scenario()
     elif scenario == "handoff":
         quit_started = handoff_scenario()
     elif scenario in ('shell', 'shell-function'):
@@ -1054,11 +1055,14 @@ try:
             time.sleep(.05)
         print(f'QUIT_LATENCY={elapsed:.3f}s')
     if scenario == "quit":
-        assert not os.path.exists(scratch), 'Cancelled refresh left its temporary index'
-        deadline = time.monotonic()+5
-        while freeze_refs():
-            assert time.monotonic()<deadline, 'Quit left its private freeze refs'
+        elapsed = time.monotonic()-quit_started
+        assert elapsed < .8, f'Quit waited {elapsed:.3f}s for disk cleanup'
+        print(f'QUIT_LATENCY={elapsed:.3f}s')
+        deadline = time.monotonic()+8
+        while os.path.exists(scratch) or freeze_refs():
+            assert time.monotonic()<deadline, 'Background cleanup left its private refs or temporary index'
             time.sleep(.05)
+        assert os.path.exists(os.environ['REVIEW_CLEANUP_MARKER']), 'Slow filesystem cleanup was not exercised'
         heartbeat = os.environ['REVIEW_GIT_HEARTBEAT']
         last_heartbeat = os.stat(heartbeat).st_mtime_ns
         time.sleep(.2)

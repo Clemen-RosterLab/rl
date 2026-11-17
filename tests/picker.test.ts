@@ -214,7 +214,7 @@ test("pickers sort by last access, retain order when filtering, and do not count
     assert.ok(readJson(captured).args.includes("--no-sort"));
     assert.ok(
       readJson(captured).args.some((arg: string) =>
-        arg.endsWith("LAST ACCESSED"),
+        /LAST (?:ACCESSED|USED \/ RL)$/.test(arg),
       ),
     );
     assert.match(
@@ -227,7 +227,7 @@ test("pickers sort by last access, retain order when filtering, and do not count
       readJson(captured).rows.find((row: string) =>
         row.startsWith("unregistered\t"),
       ),
-      /—$/,
+      args.length ? /—$/ : /not initialized$/,
     );
   }
   const before = w.status(older).lastAccessedAt;

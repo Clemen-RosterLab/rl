@@ -48,14 +48,18 @@ ${
 `,
     );
   const call = (
-    method: "setupDependencies" | "installRl" | "configureShell",
+    method:
+      | "setupDependencies"
+      | "installRl"
+      | "configureShell"
+      | "autoConfigureShell",
     args: unknown[] = [],
     host: object = {},
     ok = true,
   ) => {
     const module = method === "setupDependencies" ? "dependencies" : "install";
     const invocation =
-      method === "configureShell"
+      method === "configureShell" || method === "autoConfigureShell"
         ? `console.log(JSON.stringify(fn({...${JSON.stringify(host)}, env:process.env, home:${JSON.stringify(home)}, packageRoot:${JSON.stringify(ROOT)}})));`
         : `process.exitCode=await fn(${JSON.stringify(args)},{...${JSON.stringify(host)},env:process.env,home:${JSON.stringify(home)},packageRoot:${JSON.stringify(ROOT)}});`;
     const result = spawnSync(
@@ -73,6 +77,71 @@ ${
   };
   return { root, bin, home, env, tool, manager, call };
 }
+
+test("global install configures the current shell once without installing tools", (t) => {
+  const f = fixture(t);
+  const prefix = path.join(f.root, "prefix");
+  fs.mkdirSync(path.join(prefix, "lib/node_modules"), { recursive: true });
+  fs.symlinkSync(ROOT, path.join(prefix, "lib/node_modules/rl-workspaces"));
+  Object.assign(f.env, {
+    npm_config_global: "true",
+    npm_config_prefix: prefix,
+    CI: "false",
+    RL_SKIP_SHELL_SETUP: "0",
+    SUDO_USER: undefined,
+    SUDO_UID: undefined,
+  });
+  const profile = path.join(f.home, ".zshrc");
+  write(profile, "# Personal settings\nexport KEEP_ME=yes\n");
+  f.manager("brew");
+  f.call("autoConfigureShell", [], { uid: 1000 });
+  const first = read(profile);
+  assert.match(first, /export KEEP_ME=yes/);
+  assert.match(first, /setup shell zsh/);
+  assert.ok(!fs.existsSync(path.join(f.home, ".bashrc")));
+  assert.ok(!fs.existsSync(f.env.RL_INSTALL_TEST_LOG));
+  f.call("autoConfigureShell", [], { uid: 1000 });
+  assert.equal(read(profile), first);
+  write(profile, "# >>> rl shell integration >>>\n# incomplete block\n");
+  const result = f.call("autoConfigureShell", [], { uid: 1000 });
+  assert.match(result.stderr, /automatic shell setup skipped/);
+  assert.equal(
+    read(profile),
+    "# >>> rl shell integration >>>\n# incomplete block\n",
+  );
+});
+
+test("automatic setup skips local dependencies, CI, opt-out, elevated users and indirect global installs", (t) => {
+  const f = fixture(t);
+  const prefix = path.join(f.root, "prefix");
+  fs.mkdirSync(path.join(prefix, "lib/node_modules"), { recursive: true });
+  fs.symlinkSync(ROOT, path.join(prefix, "lib/node_modules/rl-workspaces"));
+  for (const overrides of [
+    { npm_config_global: "false" },
+    { CI: "true" },
+    { RL_SKIP_SHELL_SETUP: "1" },
+    { SUDO_USER: "someone" },
+    { npm_config_prefix: path.join(f.root, "other-prefix") },
+  ]) {
+    Object.assign(
+      f.env,
+      {
+        npm_config_global: "true",
+        npm_config_prefix: prefix,
+        CI: "false",
+        RL_SKIP_SHELL_SETUP: "0",
+        SUDO_USER: undefined,
+        SUDO_UID: undefined,
+      },
+      overrides,
+    );
+    f.call("autoConfigureShell", [], { uid: 1000 });
+    assert.deepEqual(fs.readdirSync(f.home), []);
+  }
+  Object.assign(f.env, { npm_config_prefix: prefix });
+  f.call("autoConfigureShell", [], { uid: 0 });
+  assert.deepEqual(fs.readdirSync(f.home), []);
+});
 
 test("dependency setup installs only missing tools, verifies the result, and does not run the package manager on repeat", (t) => {
   const f = fixture(t);

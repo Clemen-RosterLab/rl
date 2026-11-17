@@ -408,7 +408,9 @@ export async function analyse(
       ? "codex"
       : findExecutable("claude")
         ? "claude"
-        : "agy");
+        : findExecutable("opencode")
+          ? "opencode"
+          : "agy");
 
   const notes = ["context.md", "progress.md"].map((name) => ({
     name,

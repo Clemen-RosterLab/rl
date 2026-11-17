@@ -2,6 +2,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { agyResult, agyTurn } from "../agent-agy.js";
+import { opencodeResult, opencodeStructuredResult } from "../agent-opencode.js";
 import { agentAdapter } from "../agent-registry.js";
 import type { Agent, AgentAdapter } from "../agents.js";
 import { execute, object, readJson, writeJson } from "../common.js";
@@ -65,6 +66,8 @@ export async function runStructuredAgentTurn(
         "--json-schema",
         schemaFile,
       ];
+    } else if (provider === "opencode") {
+      flags = ["--agent", "plan", "--format", "json"];
     } else {
       flags = [
         "--tools",
@@ -93,17 +96,20 @@ export async function runStructuredAgentTurn(
         );
       } else if (provider === "agy") {
         flags.push("--effort", options.reasoning);
+      } else if (provider === "opencode") {
+        flags.push("--variant", options.reasoning);
       }
     }
 
     const turn =
       provider === "agy" ? agyTurn(options.prompt, flags) : undefined;
+    const fallbackInstruction =
+      provider === "opencode"
+        ? `${options.stdinFallbackInstruction} Return ONLY a single JSON object matching this JSON Schema (no markdown prose): ${JSON.stringify(options.schema)}`
+        : options.stdinFallbackInstruction;
     const command =
       turn?.command ??
-      adapter.runArgs(
-        provider === "codex" ? "-" : options.stdinFallbackInstruction,
-        flags,
-      );
+      adapter.runArgs(provider === "codex" ? "-" : fallbackInstruction, flags);
 
     const result = await execute(command, options.cwd, {
       input: turn?.input ?? options.prompt,
@@ -134,6 +140,8 @@ export async function runStructuredAgentTurn(
     let response: Record<string, unknown>;
     if (provider === "agy") {
       response = agyResult(result.stdout);
+    } else if (provider === "opencode") {
+      response = opencodeStructuredResult(result.stdout);
     } else if (provider === "codex" && fs.existsSync(outputFile)) {
       response = readJson(outputFile);
     } else {
@@ -187,6 +195,17 @@ export async function runHeadlessFeedbackTurn(options: {
     command = turn.command;
   } else if (agent === "codex") {
     command = ["codex", "exec", "resume", sessionId, "--", "-"];
+  } else if (agent === "opencode") {
+    command = [
+      "opencode",
+      "run",
+      "--session",
+      sessionId,
+      "--format",
+      "json",
+      "--",
+      "Apply the RL review feedback provided on stdin.",
+    ];
   } else {
     command = [
       "claude",
@@ -216,6 +235,13 @@ export async function runHeadlessFeedbackTurn(options: {
     if (response.conversation_id !== sessionId) {
       throw new Error(
         "Antigravity did not confirm a successful turn in the selected conversation",
+      );
+    }
+  } else if (agent === "opencode") {
+    const response = opencodeResult(result.stdout);
+    if (response.sessionId !== sessionId) {
+      throw new Error(
+        "OpenCode did not confirm a successful turn in the selected session",
       );
     }
   }

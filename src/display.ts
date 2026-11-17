@@ -25,6 +25,7 @@ const AGENT_LABELS: Readonly<Record<Agent, string>> = {
   codex: "Codex",
   claude: "Claude",
   agy: "Antigravity",
+  opencode: "OpenCode",
 };
 
 export function prText(pr: Instance["pr"]): string {
@@ -154,11 +155,11 @@ export function statusText(
 
   lines.push("", `  ${paint("Sessions", 1)}`);
 
-  for (const agent of ["codex", "claude", "agy"] as const) {
+  for (const agent of ["codex", "claude", "agy", "opencode"] as const) {
     if (
-      agent === "agy" &&
-      !data.sessions.agy?.length &&
-      !data.activity?.agy?.length
+      (agent === "agy" || agent === "opencode") &&
+      !data.sessions[agent]?.length &&
+      !data.activity?.[agent]?.length
     ) {
       continue;
     }

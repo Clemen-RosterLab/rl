@@ -18,7 +18,7 @@
 - [Multiple repositories and settings](#multiple-repositories-and-settings)
 - [Development](#development)
 
-Git workspaces for Codex, Claude Code and Antigravity (`agy`).
+Git workspaces for Codex, Claude Code, Antigravity (`agy`) and OpenCode (`opencode`).
 
 Create a workspace, start an agent, and keep task notes and sessions together.
 Switch projects, prepare local dependencies, check PRs, and merge finished work
@@ -29,12 +29,23 @@ zsh, fzf, GitHub CLI and integration for zsh and bash terminals.
 
 ## Install
 
-Install from npm and run the one-time setup:
+Install from npm:
 
 ```sh
 npm install --global rl-workspaces
-rl setup install
 ```
+
+Global npm installs automatically register shell integration for your current zsh
+or bash shell. Open a new terminal to use directory switching. Existing settings
+are preserved, and upgrades update the same managed block. The installer does not
+download system tools. Use `rl setup install` to install missing tools or repair
+shell integration.
+
+Automatic setup is skipped for local/dependency installs, CI, elevated installs,
+or `RL_SKIP_SHELL_SETUP=1`. npm's `--ignore-scripts` also disables it. Unsupported
+shells or startup-file errors leave the CLI installed and print manual setup
+guidance. No installer can change the directory or functions of its parent shell;
+use the activation command below for the terminal that ran npm.
 
 See Development below to build and try unpublished changes.
 
@@ -82,6 +93,7 @@ rl repo add . --base origin/test
 rl switch feature/login -c --agent codex
 # or: rl switch feature/login -c --agent claude
 # or: rl switch feature/login -c --agent agy
+# or: rl switch feature/login -c --agent opencode
 
 rl notes append progress implementation-notes.md
 rl list
@@ -99,6 +111,35 @@ branch; add `--no-fetch` to work offline using cached refs. Notes and session li
 survive workspace deletion.
 
 ## Commands and help
+
+To bring worktrees created with Git or another tool into RL:
+
+```sh
+rl                                    # existing worktrees appear automatically
+rl setup adopt /path/to/worktree       # register a particular worktree in place
+rl list                               # list worktrees without initializing them
+```
+
+Discovery uses Git's worktree registry for the selected repository; it does not
+scan unrelated directories. The picker includes worktrees with checked-out
+branches, including those outside RL's usual worktree directory. Selecting one
+registers it and installs the usual workspace hooks; its path, files and branch
+stay in place. Worktrees without RL state are labelled `not initialized` until
+selected or explicitly adopted. Opening or cancelling the picker, and listing
+worktrees, does not initialize them.
+`setup adopt` defaults to the current directory, and accepts a relative or
+absolute path belonging to the selected repository. Use `rl --repo <alias>`
+to choose a registered repository explicitly. Detached worktrees can be listed
+but cannot be adopted until you attach them to a branch yourself.
+
+`rl list` automatically groups workspaces by repository and fits the terminal.
+Each row shows the workspace once, its changes and sync status. PRs and saved
+session counts appear when present (session counts on wider terminals). Long
+names use `…`; narrow terminals use a compact two-line summary. Exceptional
+states, changed branches and active/paused tasks appear beneath the workspace.
+`↑` and `↓` mean commits ahead and behind upstream. `--json` keeps full names,
+upstream refs, per-provider sessions and all other details. No layout settings
+are needed. Piped output uses `COLUMNS` or a 120-column fallback.
 
 `rl help` shows a short list of command families. Arguments, options and examples
 live in command-specific help, which works even outside a configured repository:
@@ -436,7 +477,7 @@ pushes do not publish these refs.
 
 `--summary`, `--ai-review` and `--groups` use the editable RL `reviewer` profile
 and review policy. Override the profile with `--profile`, or the provider with
-`--provider codex|claude|agy`. Each analysis uses a fresh session, a bounded context
+`--provider codex|claude|agy|opencode`. Each analysis uses a fresh session, a bounded context
 from its saved Git trees, changed source and recorded notes. Summaries cover
 implementation, architecture, behaviour, tests and concerns. Source facts and
 agent-reported claims are labelled separately; this command does not run tests
@@ -689,7 +730,7 @@ fields cannot be empty; use “Not run” for checks that were not performed.
 Pausing saves the handoff and session together under the state lock. It does not
 stop the agent or alter Git files. Every checkpoint stays in the workspace's
 `task.handoffs` history, including after workspace deletion. `rl status --workspace` includes
-the saved handoffs, and `rl list` adds a TASK column showing `paused` or `active`.
+the saved handoffs, and `rl list` shows `task paused` or `task active` beneath the workspace.
 
 ### Start and resume agents
 
@@ -699,8 +740,10 @@ rl agent start claude
 rl agent start codex --desktop # open this worktree in the Codex desktop app
 rl agent start claude --desktop # open this worktree in Claude Desktop's Code tab
 rl agent start agy
+rl agent start opencode
 rl agent run codex --prompt "Review the change" -- --json
 rl agent run claude --prompt "Review the change"
+rl agent run opencode --prompt "Review the change"
 rl agent handoff claude --output handoff.md
 rl resume                # choose among this workspace's Codex and Claude sessions
 rl resume --latest       # resume the most recently used session directly (-l / --l)
@@ -715,13 +758,13 @@ rl doctor --repair
 ```
 
 Both launch modes preserve agent options after `--`, use the selected workspace,
-and return the agent's exit status. Headless mode uses `codex exec` or
-`claude --print` or `agy --print`. RL leaves permissions and authentication to the agent.
+and return the agent's exit status. Headless mode uses `codex exec`,
+`claude --print`, `agy --print` or `opencode run`. RL leaves permissions and authentication to the agent.
 
-`rl resume` lists saved Codex and Claude sessions for the current RL workspace.
-If multiple sessions match, an `fzf` picker shows the agent, full session UUID,
+`rl resume` lists saved sessions for the current RL workspace.
+If multiple sessions match, an `fzf` picker shows the agent, full session ID,
 last-used time, and start time, with the most recently used first. If exactly
-one session matches, it resumes automatically. An optional `codex`, `claude` or `agy`
+one session matches, it resumes automatically. An optional `codex`, `claude`, `agy` or `opencode`
 argument filters the choices. Escape cancels without launching an agent.
 Use `--latest` (or `-l` / `--l`) to skip the picker and resume the most recently
 used matching session directly.
@@ -760,7 +803,8 @@ ephemeral sessions, and checks branch metadata and existing ownership. Without
 branch metadata, only sessions created after workspace adoption are imported.
 It reads metadata from Codex's state database, preserves newer saved usage times,
 and leaves saved sessions available if Codex is missing or discovery fails.
-Overview tables show saved session counts in the CODEX and CLAUDE columns.
+On wider terminals, the workspace list shows a SESSIONS column with the total
+number of saved conversations. These counts do not indicate running agents.
 
 An agent can also run `rl agent save` (Codex by default) or
 `rl agent save codex`; this uses its `CODEX_THREAD_ID`, falling back to
@@ -772,13 +816,13 @@ Hooks supply shared context/progress at session start, after compaction, and to
 subagents. Prompt submission refreshes changed notes. Codex hooks must be reviewed
 and trusted with `/hooks` before they run; session discovery works independently.
 
-| Integration | Codex | Claude Code | Antigravity |
-| --- | --- | --- | --- |
-| Interactive / headless launch | `codex` / `codex exec` | `claude` / `claude --print` | `agy` / `agy --print` |
-| Resume | `codex resume <UUID>` | `claude --resume <UUID>` | `agy --conversation <UUID>` |
-| Project hooks | `.codex/hooks.json` | `.claude/settings.local.json` | `.agents/hooks.json` |
-| Lifecycle | SessionStart, UserPromptSubmit, Stop, SessionEnd, SubagentStart, SubagentStop | Same | SessionStart, PreInvocation, PreToolUse, PostToolUse, Stop |
-| Optional extended hooks | Interrupt | StopFailure, Notification | None |
+| Integration | Codex | Claude Code | Antigravity | OpenCode |
+| --- | --- | --- | --- | --- |
+| Interactive / headless launch | `codex` / `codex exec` | `claude` / `claude --print` | `agy` / `agy --print` | `opencode` / `opencode run` |
+| Resume | `codex resume <UUID>` | `claude --resume <UUID>` | `agy --conversation <UUID>` | `opencode --session <ID>` |
+| Project hooks | `.codex/hooks.json` | `.claude/settings.local.json` | `.agents/hooks.json` | `.opencode/plugins/rl.js` |
+| Lifecycle | SessionStart, UserPromptSubmit, Stop, SessionEnd, SubagentStart, SubagentStop | Same | SessionStart, PreInvocation, PreToolUse, PostToolUse, Stop | SessionStart, UserPromptSubmit, PreToolUse, PostToolUse, Stop, SessionEnd, SubagentStart, SubagentStop |
+| Optional extended hooks | Interrupt | StopFailure, Notification | None | None |
 
 For Antigravity, run `rl setup adopt` once in an existing worktree, then start
 `agy` normally or use `rl agent start agy`. Its native hooks save conversation
@@ -994,7 +1038,23 @@ rl workflow validation RUN_ID --file receipt.json --agent codex --session SESSIO
 rl workflow heartbeat RUN_ID --file progress.json --agent codex --session SESSION_ID
 rl workflow status RUN_ID --json
 rl workflow status RUN_ID --watch # live per-agent state in this terminal
+rl workflow status RUN_ID --follow # plain-text progress stream; also works in pipes
 ```
+
+The coordinator reports workflow milestones in the main conversation, including
+research alternatives, the selected approach, implementation, review, validation
+and blockers. Roles report concrete progress to the coordinator and record claim
+heartbeats. During long work or waits, the protocol asks for brief updates roughly
+every 30 seconds when the host allows; it never treats a heartbeat as proof that
+an agent process is alive.
+
+`status --follow` prints recorded changes with timestamps, checks once per second,
+and emits an explicit waiting notice after 30 seconds without changes. It follows
+the selected run, including when `latest` was used, until it completes, pauses or
+is cancelled. Ctrl-C closes the stream without cancelling the workflow. This is
+a summary of recorded state, not a raw agent transcript or a complete event log;
+very short intermediate states between polls may not appear. JSON and MCP
+responses remain machine-readable and do not include these terminal messages.
 
 `assess` input is `{ "assessment": { "level": "standard", "rationale": "...",
 "uncertainty": [], "systems": ["..."], "consequences": ["..."] } }`.
@@ -1063,6 +1123,28 @@ missing outcomes remain unverified. Synthetic harness tests never count as
 native-agent quality results. Historical outcomes do not certify changed source.
 Trial kind, observed defect counts and environment comparability are
 host-reported; token/cost numbers are not invented.
+
+For everyday use:
+
+```sh
+rl workflow show                    # readable summary of the default workflow
+rl workflow configure               # edit this worktree's settings in VISUAL/EDITOR
+rl workflow status --follow          # follow progress from the latest run
+rl workflow list                     # available workflows
+rl workflow pause                   # pause the latest run
+rl workflow resume                  # continue unfinished stages
+rl workflow cancel                  # cancel the latest run
+```
+
+`configure` creates editable defaults on first use, or opens existing settings,
+and validates them when your editor exits. Missing files in a partial configuration
+keep their inherited defaults. Use `EDITOR='code --wait' rl workflow configure`
+for VS Code. `--paths` or `--json` prints file paths without opening an editor;
+non-interactive invocations also print paths. Settings affect future runs.
+
+The default help shows only these everyday commands. Agents still have the
+coordination protocol; `rl workflow --help --all` lists all commands. For
+advanced configuration and automation:
 
 ```sh
 rl workflow context --json           # discover active definitions and their source
@@ -1273,7 +1355,8 @@ rl setup mcp
 
 This configures both `.codex/config.toml` and `.mcp.json` in the current checkout.
 Pass `codex` or `claude` to select one client, or `--dry-run` to preview changes.
-Use `rl setup mcp agy` for Antigravity's workspace-local `.agents/mcp_config.json`.
+Use `rl setup mcp agy` for Antigravity's workspace-local `.agents/mcp_config.json`,
+or `rl setup mcp opencode` for OpenCode's workspace-local `opencode.json`.
 Its managed server name includes the RL instance UUID, preventing a server
 already running for another worktree from taking precedence. Reconfiguring a
 copied file replaces obsolete RL-managed entries while preserving other servers.
@@ -1324,6 +1407,21 @@ Deleting a workspace archives its record. Recreating it starts a new instance
 with separate sessions. Back up state alongside your work.
 
 ## Multiple repositories and settings
+
+Clone and register a repository directly from Git:
+
+```sh
+rl repo add git@github.com:owner/project.git
+rl repo clone https://github.com/owner/project.git ./projects/frontend --alias frontend
+```
+
+Both forms clone, register, and enter the checkout with shell integration. Without
+shell integration they print its path. The default destination is a new directory
+named after the alias or repository in the current directory. Existing destinations,
+including empty directories, are refused. Git handles authentication and checks out
+the remote default branch; `--base` only overrides RL's workspace base. Setup scripts
+are not run. `rl repo clone` also accepts local Git paths. Failed clones may leave a
+partial directory; registration failures keep the clone for `rl repo add <path>`.
 
 ```sh
 rl repo add /path/to/frontend --base origin/test

@@ -21,10 +21,11 @@ export async function main(argv: string[]): Promise<number> {
     selected !== undefined &&
     selected !== "codex" &&
     selected !== "claude" &&
-    selected !== "agy"
+    selected !== "agy" &&
+    selected !== "opencode"
   ) {
     throw new UsageError(
-      "Expected codex, claude or agy; omit the client to configure Codex and Claude",
+      "Expected codex, claude, agy or opencode; omit the client to configure Codex and Claude",
     );
   }
 

@@ -2,72 +2,16 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
-import {
-  buildManagedSshBlock,
-  extractDryRunSshDetails,
-  parseShellWords,
-  upsertSshConfigContent,
-} from "../dist/cloud.js";
 import { CLI, Workspace, read, readJson, write } from "./helpers.js";
 
-test("gcloud dry-run parser and ssh_config generator preserve user settings and deduplicate rl-cloud alias", () => {
-  const sample =
-    '/usr/bin/ssh -t -i /Users/tester/.ssh/google_compute_engine -o CheckHostIP=no -o HashKnownHosts=no -o HostKeyAlias=compute.100001 -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=/Users/tester/.ssh/google_compute_known_hosts -o "ProxyCommand /opt/homebrew/bin/python3 -S /opt/homebrew/google-cloud-sdk/lib/gcloud.py compute start-iap-tunnel dev-vm-1 %p --listen-on-stdin --project=example-cloud-project --zone=us-central1-a --verbosity=warning" -o ProxyUseFdpass=no tester_example_invalid@compute.100001';
-
-  const words = parseShellWords(sample);
-  assert.equal(words[0], "/usr/bin/ssh");
-  assert.equal(words.at(-1), "tester_example_invalid@compute.100001");
-
-  const details = extractDryRunSshDetails(sample);
-  assert.deepEqual(details, {
-    user: "tester_example_invalid",
-    hostKeyAlias: "compute.100001",
-    identityFile: "/Users/tester/.ssh/google_compute_engine",
-    userKnownHostsFile: "/Users/tester/.ssh/google_compute_known_hosts",
-  });
-
-  const blockA = buildManagedSshBlock({
-    vm: "dev-vm-1",
-    isDefault: true,
-    project: "example-cloud-project",
-    zone: "us-central1-a",
-    gcloudPath: "/opt/homebrew/bin/gcloud",
-    details,
-  });
-  assert.match(blockA, /Host dev-vm-1 rl-cloud/);
-  assert.match(blockA, /ControlMaster auto/);
-  assert.match(blockA, /start-iap-tunnel dev-vm-1 %p/);
-
-  const existing = "Host github.com\n  User git\n";
-  const withA = upsertSshConfigContent(existing, "dev-vm-1", blockA, true);
-  assert.match(withA, /Host github\.com/);
-  assert.match(withA, /Host dev-vm-1 rl-cloud/);
-
-  const blockB = buildManagedSshBlock({
-    vm: "dev-vm-2",
-    isDefault: true,
-    project: "example-cloud-project",
-    zone: "us-central1-a",
-    gcloudPath: "/opt/homebrew/bin/gcloud",
-    details: { ...details, hostKeyAlias: "compute.99999" },
-  });
-  const withBoth = upsertSshConfigContent(withA, "dev-vm-2", blockB, true);
-  assert.match(withBoth, /Host dev-vm-1\n/);
-  assert.match(withBoth, /Host dev-vm-2 rl-cloud\n/);
-});
-
-test("end-to-end cloud repos, list, ssh-config, fetch, checkout and uncommitted cloud review", (t) => {
+test("end-to-end SSH workspace listing, creation, checkout and uncommitted review", (t) => {
   const w = new Workspace(t);
   const localHome = path.join(w.root, "local-home");
   const cloudHome = path.join(w.root, "cloud-home");
   fs.mkdirSync(localHome, { recursive: true });
   fs.mkdirSync(cloudHome, { recursive: true });
 
-  // Configure cloudProject and cloudZone locally in config.toml (no hardcoded defaults).
-  write(
-    w.config,
-    'cloudProject = "example-cloud-project"\ncloudZone = "us-central1-a"\n',
-  );
+  write(w.config, 'cloudHost = "dev-vm-1"\n');
 
   // Isolate os.homedir() for the local CLI process so ~/.ssh/config is written inside w.root.
   const preload = path.join(w.root, "home-preload.cjs");
@@ -171,29 +115,7 @@ test("end-to-end cloud repos, list, ssh-config, fetch, checkout and uncommitted 
 
   w.stub(
     "gcloud",
-    `
-const args = process.argv.slice(2);
-if (args[0] === "config" && args[1] === "get-value" && args[2] === "account") {
-  console.log("tester@example.invalid");
-  process.exit(0);
-}
-if (args[0] === "compute" && args[1] === "instances" && args[2] === "list") {
-  console.log(JSON.stringify([{
-    name: "dev-vm-1",
-    zone: "https://www.googleapis.com/compute/v1/projects/p/zones/us-central1-a",
-    machineType: "zones/us-central1-a/machineTypes/e2-standard-4",
-    status: "RUNNING",
-    labels: { owner: "tester" }
-  }]));
-  process.exit(0);
-}
-if (args[0] === "compute" && args[1] === "ssh" && args.includes("--dry-run")) {
-  console.log("/usr/bin/ssh -t -i /tmp/fake_key -o HostKeyAlias=compute.12345 -o UserKnownHostsFile=/tmp/fake_kh tester_example_invalid@compute.12345");
-  process.exit(0);
-}
-console.error("Unexpected gcloud call: " + args.join(" "));
-process.exit(1);
-`,
+    `require('node:fs').writeFileSync(process.env.CLOUD_TEST_HOME + '/unexpected-gcloud', 'called'); process.exit(99);`,
   );
 
   // Expose `rl` inside a cloud-bin dir for simulated remote commands.
@@ -251,16 +173,10 @@ fs.appendFileSync(process.env.CODE_CALL_LOG, JSON.stringify(process.argv.slice(2
 `,
   );
 
-  // 1. rl cloud vms
-  const vmsJson = JSON.parse(w.rl(["cloud", "vms", "--json"]).stdout);
-  assert.equal(vmsJson.vms.length, 1);
-  assert.equal(vmsJson.vms[0].name, "dev-vm-1");
-
-  // 2. rl cloud ssh-config writes ~/.ssh/config inside localHome
-  w.rl(["cloud", "ssh-config"]);
-  const sshCfg = read(path.join(localHome, ".ssh/config"));
-  assert.match(sshCfg, /Host dev-vm-1 rl-cloud/);
-  assert.match(sshCfg, /ControlMaster auto/);
+  fs.mkdirSync(path.join(localHome, ".ssh"), { recursive: true });
+  const sshConfig =
+    "Host dev-vm-1\n  HostName example.invalid\n  ProxyCommand existing-user-proxy %h %p\n";
+  write(path.join(localHome, ".ssh/config"), sshConfig);
 
   // 3. rl cloud repos discovers both registered RL repo AND unregistered git repo in $HOME
   const cloudRepos = JSON.parse(w.rl(["cloud", "repos", "--json"]).stdout);
@@ -351,6 +267,54 @@ fs.appendFileSync(process.env.CODE_CALL_LOG, JSON.stringify(process.argv.slice(2
     read(path.join(localCheckedOut, "uncommitted.ts")),
     "export const draft = true;\n",
   );
+  // Create on the explicitly chosen remote repository, never the local selection.
+  const localHead = w.git(w.repo, "rev-parse", "HEAD");
+  const localStatus = w.git(w.repo, "status", "--porcelain");
+  w.rl([
+    "--repo",
+    "frontend",
+    "cloud",
+    "create",
+    "feature/new-work",
+    "--repo",
+    "webapp",
+    "--base",
+    "develop",
+    "--no-fetch",
+  ]);
+  assert.match(
+    w.git(cloudRepo, "worktree", "list", "--porcelain"),
+    /refs\/heads\/feature\/new-work/,
+  );
+  w.rl(["cloud", "create", "default-work", "--base", "develop", "--no-fetch"]);
+  assert.match(
+    w.git(cloudRepo, "worktree", "list", "--porcelain"),
+    /refs\/heads\/default-work/,
+  );
+  assert.match(
+    w.rl(
+      ["cloud", "create", "feature/new-work", "--repo", "webapp", "--no-fetch"],
+      {
+        ok: false,
+      },
+    ).stderr,
+    /already/,
+  );
+  assert.match(
+    w.rl(["cloud", "create", "missing-work", "--repo", "missing"], {
+      ok: false,
+    }).stderr,
+    /not registered/,
+  );
+  w.rl(["cloud", "code", "webapp/feature/new-work"]);
+  assert.equal(w.git(w.repo, "rev-parse", "HEAD"), localHead);
+  assert.equal(w.git(w.repo, "status", "--porcelain"), localStatus);
+  assert.equal(
+    w.git(w.repo, "branch", "--list", "feature/new-work", "default-work"),
+    "",
+  );
+  assert.equal(read(path.join(localHome, ".ssh/config")), sshConfig);
+  assert.ok(!fs.existsSync(path.join(cloudHome, "unexpected-gcloud")));
 });
 
 test("rl cloud works with any plain SSH host without gcloud or GCP config", (t) => {

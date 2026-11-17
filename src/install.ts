@@ -183,6 +183,51 @@ export function configureShell(host: InstallHost, requestedShell?: string) {
   };
 }
 
+/** npm global installs opt into shell setup; project dependencies never do. */
+export function autoConfigureShell(host: InstallHost = {}): void {
+  const env = host.env ?? process.env;
+  if (
+    env.npm_config_global !== "true" ||
+    /^(1|true)$/i.test(env.RL_SKIP_SHELL_SETUP ?? "") ||
+    /^(1|true)$/i.test(env.CI ?? "")
+  )
+    return;
+  if ((host.uid ?? process.getuid?.()) === 0 || env.SUDO_USER || env.SUDO_UID) {
+    console.warn(
+      "rl: shell setup skipped for elevated installation. Run rl setup install as your normal user.",
+    );
+    return;
+  }
+  // npm also sets global=true for dependencies of other global packages.
+  // Only the directly installed RL package may change startup configuration.
+  const root = canonical(host.packageRoot ?? PACKAGE_ROOT);
+  if (
+    !env.npm_config_prefix ||
+    canonical(
+      path.join(env.npm_config_prefix, "lib/node_modules/rl-workspaces"),
+    ) !== root
+  )
+    return;
+  try {
+    const shell = path.basename(
+      env.SHELL ||
+        ((host.platform ?? process.platform) === "darwin" ? "zsh" : "bash"),
+    );
+    const configured = configureShell(host, shell);
+    console.log(
+      `rl: shell integration enabled in ${configured.profiles.join(", ")}. Open a new terminal to activate workspace switching.`,
+    );
+    console.log(
+      `For this terminal: eval "$(command rl setup shell ${configured.shell})"`,
+    );
+  } catch (error) {
+    // A dotfile problem must not make the installed CLI unavailable.
+    console.warn(
+      `rl: automatic shell setup skipped: ${error instanceof Error ? error.message : String(error)}. Run rl setup install to repair it.`,
+    );
+  }
+}
+
 export async function installRl(
   argv: string[],
   host: InstallHost = {},

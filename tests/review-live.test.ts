@@ -964,7 +964,7 @@ test("batched history statistics preserve initial, rename, binary and merge comm
 });
 
 test(
-  "Quit cancels a blocked Git refresh and cleans up the frozen review session",
+  "Quit cancels blocked Git and returns promptly while slow disk cleanup finishes separately",
   { timeout: 120000 },
   (t) => {
     const w = new Workspace(t);
@@ -973,6 +973,23 @@ test(
     w.env.REVIEW_PAUSE_GIT = path.join(w.root, "pause-review-git");
     w.env.REVIEW_GIT_INDEX_MARKER = path.join(w.root, "review-index-marker");
     w.env.REVIEW_GIT_HEARTBEAT = path.join(w.root, "review-git-heartbeat");
+    w.env.REVIEW_CLEANUP_MARKER = path.join(w.root, "review-cleanup-started");
+    const preload = path.join(w.root, "slow-cleanup.cjs");
+    write(
+      preload,
+      String.raw`
+const fs = require('node:fs'), path = require('node:path');
+const remove = fs.promises.rm;
+fs.promises.rm = async function(target, ...args) {
+  if (path.basename(String(target)).startsWith('rl-review-live-')) {
+    fs.writeFileSync(process.env.REVIEW_CLEANUP_MARKER, String(process.pid));
+    await new Promise(resolve => setTimeout(resolve, 3000));
+  }
+  return remove.call(this, target, ...args);
+};
+`,
+    );
+    w.env.NODE_OPTIONS = `${w.env.NODE_OPTIONS ?? ""} --require=${JSON.stringify(preload)}`;
     w.stub(
       "git",
       String.raw`
@@ -1003,6 +1020,9 @@ if (args.includes("read-tree") && process.env.GIT_INDEX_FILE && fs.existsSync(pr
       { timeoutMs: 90000 },
     );
     assert.match(result.stdout, /PTY: quit.*passed/);
+    t.diagnostic(
+      result.stdout.match(/QUIT_LATENCY=[\d.]+s/)?.[0] ?? result.stdout,
+    );
   },
 );
 

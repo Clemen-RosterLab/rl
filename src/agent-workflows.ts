@@ -12,12 +12,14 @@ import {
 import {
   CONFIG_FILES,
   defaultWorkflow,
+  hasAutomation,
   initAutomation,
   readAutomation,
   setAutomation,
 } from "./automation-config.js";
 import { commandContext, contextOptions } from "./command-context.js";
-import { args, arity, json } from "./common.js";
+import { args, arity, execute, json } from "./common.js";
+import { commandWords } from "./review-terminal.js";
 import { UsageError } from "./errors.js";
 import { parseJsonObject } from "./json.js";
 import { callWorkflowTool, resumeNativeRun } from "./session-workflows.js";
@@ -36,6 +38,7 @@ import {
   evaluateWorkflowRuns,
 } from "./orchestration/evaluation.js";
 import { watchWorkflowStatus } from "./orchestration/status.js";
+import { followWorkflowProgress } from "./orchestration/progress.js";
 
 const visible = (value: unknown): string =>
   sanitizeTerminalText(String(value ?? ""));
@@ -198,7 +201,7 @@ export async function main(argv: string[]): Promise<number> {
       "claim",
       "level",
     ],
-    ["json", "dry-run", "default", "watch"],
+    ["json", "dry-run", "default", "watch", "follow", "paths"],
   );
 
   const context = commandContext(values);
@@ -206,6 +209,15 @@ export async function main(argv: string[]): Promise<number> {
   arity(rest, 0, 1);
   const [, data] = context.store.current();
   const asJson = Boolean(values.json);
+  if (values.paths && !(namespace === "workflow" && action === "configure"))
+    throw new UsageError("--paths requires rl workflow configure");
+  if (
+    values.follow &&
+    (namespace !== "workflow" || action !== "status" || asJson || values.watch)
+  )
+    throw new UsageError(
+      "--follow requires rl workflow status without --json or --watch",
+    );
   if (
     values.watch &&
     (namespace !== "workflow" || action !== "status" || asJson)
@@ -256,27 +268,59 @@ export async function main(argv: string[]): Promise<number> {
     throw new UsageError("--policy is only supported by workflow score");
   }
 
-  if (namespace === "workflow" && action === "init") {
+  if (namespace === "workflow" && ["init", "configure"].includes(action)) {
     arity(rest, 0);
     const provider = values.provider ?? "inherit";
     if (
       provider !== "inherit" &&
       provider !== "codex" &&
       provider !== "claude" &&
-      provider !== "agy"
+      provider !== "agy" &&
+      provider !== "opencode"
     ) {
-      throw new UsageError("Provider must be inherit, codex, claude or agy");
+      throw new UsageError(
+        "Provider must be inherit, codex, claude, agy or opencode",
+      );
     }
-    await context.store.locked(() => initAutomation(data.worktree, provider));
-    await context.store.adopt(data.worktree);
-    const paths = Object.values(CONFIG_FILES).map((file) =>
-      path.join(data.worktree, file),
-    );
+    await context.store.locked(() => {
+      if (action === "init" || !hasAutomation(data.worktree))
+        initAutomation(data.worktree, provider);
+    });
+    if (action === "init") await context.store.adopt(data.worktree);
+    const paths = Object.values(CONFIG_FILES)
+      .map((file) => path.join(data.worktree, file))
+      .filter((file) => fs.existsSync(file));
     if (asJson) {
       json({ files: paths });
     } else {
       console.log(
-        `Created separate agent, policy and workflow configurations:\n${paths.map((file) => `  ${visible(file)}`).join("\n")}`,
+        `Workspace configuration:\n${paths.map((file) => `  ${visible(file)}`).join("\n")}`,
+      );
+      if (paths.length < Object.keys(CONFIG_FILES).length)
+        console.log(
+          "Only existing files are opened; missing files keep their inherited defaults.",
+        );
+    }
+    if (
+      action === "configure" &&
+      !asJson &&
+      !values.paths &&
+      process.stdin.isTTY &&
+      process.stdout.isTTY
+    ) {
+      const editor = commandWords(
+        process.env.VISUAL ?? process.env.EDITOR ?? "vi",
+      );
+      const result = await execute([...editor, ...paths], data.worktree, {
+        interactive: true,
+      });
+      if (result.code !== 0)
+        throw new Error(
+          `Editor exited with code ${result.code}; your configuration files are retained.`,
+        );
+      readAutomation(data.worktree);
+      console.log(
+        "Workflow settings validated. Future runs will use these settings.",
       );
     }
     return 0;
@@ -411,15 +455,36 @@ export async function main(argv: string[]): Promise<number> {
         }
       }
     } else {
-      arity(rest, 1);
-      if (!Object.hasOwn(entries, rest[0])) {
-        throw new Error(`Unknown ${namespace}: ${rest[0]}`);
+      arity(rest, namespace === "workflow" ? 0 : 1, 1);
+      const name = rest[0] ?? defaultWorkflow(config);
+      if (!Object.hasOwn(entries, name)) {
+        throw new Error(`Unknown ${namespace}: ${name}`);
       }
-      const item = entries[rest[0]];
+      const item = entries[name];
       if (asJson) {
         json(item);
+      } else if (namespace === "workflow") {
+        const workflow = config.workflows[name];
+        console.log(
+          `${visible(name)}${name === defaultWorkflow(config) ? " (default)" : ""}\n${visible(workflow.description)}\n`,
+        );
+        for (const step of workflow.steps) {
+          console.log(
+            `  ${visible(step.id)} · ${visible(step.agent ?? step.command?.join(" "))} · ${step.after.length ? `after ${step.after.map(visible).join(", ")}` : "ready at start"}`,
+          );
+        }
+        console.log(
+          `\nPolicy: ${visible(workflow.policy)} · Parallel steps: ${workflow.concurrency} · Retries: ${workflow.retries} · Timeout: ${workflow.timeoutSeconds}s`,
+        );
+        if (workflow.triggers?.length)
+          console.log(
+            `Triggers: ${workflow.triggers.map((trigger) => visible(trigger.event)).join(", ")}`,
+          );
+        console.log(
+          "\nConfigured steps shown; execution depth can add research and review roles.\nEdit: rl workflow configure · Live progress: rl workflow status --follow",
+        );
       } else {
-        console.log(`${rest[0]}\n`);
+        console.log(`${visible(name)}\n`);
         for (const [key, fieldValue] of Object.entries(item)) {
           const rendered =
             typeof fieldValue === "object"
@@ -513,6 +578,9 @@ export async function main(argv: string[]): Promise<number> {
       console.log(
         "Prepared for this session's native subagents. Claim ready steps with rl_workflow_claim or rl workflow claim; RL has not started any agent processes.",
       );
+      console.log(
+        `Follow progress in another terminal: rl workflow status ${run.id} --follow`,
+      );
     }
     return 0;
   }
@@ -534,6 +602,11 @@ export async function main(argv: string[]): Promise<number> {
   }
 
   if (action === "status") {
+    if (values.follow) {
+      const selected = readRun(context.store, name).run.id;
+      await followWorkflowProgress(() => readRun(context.store, selected).run);
+      return 0;
+    }
     if (values.watch) {
       const selected = readRun(context.store, name).run.id;
       await watchWorkflowStatus(() => readRun(context.store, selected).run);

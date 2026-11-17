@@ -57,7 +57,20 @@ test("help is specific and works without valid configuration or repository selec
   }
   const workflow = w.rl(["workflow"]).stdout;
   assert.match(workflow, /Commands:/);
-  assert.match(workflow, /score\s+Rescore/);
+  assert.match(workflow, /configure\s+Edit/);
+  assert.deepEqual(
+    [...workflow.matchAll(/^  (\w+)\s{2,}/gm)].map((match) => match[1]),
+    ["show", "configure", "status", "list", "pause", "resume", "cancel"],
+  );
+  assert.doesNotMatch(workflow, /^  (score|claim|report|research)\s/m);
+  for (const args of [
+    ["workflow", "--help", "--all"],
+    ["help", "workflow", "--all"],
+  ]) {
+    const advanced = w.rl(args).stdout;
+    assert.match(advanced, /score\s+Rescore/);
+    assert.match(advanced, /claim\s+Claim/);
+  }
   assert.doesNotMatch(workflow, /--provider|--policy|--base/);
   assert.match(w.rl(["workflow", "run", "--help"]).stdout, /--base/);
   assert.match(w.rl(["pr", "--json", "--help"]).stdout, /Usage: rl pr/);

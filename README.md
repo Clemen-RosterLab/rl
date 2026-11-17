@@ -9,10 +9,11 @@ notes, and agent conversations together, then pick up where you left off.
 
 ```sh
 npm install --global rl-workspaces
-rl setup install
 ```
 
-Requires macOS or Linux and Node.js 22+. Open a new terminal after setup.
+Requires macOS or Linux and Node.js 22+. Global installation enables shell
+integration automatically for zsh or bash; open a new terminal afterward.
+Run `rl setup install` to install missing tools or repair shell setup.
 Install and authenticate your chosen agent CLI separately. For GitHub features,
 run `gh auth login`.
 

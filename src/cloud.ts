@@ -1,13 +1,11 @@
 import { createHash, randomUUID } from "node:crypto";
 import fs from "node:fs";
-import os from "node:os";
 import path from "node:path";
 import { accessLabel } from "./access.js";
 import { writeWorkspaceOutput } from "./command-context.js";
 import {
   args,
   arity,
-  atomicWrite,
   canonical,
   execute,
   git,
@@ -33,14 +31,8 @@ import { padCell, paintAnsi, sanitizeTerminalText } from "./tui/ansi.js";
 import { type FzfItem, runFzf } from "./tui/fzf.js";
 import { loadUserConfig, resolveCliEnvironment } from "./user-config.js";
 
-const DEFAULT_MACHINE_TYPE = "e2-standard-4";
-const DEFAULT_TUNNEL_PORT = 3000;
-const SSH_MUX_REL_PATH = "~/.rl/ssh/%C";
 const HOST_NAME_PATTERN = /^[A-Za-z0-9](?:[A-Za-z0-9._@-]{0,126}[A-Za-z0-9])?$/;
-const GCP_VM_PATTERN = /^[a-z](?:[-a-z0-9]{0,61}[a-z0-9])?$/;
-const PROJECT_PATTERN = /^[a-z][a-z0-9-]{4,29}$/;
-const ZONE_PATTERN = /^[a-z]+-[a-z]+\d+-[a-z]$/;
-const SUPPORTED_AGENTS = new Set(["codex", "claude", "agy"]);
+const SUPPORTED_AGENTS = new Set(["codex", "claude", "agy", "opencode"]);
 
 const STATE_COLORS: Readonly<Record<string, number>> = {
   merged: 35,
@@ -53,16 +45,6 @@ const STATE_COLORS: Readonly<Record<string, number>> = {
 
 const colorText = (val: string, code: number): string =>
   paintAnsi(val, code, process.env.NO_COLOR === undefined);
-
-const dimText = (val: string): string => colorText(val, 90);
-
-export interface CloudVm {
-  name: string;
-  zone: string;
-  machineType: string;
-  status: string;
-  owner: string;
-}
 
 export interface CloudRepository {
   name: string;
@@ -101,9 +83,6 @@ interface CloudProbeResult {
 }
 
 interface CloudSettings {
-  project?: string;
-  zone?: string;
-  template?: string;
   stateDir: string;
   worktreeDir: string;
   configuredVm?: string;
@@ -112,13 +91,6 @@ interface CloudSettings {
 interface PersistedCloudState {
   schemaVersion: 1;
   defaultVm: string | null;
-}
-
-interface ParsedDryRunSsh {
-  user: string;
-  hostKeyAlias: string;
-  identityFile: string;
-  userKnownHostsFile: string;
 }
 
 interface CloudPickerTarget {
@@ -429,29 +401,6 @@ function validateHostName(name: string): string {
   return name;
 }
 
-function validateGcpVmName(name: string): string {
-  if (!GCP_VM_PATTERN.test(name) || name.length > 63) {
-    throw new UsageError(
-      "Choose a valid Compute Engine VM name (lowercase letters, digits, hyphens; max 63 chars)",
-    );
-  }
-  return name;
-}
-
-function validateProjectId(project: string): string {
-  if (!PROJECT_PATTERN.test(project)) {
-    throw new UsageError(`Invalid Google Cloud project ID: ${project}`);
-  }
-  return project;
-}
-
-function validateZoneName(zone: string): string {
-  if (!ZONE_PATTERN.test(zone)) {
-    throw new UsageError(`Invalid Google Cloud zone: ${zone}`);
-  }
-  return zone;
-}
-
 function normalizeGitOriginIdentity(
   originUrl: string | null | undefined,
 ): string | null {
@@ -466,74 +415,39 @@ function normalizeGitOriginIdentity(
   return trimmed ? trimmed.toLowerCase() : null;
 }
 
-function requireGcloudPath(): string {
-  const found = findExecutable("gcloud");
-  if (!found) {
-    throw new RlError(
-      "Install the Google Cloud CLI first: https://cloud.google.com/sdk/docs/install",
-    );
+function cloudHostOption(values: Record<string, unknown>): string | undefined {
+  if (values.host && values.vm && values.host !== values.vm) {
+    throw new UsageError("Choose either --host or --vm, not different hosts");
   }
-  return found;
+  return (values.host ?? values.vm) as string | undefined;
 }
 
 function resolveCloudSettings(
   overrides: {
     stateDir?: string;
     worktreeDir?: string;
-    project?: string;
-    zone?: string;
+
     vm?: string;
   } = {},
 ): CloudSettings {
   const config = loadUserConfig();
   const envResolved = resolveCliEnvironment(undefined);
-  const project =
-    overrides.project ||
-    process.env.RL_CLOUD_PROJECT ||
-    config.cloudProject ||
-    undefined;
-  const zone =
-    overrides.zone ||
-    process.env.RL_CLOUD_ZONE ||
-    config.cloudZone ||
-    undefined;
-  const template =
-    process.env.RL_CLOUD_TEMPLATE || config.cloudTemplate || undefined;
-  if (project) validateProjectId(project);
-  if (zone) validateZoneName(zone);
-
   const configuredVm =
-    overrides.vm || process.env.RL_CLOUD_VM || config.cloudVm || undefined;
+    overrides.vm ||
+    process.env.RL_CLOUD_HOST ||
+    process.env.RL_CLOUD_VM ||
+    config.cloudHost ||
+    config.cloudVm ||
+    undefined;
   if (configuredVm) {
     validateHostName(configuredVm);
   }
 
   return {
-    project,
-    zone,
-    template,
     stateDir: overrides.stateDir ?? envResolved.stateDir,
     worktreeDir: overrides.worktreeDir ?? envResolved.worktreeDir,
     configuredVm,
   };
-}
-
-function requireProject(settings: Pick<CloudSettings, "project">): string {
-  if (!settings.project) {
-    throw new RlError(
-      "No Google Cloud project configured. Set cloudProject in ~/.config/rl/config.toml or pass --project <id>.",
-    );
-  }
-  return validateProjectId(settings.project);
-}
-
-function requireZone(settings: Pick<CloudSettings, "zone">): string {
-  if (!settings.zone) {
-    throw new RlError(
-      "No Google Cloud zone configured. Set cloudZone in ~/.config/rl/config.toml or pass --zone <zone>.",
-    );
-  }
-  return validateZoneName(settings.zone);
 }
 
 function cloudStateFile(stateDir: string): string {
@@ -567,477 +481,13 @@ async function saveDefaultVm(stateDir: string, vmName: string): Promise<void> {
   });
 }
 
-function gcloudFlags(project: string): string[] {
-  return [`--project=${project}`, `--billing-project=${project}`];
-}
-
-async function listCloudVms(
-  settings: Pick<CloudSettings, "project">,
-): Promise<CloudVm[]> {
-  const project = requireProject(settings);
-  const gcloud = requireGcloudPath();
-  const result = await execute(
-    [
-      gcloud,
-      "compute",
-      "instances",
-      "list",
-      ...gcloudFlags(project),
-      "--format=json(name,zone,machineType,status,labels)",
-    ],
-    process.cwd(),
-    { timeoutMs: 25000 },
-  );
-  if (result.code !== 0) {
-    throw new RlError(
-      result.stderr.trim() ||
-        "Failed to list cloud VMs. Verify your gcloud authentication ('gcloud auth login').",
-    );
-  }
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(result.stdout || "[]");
-  } catch {
-    throw new RlError(
-      "Unexpected JSON output from gcloud compute instances list",
-    );
-  }
-  if (!Array.isArray(parsed)) {
-    return [];
-  }
-  return parsed
-    .filter(object)
-    .map((item) => {
-      const labels = object(item.labels) ? item.labels : {};
-      const zoneStr = typeof item.zone === "string" ? item.zone : "";
-      const machineStr =
-        typeof item.machineType === "string" ? item.machineType : "";
-      return {
-        name: String(item.name ?? ""),
-        zone: zoneStr.split("/").at(-1) ?? zoneStr,
-        machineType: machineStr.split("/").at(-1) ?? machineStr,
-        status: String(item.status ?? "UNKNOWN"),
-        owner: typeof labels.owner === "string" ? labels.owner : "-",
-      };
-    })
-    .filter((vm) => Boolean(vm.name))
-    .toSorted((a, b) => a.name.localeCompare(b.name));
-}
-
-async function currentGcloudOwner(): Promise<string | null> {
-  const gcloud = findExecutable("gcloud");
-  if (!gcloud) return null;
-  const result = await execute(
-    [gcloud, "config", "get-value", "account"],
-    process.cwd(),
-    { timeoutMs: 10000 },
-  );
-  if (result.code !== 0) return null;
-  const email = result.stdout.trim();
-  if (!email.includes("@")) return null;
-  return email
-    .split("@")[0]!
-    .toLowerCase()
-    .replace(/[^a-z0-9_-]/g, "-");
-}
-
-async function resolveTargetVm(
-  settings: CloudSettings,
-  options: { allowPick?: boolean; requireRunning?: boolean } = {},
-): Promise<string> {
-  if (settings.configuredVm) {
-    return validateHostName(settings.configuredVm);
-  }
-  const saved = readCloudState(settings.stateDir);
-  if (saved.defaultVm) {
-    return saved.defaultVm;
-  }
-
-  if (!settings.project) {
-    throw new RlError(
-      "No cloud host configured. Run 'rl cloud use <ssh-host>', set cloudVm in ~/.config/rl/config.toml, or pass --vm <host>.",
-    );
-  }
-
-  const vms = await listCloudVms(settings);
-  if (vms.length === 0) {
-    throw new RlError(
-      "No cloud VMs found. Create one with 'rl cloud create <name>' or select an SSH host with 'rl cloud use <host>'.",
-    );
-  }
-
-  const candidates = options.requireRunning
-    ? vms.filter((vm) => vm.status === "RUNNING")
-    : vms;
-
-  if (candidates.length === 0) {
-    const names = vms.map((vm) => `${vm.name} (${vm.status})`).join(", ");
-    throw new RlError(
-      `No running cloud VMs found (${names}). Start one with 'rl cloud start <name>'.`,
-    );
-  }
-
-  if (candidates.length === 1) {
-    await saveDefaultVm(settings.stateDir, candidates[0].name);
-    return candidates[0].name;
-  }
-
-  const owner = await currentGcloudOwner();
-  if (owner) {
-    const owned = candidates.filter((vm) => vm.owner === owner);
-    if (owned.length === 1) {
-      await saveDefaultVm(settings.stateDir, owned[0].name);
-      return owned[0].name;
-    }
-  }
-
-  if (options.allowPick && process.stdin.isTTY && process.stderr.isTTY) {
-    const fzfRows: FzfItem<CloudVm>[] = candidates.map((vm) => ({
-      id: vm.name,
-      line: `${padCell(vm.name, 24)}  ${padCell(vm.status, 10)}  ${dimText(padCell(vm.machineType, 16))}  ${dimText(vm.owner)}`,
-      value: vm,
-    }));
-    const picked = await runFzf(fzfRows, {
-      cwd: process.cwd(),
-      prompt: "Cloud VM › ",
-      header: `Enter select VM · Esc cancel\n\n${padCell("NAME", 24)}  ${padCell("STATUS", 10)}  ${padCell("MACHINE", 16)}  OWNER`,
-      ansi: true,
-      numericHeight: true,
-      errorLabel: "Cloud VM picker",
-      unknownNoun: "VM",
-    });
-    if (!picked) {
-      throw new RlError("No cloud VM selected");
-    }
-    const chosen = picked.items[0]!.name;
-    await saveDefaultVm(settings.stateDir, chosen);
-    return chosen;
-  }
-
+async function resolveTargetVm(settings: CloudSettings): Promise<string> {
+  const host =
+    settings.configuredVm ?? readCloudState(settings.stateDir).defaultVm;
+  if (host) return validateHostName(host);
   throw new RlError(
-    `Multiple cloud VMs available (${candidates.map((vm) => vm.name).join(", ")}). Select a default with 'rl cloud use <name>' or pass --vm <name>.`,
+    "No cloud host configured. Run 'rl cloud use <ssh-host>' or pass --host <host>.",
   );
-}
-
-export function parseShellWords(line: string): string[] {
-  const words: string[] = [];
-  let current = "";
-  let quote: "'" | '"' | null = null;
-  let escaped = false;
-  let active = false;
-
-  for (const ch of line.trim()) {
-    if (escaped) {
-      current += ch;
-      escaped = false;
-      active = true;
-      continue;
-    }
-    if (ch === "\\" && quote !== "'") {
-      escaped = true;
-      active = true;
-      continue;
-    }
-    if (quote) {
-      if (ch === quote) {
-        quote = null;
-      } else {
-        current += ch;
-      }
-      active = true;
-      continue;
-    }
-    if (ch === "'" || ch === '"') {
-      quote = ch;
-      active = true;
-      continue;
-    }
-    if (/\s/.test(ch)) {
-      if (active) {
-        words.push(current);
-        current = "";
-        active = false;
-      }
-      continue;
-    }
-    current += ch;
-    active = true;
-  }
-  if (active) {
-    words.push(current);
-  }
-  return words;
-}
-
-export function extractDryRunSshDetails(dryRunOutput: string): ParsedDryRunSsh {
-  const lines = dryRunOutput
-    .split(/\r?\n/)
-    .map((line) => line.trim())
-    .filter(Boolean);
-  const sshLine = lines.at(-1) ?? "";
-  const tokens = parseShellWords(sshLine);
-
-  let identityFile = path.join(os.homedir(), ".ssh/google_compute_engine");
-  let hostKeyAlias = "";
-  let userKnownHostsFile = path.join(
-    os.homedir(),
-    ".ssh/google_compute_known_hosts",
-  );
-  let target = "";
-
-  for (let i = 1; i < tokens.length; i++) {
-    const tok = tokens[i]!;
-    if (tok === "-i" && tokens[i + 1]) {
-      identityFile = tokens[++i]!;
-      continue;
-    }
-    if (tok === "-o" && tokens[i + 1]) {
-      const opt = tokens[++i]!;
-      if (opt.startsWith("HostKeyAlias=")) {
-        hostKeyAlias = opt.slice("HostKeyAlias=".length);
-      } else if (opt.startsWith("UserKnownHostsFile=")) {
-        userKnownHostsFile = opt.slice("UserKnownHostsFile=".length);
-      }
-      continue;
-    }
-    if (tok.startsWith("-oHostKeyAlias=")) {
-      hostKeyAlias = tok.slice("-oHostKeyAlias=".length);
-      continue;
-    }
-    if (tok.startsWith("-oUserKnownHostsFile=")) {
-      userKnownHostsFile = tok.slice("-oUserKnownHostsFile=".length);
-      continue;
-    }
-    if (!tok.startsWith("-") && tok.includes("@")) {
-      target = tok;
-    }
-  }
-
-  const atIndex = target.indexOf("@");
-  if (atIndex <= 0) {
-    throw new RlError(
-      "Could not determine OS Login SSH user from gcloud compute ssh --dry-run",
-    );
-  }
-  const user = target.slice(0, atIndex);
-  const targetHost = target.slice(atIndex + 1);
-  if (!hostKeyAlias) {
-    hostKeyAlias = targetHost;
-  }
-
-  if (
-    /[\r\n"\\]/.test(user) ||
-    /[\r\n"\\]/.test(hostKeyAlias) ||
-    /[\r\n"]/.test(identityFile) ||
-    /[\r\n"]/.test(userKnownHostsFile)
-  ) {
-    throw new RlError("Unsafe characters in resolved SSH configuration");
-  }
-
-  return {
-    user,
-    hostKeyAlias,
-    identityFile,
-    userKnownHostsFile,
-  };
-}
-
-function sshConfigPaths(home = os.homedir()): {
-  sshDir: string;
-  configFile: string;
-  muxDir: string;
-} {
-  return {
-    sshDir: path.join(home, ".ssh"),
-    configFile: path.join(home, ".ssh/config"),
-    muxDir: path.join(home, ".rl/ssh"),
-  };
-}
-
-function hasSshHostEntry(vmName: string, home = os.homedir()): boolean {
-  const { configFile } = sshConfigPaths(home);
-  if (!fs.existsSync(configFile)) return false;
-  const content = fs.readFileSync(configFile, "utf8");
-  if (content.includes(`# >>> rl cloud ssh (${vmName}) >>>`)) {
-    return true;
-  }
-  return content.split(/\r?\n/).some((line) => {
-    const trimmed = line.trim();
-    if (!trimmed.toLowerCase().startsWith("host ")) return false;
-    return trimmed.slice(5).trim().split(/\s+/).includes(vmName);
-  });
-}
-
-export function buildManagedSshBlock(params: {
-  vm: string;
-  isDefault: boolean;
-  project: string;
-  zone: string;
-  gcloudPath: string;
-  details: ParsedDryRunSsh;
-}): string {
-  const { vm, isDefault, project, zone, gcloudPath, details } = params;
-  const gcloudDir = path.dirname(gcloudPath);
-  const pathEntries = [
-    ...new Set([
-      gcloudDir,
-      "/opt/homebrew/bin",
-      "/usr/local/bin",
-      "/usr/bin",
-      "/bin",
-    ]),
-  ].join(":");
-  const hostNames = isDefault ? `${vm} rl-cloud` : vm;
-  const proxyCmd = `env PATH=${shellQuote(pathEntries)} ${shellQuote(gcloudPath)} compute start-iap-tunnel ${vm} %p --listen-on-stdin --project=${project} --billing-project=${project} --zone=${zone} --verbosity=warning`;
-
-  return [
-    `# >>> rl cloud ssh (${vm}) >>>`,
-    `Host ${hostNames}`,
-    `  HostName ${details.hostKeyAlias}`,
-    `  User ${details.user}`,
-    `  IdentityFile "${details.identityFile}"`,
-    "  IdentitiesOnly yes",
-    "  CheckHostIP no",
-    "  HashKnownHosts no",
-    `  HostKeyAlias ${details.hostKeyAlias}`,
-    "  StrictHostKeyChecking yes",
-    `  UserKnownHostsFile "${details.userKnownHostsFile}"`,
-    "  ProxyUseFdpass no",
-    `  ProxyCommand ${proxyCmd}`,
-    "  ControlMaster auto",
-    `  ControlPath ${SSH_MUX_REL_PATH}`,
-    "  ControlPersist 15m",
-    "  ServerAliveInterval 30",
-    "  ServerAliveCountMax 3",
-    `# <<< rl cloud ssh (${vm}) <<<`,
-  ].join("\n");
-}
-
-export function upsertSshConfigContent(
-  existing: string,
-  vm: string,
-  block: string,
-  isDefault: boolean,
-): string {
-  let updated = existing;
-  if (isDefault) {
-    updated = updated.replace(
-      /(# >>> rl cloud ssh \([^)]+\) >>>\nHost [^\n]*?)\s+rl-cloud(\n)/g,
-      "$1$2",
-    );
-  }
-  const startMarker = `# >>> rl cloud ssh (${vm}) >>>`;
-  const endMarker = `# <<< rl cloud ssh (${vm}) <<<`;
-  const startIndex = updated.indexOf(startMarker);
-  const endIndex = updated.indexOf(endMarker);
-
-  if (startIndex >= 0 && endIndex > startIndex) {
-    const before = updated.slice(0, startIndex).replace(/\n*$/, "");
-    const after = updated
-      .slice(endIndex + endMarker.length)
-      .replace(/^\n*/, "");
-    return [before, block, after].filter(Boolean).join("\n\n") + "\n";
-  }
-
-  const trimmed = updated.trimEnd();
-  return trimmed ? `${trimmed}\n\n${block}\n` : `${block}\n`;
-}
-
-async function configureSshForVm(
-  settings: CloudSettings,
-  vmName: string,
-  options: { dryRun?: boolean; setAsDefault?: boolean } = {},
-): Promise<{
-  vm: string;
-  configFile: string;
-  alias: string | null;
-  user: string;
-  hostKeyAlias: string;
-  block: string;
-  wrote: boolean;
-}> {
-  validateGcpVmName(vmName);
-  const project = requireProject(settings);
-  const zone = requireZone(settings);
-  const gcloudPath = requireGcloudPath();
-  const dryRun = await execute(
-    [
-      gcloudPath,
-      "compute",
-      "ssh",
-      vmName,
-      ...gcloudFlags(project),
-      `--zone=${zone}`,
-      "--tunnel-through-iap",
-      "--dry-run",
-    ],
-    process.cwd(),
-    { timeoutMs: 30000 },
-  );
-  if (dryRun.code !== 0) {
-    throw new RlError(
-      dryRun.stderr.trim() ||
-        `Cannot resolve IAP SSH configuration for ${vmName}. Verify the VM exists and you are signed in to gcloud.`,
-    );
-  }
-
-  const details = extractDryRunSshDetails(dryRun.stdout);
-  const saved = readCloudState(settings.stateDir);
-  const isDefault = Boolean(
-    options.setAsDefault || !saved.defaultVm || saved.defaultVm === vmName,
-  );
-  const block = buildManagedSshBlock({
-    vm: vmName,
-    isDefault,
-    project,
-    zone,
-    gcloudPath,
-    details,
-  });
-
-  const { sshDir, configFile, muxDir } = sshConfigPaths();
-  if (!options.dryRun) {
-    fs.mkdirSync(sshDir, { recursive: true, mode: 0o700 });
-    fs.mkdirSync(muxDir, { recursive: true, mode: 0o700 });
-    await locked(settings.stateDir, ".cloud-ssh-config.lock", () => {
-      const existing = fs.existsSync(configFile)
-        ? fs.readFileSync(configFile, "utf8")
-        : "";
-      const next = upsertSshConfigContent(existing, vmName, block, isDefault);
-      atomicWrite(configFile, next);
-      fs.chmodSync(configFile, 0o600);
-    });
-    if (isDefault && saved.defaultVm !== vmName) {
-      await saveDefaultVm(settings.stateDir, vmName);
-    }
-  }
-
-  return {
-    vm: vmName,
-    configFile,
-    alias: isDefault ? "rl-cloud" : null,
-    user: details.user,
-    hostKeyAlias: details.hostKeyAlias,
-    block,
-    wrote: !options.dryRun,
-  };
-}
-
-async function ensureVmSshReady(
-  settings: CloudSettings,
-  vmName: string,
-): Promise<void> {
-  const { muxDir } = sshConfigPaths();
-  fs.mkdirSync(muxDir, { recursive: true, mode: 0o700 });
-  if (
-    !hasSshHostEntry(vmName) &&
-    !vmName.includes("@") &&
-    settings.project &&
-    settings.zone &&
-    GCP_VM_PATTERN.test(vmName)
-  ) {
-    await configureSshForVm(settings, vmName);
-  }
 }
 
 async function runSshCommand(
@@ -1046,7 +496,6 @@ async function runSshCommand(
   remoteCommand: string,
   options: { interactive?: boolean; tty?: boolean; timeoutMs?: number } = {},
 ): Promise<{ code: number; stdout: string; stderr: string }> {
-  await ensureVmSshReady(settings, vmName);
   const buildArgv = () => [
     "ssh",
     ...(options.tty ? ["-t"] : []),
@@ -1064,24 +513,9 @@ async function runSshCommand(
     );
   }
 
-  let res = await execute(buildArgv(), process.cwd(), {
+  return execute(buildArgv(), process.cwd(), {
     timeoutMs: options.timeoutMs ?? 45000,
   });
-  if (
-    res.code === 255 &&
-    settings.project &&
-    settings.zone &&
-    GCP_VM_PATTERN.test(vmName) &&
-    /REMOTE HOST IDENTIFICATION HAS CHANGED|Host key verification failed|Permission denied/i.test(
-      res.stderr,
-    )
-  ) {
-    await configureSshForVm(settings, vmName);
-    res = await execute(buildArgv(), process.cwd(), {
-      timeoutMs: options.timeoutMs ?? 45000,
-    });
-  }
-  return res;
 }
 
 async function probeCloudHost(
@@ -1100,7 +534,7 @@ async function probeCloudHost(
   if (res.code !== 0) {
     throw new RlError(
       res.stderr.trim() ||
-        `Cannot query repositories on cloud VM '${vmName}'. Is the VM running ('rl cloud vms')?`,
+        `Cannot query SSH host '${vmName}'. Check your SSH connection and remote Node.js installation.`,
     );
   }
   const lastLine =
@@ -1112,10 +546,10 @@ async function probeCloudHost(
   try {
     parsed = JSON.parse(lastLine);
   } catch {
-    throw new RlError(`Invalid probe response from cloud VM '${vmName}'`);
+    throw new RlError(`Invalid probe response from SSH host '${vmName}'`);
   }
   if (!object(parsed)) {
-    throw new RlError(`Unexpected probe response from cloud VM '${vmName}'`);
+    throw new RlError(`Unexpected probe response from SSH host '${vmName}'`);
   }
   return parsed as unknown as CloudProbeResult;
 }
@@ -1139,8 +573,7 @@ function toOverviewRows(vm: string, probe: CloudProbeResult): OverviewRow[] {
 export async function fetchCloudOverview(options: {
   stateDir: string;
   vm?: string;
-  project?: string;
-  zone?: string;
+
   fetch?: boolean;
   includeDeleted?: boolean;
 }): Promise<{
@@ -1149,7 +582,7 @@ export async function fetchCloudOverview(options: {
   errors: { repository: string; message: string }[];
 }> {
   const settings = resolveCloudSettings(options);
-  const vm = await resolveTargetVm(settings, { requireRunning: true });
+  const vm = await resolveTargetVm(settings);
   const probe = await probeCloudHost(settings, vm, {
     fetch: options.fetch,
     includeDeleted: options.includeDeleted,
@@ -1167,15 +600,13 @@ export async function fetchCloudOverview(options: {
 export async function fetchCloudRepositories(options: {
   stateDir: string;
   vm?: string;
-  project?: string;
-  zone?: string;
 }): Promise<{
   vm: string;
   defaultRepo: string | null;
   repositories: CloudRepository[];
 }> {
   const settings = resolveCloudSettings(options);
-  const vm = await resolveTargetVm(settings, { requireRunning: true });
+  const vm = await resolveTargetVm(settings);
   const probe = await probeCloudHost(settings, vm);
   return {
     vm,
@@ -1209,6 +640,9 @@ function formatSessionsLabel(sessions?: Instance["sessions"]): string {
   if (sessions.agy && sessions.agy.length > 0) {
     parts.push(`${sessions.agy.length}agy`);
   }
+  if (sessions.opencode && sessions.opencode.length > 0) {
+    parts.push(`${sessions.opencode.length}oc`);
+  }
   return parts.length > 0 ? parts.join("/") : "-";
 }
 
@@ -1240,7 +674,7 @@ function buildCloudPickerTargets(
       };
     });
 
-  const sortedWorkspaces = workspaceTargets.toSorted((a, b) => {
+  const sortedWorkspaces = [...workspaceTargets].sort((a, b) => {
     const left = a.accessedAt ? safeTimestamp(a.accessedAt) : -1n;
     const right = b.accessedAt ? safeTimestamp(b.accessedAt) : -1n;
     if (left === right) {
@@ -1291,6 +725,8 @@ function resolveSelectorTarget(
         t.branch === normalized ||
         `${t.repositoryName}/${t.name}` === normalized ||
         `${t.repositoryName}:${t.name}` === normalized ||
+        `${t.repositoryName}/${t.branch}` === normalized ||
+        `${t.repositoryName}:${t.branch}` === normalized ||
         t.path === normalized),
   );
   if (exactWorkspace.length === 1) {
@@ -1428,7 +864,6 @@ async function openInVsCodeRemote(
   vm: string,
   remotePath: string,
 ): Promise<number> {
-  await ensureVmSshReady(settings, vm);
   const codeBin = findExecutable("code");
   if (!codeBin) {
     throw new RlError(
@@ -1613,7 +1048,6 @@ async function fetchBranchFromCloud(
     );
   }
 
-  await ensureVmSshReady(settings, target.vm);
   const remoteUrl = sshGitRemoteUrl(target.vm, target.repositoryRoot);
 
   if (options.addRemote) {
@@ -1886,7 +1320,7 @@ export async function runCloudReview(
 ): Promise<number> {
   const { values, positionals } = args(
     argv,
-    ["vm", "project", "zone"],
+    ["host", "vm"],
     ["diff", "json", "live", "remote", "cloud"],
   );
   arity(positionals, 0, 1);
@@ -1897,14 +1331,9 @@ export async function runCloudReview(
   const settings = resolveCloudSettings({
     stateDir: context.stateDir,
     worktreeDir: context.worktreeDir,
-    vm: values.vm as string | undefined,
-    project: values.project as string | undefined,
-    zone: values.zone as string | undefined,
+    vm: cloudHostOption(values),
   });
-  const vm = await resolveTargetVm(settings, {
-    allowPick: true,
-    requireRunning: true,
-  });
+  const vm = await resolveTargetVm(settings);
   const probe = await probeCloudHost(settings, vm);
   const allTargets = buildCloudPickerTargets(vm, probe);
 
@@ -2078,10 +1507,7 @@ export async function pickWorkspaceWithCloud(options: {
     worktreeDir: options.worktreeDir,
     vm: options.vm,
   });
-  const vm = await resolveTargetVm(settings, {
-    allowPick: true,
-    requireRunning: true,
-  });
+  const vm = await resolveTargetVm(settings);
 
   if (options.cloudOnly) {
     return openCloudInteractive(settings, vm);
@@ -2166,8 +1592,11 @@ export async function pickWorkspaceWithCloud(options: {
 
   const choice = picked.items[0]!;
   if (choice.kind === "local") {
-    await options.store.adopt(choice.candidate.path, options.defaultBase);
-    writeWorkspaceOutput(choice.candidate.path);
+    const [root, branch] = options.store.worktree(choice.candidate.path);
+    if (branch !== choice.candidate.branch)
+      throw new Error("Workspace branch changed during selection; retry");
+    await options.store.adopt(root, options.defaultBase);
+    writeWorkspaceOutput(root);
     return 0;
   }
   return sshIntoRemoteDirectory(settings, vm, choice.target.path);
@@ -2270,35 +1699,6 @@ function renderCloudReposTable(
   }
 }
 
-function renderVmsTable(vms: CloudVm[], defaultVm: string | null): void {
-  if (vms.length === 0) {
-    console.log("No shared cloud dev VMs found.");
-    return;
-  }
-  const rows: string[][] = [
-    ["DEFAULT", "NAME", "ZONE", "MACHINE_TYPE", "STATUS", "OWNER"],
-    ...vms.map((vm) => [
-      vm.name === defaultVm ? "*" : "",
-      sanitizeTerminalText(vm.name),
-      sanitizeTerminalText(vm.zone),
-      sanitizeTerminalText(vm.machineType),
-      sanitizeTerminalText(vm.status),
-      sanitizeTerminalText(vm.owner),
-    ]),
-  ];
-  const widths = rows[0]!.map((_, col) =>
-    Math.max(...rows.map((row) => row[col]!.length)),
-  );
-  for (const row of rows) {
-    console.log(
-      row
-        .map((val, col) => val.padEnd(widths[col]!))
-        .join("  ")
-        .trimEnd(),
-    );
-  }
-}
-
 export async function main(
   argv: string[],
   context: {
@@ -2323,16 +1723,30 @@ export async function main(
     return runCloudReview(subArgv, context);
   }
 
+  if (passthrough.length > 0)
+    throw new UsageError(
+      "Unexpected arguments after --; use SSH directly for remote commands",
+    );
+  if (
+    ["vms", "ssh-config", "ssh", "tunnel", "start", "stop", "delete"].includes(
+      sub,
+    )
+  ) {
+    throw new UsageError(
+      "Cloud infrastructure commands have been removed. Use SSH or your cloud provider's tools; rl cloud manages workspaces on an existing host.",
+    );
+  }
+
   const { values, positionals } = args(
     subArgv,
-    ["vm", "project", "zone", "agent", "local-port", "output-path"],
+    ["host", "vm", "agent", "output-path", "repo", "base"],
     [
       "json",
       "fetch",
       "include-deleted",
       "code",
       "resume",
-      "dry-run",
+      "no-fetch",
       "remote",
       "include-uncommitted",
     ],
@@ -2341,27 +1755,98 @@ export async function main(
   const settings = resolveCloudSettings({
     stateDir: context.stateDir,
     worktreeDir: context.worktreeDir,
-    vm: values.vm as string | undefined,
-    project: values.project as string | undefined,
-    zone: values.zone as string | undefined,
+    vm: cloudHostOption(values),
   });
 
   switch (sub) {
+    case "create": {
+      arity(positionals, 1);
+      const name = positionals[0];
+      if (name.startsWith("-") || /[\x00-\x1f\x7f]/.test(name)) {
+        throw new UsageError("Expected a workspace branch name");
+      }
+      const valid = await execute(
+        ["git", "check-ref-format", "--branch", name],
+        process.cwd(),
+      );
+      if (valid.code !== 0)
+        throw new UsageError("Invalid workspace branch name");
+      const vm = await resolveTargetVm(settings);
+      const probe = await probeCloudHost(settings, vm);
+      if (!probe.rlInstalled) {
+        throw new RlError(
+          "Install rl on the SSH host before creating workspaces.",
+        );
+      }
+      const repos = probe.repositories.filter((repo) => repo.registered);
+      const requested = values.repo as string | undefined;
+      let repo = requested
+        ? repos.find((entry) => entry.name === requested)
+        : (repos.find((entry) => entry.name === probe.defaultRepo) ??
+          (repos.length === 1 ? repos[0] : undefined));
+      if (requested && !repo) {
+        throw new UsageError(
+          `Remote repository is not registered: ${requested}. Run rl repo add on the server first.`,
+        );
+      }
+      if (!repo) {
+        if (!repos.length)
+          throw new RlError(
+            "No registered remote repositories. Run rl repo add on the server first.",
+          );
+        if (!process.stdin.isTTY || !process.stderr.isTTY) {
+          throw new UsageError(
+            "Multiple remote repositories; choose --repo <name>",
+          );
+        }
+        const picked = await runFzf(
+          repos.map((entry) => ({
+            id: entry.name,
+            line: `${sanitizeTerminalText(entry.name)}  ${sanitizeTerminalText(entry.root)}`,
+            value: entry,
+          })),
+          {
+            cwd: process.cwd(),
+            prompt: "Create workspace in › ",
+            header: "Enter select repository · Esc cancel",
+            errorLabel: "Remote repository picker",
+            unknownNoun: "repository",
+          },
+        );
+        if (!picked) return 0;
+        repo = picked.items[0];
+      }
+      const remoteArgs = [
+        "rl",
+        "--repo",
+        repo.name,
+        "switch",
+        name,
+        "--create",
+        ...(values.base ? ["--base", String(values.base)] : []),
+        ...(values["no-fetch"] ? ["--no-fetch"] : []),
+      ];
+      const command = `export PATH="$HOME/.local/share/rl/bin:$HOME/.local/bin:/usr/local/bin:$PATH" && cd -- ${shellQuote(repo.root)} && ${remoteArgs.map(shellQuote).join(" ")}`;
+      const result = await runSshCommand(settings, vm, command, {
+        interactive: true,
+      });
+      return result.code;
+    }
+
     case "open": {
       if (passthrough.length > 0) {
         throw new UsageError(
-          "Use 'rl cloud ssh [vm] -- <command>' to run arbitrary remote commands",
+          "Unexpected arguments after --; use SSH directly for remote commands",
         );
       }
       arity(positionals, 0, 1);
       const agent = values.agent as string | undefined;
       if (agent && !SUPPORTED_AGENTS.has(agent)) {
-        throw new UsageError("Unsupported agent: choose codex, claude, or agy");
+        throw new UsageError(
+          "Unsupported agent: choose codex, claude, agy, or opencode",
+        );
       }
-      const vm = await resolveTargetVm(settings, {
-        allowPick: true,
-        requireRunning: true,
-      });
+      const vm = await resolveTargetVm(settings);
       return openCloudInteractive(settings, vm, positionals[0], {
         code: Boolean(values.code),
         agent,
@@ -2372,10 +1857,7 @@ export async function main(
 
     case "code": {
       arity(positionals, 0, 1);
-      const vm = await resolveTargetVm(settings, {
-        allowPick: true,
-        requireRunning: true,
-      });
+      const vm = await resolveTargetVm(settings);
       const probe = await probeCloudHost(settings, vm);
       const targets = buildCloudPickerTargets(vm, probe);
       if (positionals[0]) {
@@ -2394,8 +1876,6 @@ export async function main(
       const { vm, defaultRepo, repositories } = await fetchCloudRepositories({
         stateDir: settings.stateDir,
         vm: settings.configuredVm,
-        project: settings.project,
-        zone: settings.zone,
       });
       if (values.json) {
         json({ vm, default: defaultRepo, repositories });
@@ -2410,8 +1890,7 @@ export async function main(
       const overview = await fetchCloudOverview({
         stateDir: settings.stateDir,
         vm: settings.configuredVm,
-        project: settings.project,
-        zone: settings.zone,
+
         fetch: Boolean(values.fetch),
         includeDeleted: Boolean(values["include-deleted"]),
       });
@@ -2423,10 +1902,7 @@ export async function main(
           fetched: Boolean(values.fetch),
         });
       } else {
-        renderOverviewTable(overview.rows);
-        console.log(
-          "S=staged M=unstaged ?=untracked !=conflicts; +ahead/-behind relative to upstream.",
-        );
+        renderOverviewTable(overview.rows, Boolean(values.fetch));
         for (const err of overview.errors) {
           console.error(
             `${sanitizeTerminalText(err.repository)}: ${sanitizeTerminalText(err.message)}`,
@@ -2438,10 +1914,7 @@ export async function main(
 
     case "fetch": {
       arity(positionals, 0, 1);
-      const vm = await resolveTargetVm(settings, {
-        allowPick: true,
-        requireRunning: true,
-      });
+      const vm = await resolveTargetVm(settings);
       const probe = await probeCloudHost(settings, vm);
       const targets = buildCloudPickerTargets(vm, probe);
       let target: CloudPickerTarget | undefined;
@@ -2478,10 +1951,7 @@ export async function main(
 
     case "checkout": {
       arity(positionals, 0, 1);
-      const vm = await resolveTargetVm(settings, {
-        allowPick: true,
-        requireRunning: true,
-      });
+      const vm = await resolveTargetVm(settings);
       const probe = await probeCloudHost(settings, vm);
       const targets = buildCloudPickerTargets(vm, probe);
       let target: CloudPickerTarget | undefined;
@@ -2502,239 +1972,12 @@ export async function main(
       });
     }
 
-    case "ssh-config": {
-      arity(positionals, 0, 1);
-      const vm = positionals[0]
-        ? validateGcpVmName(positionals[0])
-        : await resolveTargetVm(settings, { allowPick: true });
-      const configured = await configureSshForVm(settings, vm, {
-        dryRun: Boolean(values["dry-run"]),
-        setAsDefault: Boolean(positionals[0]),
-      });
-      if (values.json) {
-        json(configured);
-      } else if (values["dry-run"]) {
-        console.log(configured.block);
-      } else {
-        console.log(
-          `Configured SSH for ${configured.vm}${configured.alias ? ` (alias: ${configured.alias})` : ""} in ${configured.configFile}`,
-        );
-        console.log(
-          `Native SSH, Git, scp and VS Code Remote-SSH now connect through IAP with connection multiplexing.`,
-        );
-      }
-      return 0;
-    }
-
-    case "vms": {
-      arity(positionals, 0);
-      const project = requireProject(settings);
-      const vms = await listCloudVms(settings);
-      const defaultVm =
-        settings.configuredVm ?? readCloudState(settings.stateDir).defaultVm;
-      if (values.json) {
-        json({ project, defaultVm, vms });
-      } else {
-        renderVmsTable(vms, defaultVm);
-      }
-      return 0;
-    }
-
     case "use": {
-      arity(positionals, 0, 1);
-      let vmName = positionals[0];
-      if (vmName) {
-        validateHostName(vmName);
-      } else {
-        const vms = await listCloudVms(settings);
-        if (vms.length === 0) {
-          throw new RlError("No cloud VMs found");
-        }
-        const fzfRows: FzfItem<CloudVm>[] = vms.map((vm) => ({
-          id: vm.name,
-          line: `${padCell(vm.name, 24)}  ${padCell(vm.status, 10)}  ${padCell(vm.machineType, 16)}  ${vm.owner}`,
-          value: vm,
-        }));
-        const picked = await runFzf(fzfRows, {
-          cwd: process.cwd(),
-          prompt: "Default Cloud VM › ",
-          header: "Enter set default VM · Esc cancel",
-          numericHeight: true,
-          errorLabel: "Cloud VM picker",
-          unknownNoun: "VM",
-        });
-        if (!picked) return 0;
-        vmName = picked.items[0]!.name;
-      }
-      await saveDefaultVm(settings.stateDir, vmName);
-      console.log(`Default cloud host: ${vmName}`);
-      return 0;
-    }
-
-    case "ssh": {
-      arity(positionals, 0, 1);
-      const vm = positionals[0]
-        ? validateHostName(positionals[0])
-        : await resolveTargetVm(settings, {
-            allowPick: true,
-            requireRunning: true,
-          });
-      await ensureVmSshReady(settings, vm);
-      const sshArgs = ["ssh", ...(passthrough.length === 0 ? ["-t"] : []), vm];
-      if (passthrough.length > 0) {
-        sshArgs.push(passthrough.map(shellQuote).join(" "));
-      }
-      const res = await execute(sshArgs, process.cwd(), { interactive: true });
-      return res.code;
-    }
-
-    case "tunnel": {
-      arity(positionals, 0, 2);
-      let vm: string;
-      let portRaw: string | undefined;
-      if (positionals.length === 2) {
-        vm = validateHostName(positionals[0]!);
-        portRaw = positionals[1];
-      } else if (
-        positionals.length === 1 &&
-        !/^\d+$/.test(positionals[0]!) &&
-        HOST_NAME_PATTERN.test(positionals[0]!)
-      ) {
-        vm = validateHostName(positionals[0]!);
-        portRaw = undefined;
-      } else {
-        vm = await resolveTargetVm(settings, {
-          allowPick: true,
-          requireRunning: true,
-        });
-        portRaw = positionals[0];
-      }
-
-      const remotePort = Number(portRaw ?? DEFAULT_TUNNEL_PORT);
-      const localPort = Number(values["local-port"] ?? remotePort);
-      for (const p of [remotePort, localPort]) {
-        if (!Number.isInteger(p) || p < 1024 || p > 65535) {
-          throw new UsageError(
-            "Choose an unprivileged port between 1024 and 65535",
-          );
-        }
-      }
-
-      await ensureVmSshReady(settings, vm);
-      console.log(
-        `Forwarding http://localhost:${localPort} to ${vm}:${remotePort}. Keep this terminal open.`,
-      );
-      const res = await execute(
-        [
-          "ssh",
-          "-N",
-          "-o",
-          "ControlMaster=no",
-          "-o",
-          "ControlPath=none",
-          "-o",
-          "ExitOnForwardFailure=yes",
-          "-L",
-          `127.0.0.1:${localPort}:localhost:${remotePort}`,
-          vm,
-        ],
-        process.cwd(),
-        { interactive: true },
-      );
-      return res.code;
-    }
-
-    case "create": {
-      arity(positionals, 1, 2);
-      const vm = validateGcpVmName(positionals[0]!);
-      const project = requireProject(settings);
-      const zone = requireZone(settings);
-      const machineType = positionals[1] ?? DEFAULT_MACHINE_TYPE;
-      if (!/^[a-z0-9-]+$/.test(machineType)) {
-        throw new UsageError(`Invalid machine type: ${machineType}`);
-      }
-      const gcloud = requireGcloudPath();
-      const accountRes = await execute(
-        [gcloud, "config", "get-value", "account"],
-        process.cwd(),
-        { timeoutMs: 10000 },
-      );
-      const account = accountRes.stdout.trim();
-      if (!account || !account.includes("@")) {
-        throw new RlError("Sign in with Google Cloud first: gcloud auth login");
-      }
-      const owner = account
-        .split("@")[0]!
-        .toLowerCase()
-        .replace(/[^a-z0-9_-]/g, "-");
-      const createArgs = [
-        gcloud,
-        "compute",
-        "instances",
-        "create",
-        vm,
-        ...gcloudFlags(project),
-        `--zone=${zone}`,
-        ...(settings.template
-          ? [`--source-instance-template=${settings.template}`]
-          : []),
-        `--machine-type=${machineType}`,
-        `--labels=environment=dev,owner=${owner}`,
-      ];
-      const res = await execute(createArgs, process.cwd(), {
-        interactive: true,
-      });
-      if (res.code === 0) {
-        await saveDefaultVm(settings.stateDir, vm);
-      }
-      return res.code;
-    }
-
-    case "start":
-    case "stop": {
-      arity(positionals, 0, 1);
-      const project = requireProject(settings);
-      const zone = requireZone(settings);
-      const vm = positionals[0]
-        ? validateGcpVmName(positionals[0])
-        : await resolveTargetVm(settings, { allowPick: true });
-      const gcloud = requireGcloudPath();
-      const res = await execute(
-        [
-          gcloud,
-          "compute",
-          "instances",
-          sub,
-          vm,
-          ...gcloudFlags(project),
-          `--zone=${zone}`,
-        ],
-        process.cwd(),
-        { interactive: true },
-      );
-      return res.code;
-    }
-
-    case "delete": {
       arity(positionals, 1);
-      const project = requireProject(settings);
-      const zone = requireZone(settings);
-      const vm = validateGcpVmName(positionals[0]!);
-      const gcloud = requireGcloudPath();
-      const res = await execute(
-        [
-          gcloud,
-          "compute",
-          "instances",
-          "delete",
-          vm,
-          ...gcloudFlags(project),
-          `--zone=${zone}`,
-        ],
-        process.cwd(),
-        { interactive: true },
-      );
-      return res.code;
+      const host = validateHostName(positionals[0]);
+      await saveDefaultVm(settings.stateDir, host);
+      console.log(`Default cloud host: ${host}`);
+      return 0;
     }
 
     default:

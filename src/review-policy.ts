@@ -95,7 +95,7 @@ export function evaluate(
     }
   }
 
-  const findings = [...unique.values()].toSorted(
+  const findings = [...unique.values()].sort(
     (a, b) => SEVERITIES.indexOf(a.severity) - SEVERITIES.indexOf(b.severity),
   );
   const deductions: Record<Severity, number> = {

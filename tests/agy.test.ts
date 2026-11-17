@@ -165,6 +165,7 @@ test("Antigravity remains optional in the default doctor report for existing Cod
   const w = new Workspace(t);
   const git = w.command(["which", "git"]).stdout.trim();
   fs.unlinkSync(path.join(w.bin, "agy"));
+  fs.unlinkSync(path.join(w.bin, "opencode"));
   fs.symlinkSync(git, path.join(w.bin, "git"));
   fs.symlinkSync(process.execPath, path.join(w.bin, "node"));
   w.env.PATH = w.bin;

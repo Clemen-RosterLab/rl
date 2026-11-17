@@ -30,6 +30,7 @@ export interface Candidate {
   path: string;
   branch: string;
   locked: boolean;
+  existing?: boolean;
 }
 
 const escapePickerToken = (value: string): string =>
@@ -50,6 +51,7 @@ export function candidates(
   repo: string,
   base: string,
   store?: Store,
+  includeExisting = false,
 ): Candidate[] {
   const adopted = new Map(
     store
@@ -64,7 +66,12 @@ export function candidates(
       const root = canonical(record.worktree);
       const managed = inside(root, base);
       const branch = (record.branch ?? "").replace(/^refs\/heads\//, "");
-      if (root === repo || (!managed && adopted.get(root) !== branch)) {
+      const existing = adopted.get(root) !== branch;
+      if (
+        root === repo ||
+        (!managed && existing && !includeExisting) ||
+        (includeExisting && !branch)
+      ) {
         return [];
       }
       return [
@@ -73,6 +80,7 @@ export function candidates(
           path: root,
           branch,
           locked: "locked" in record,
+          ...(store && existing ? { existing: true } : {}),
         },
       ];
     });
@@ -174,32 +182,40 @@ export function pickerRows(
   });
 
   const columns = process.stderr.columns || 110;
+  const candidateLabel = (item: Candidate) =>
+    (item.locked ? "[locked] " : "") + item.name;
   const baseWidth = Math.min(
     24,
     Math.max(8, ...details.map((row) => escapePickerToken(row.base).length)),
   );
   const nameWidth = Math.min(
-    Math.max(12, ...items.map((item) => escapePickerToken(item.name).length)),
+    Math.max(
+      12,
+      ...items.map((item) => escapePickerToken(candidateLabel(item)).length),
+    ),
     Math.max(16, Math.min(48, columns - baseWidth - 47)),
   );
   const diffWidth = Math.max(13, ...details.map((row) => row.diff.length));
 
+  const accessHeader = items.some((item) => item.existing)
+    ? "LAST USED / RL"
+    : "LAST ACCESSED";
   const formatRow = (name: string, state: string, diff: string, base: string) =>
-    `${cell(name, nameWidth)}  ${cell(state, 7)}  ${cell(diff, diffWidth)}  ${cell(base, baseWidth)}  LAST ACCESSED`;
+    `${cell(name, nameWidth)}  ${cell(state, 7)}  ${cell(diff, diffWidth)}  ${cell(base, baseWidth)}  ${accessHeader}`;
 
   const header = formatRow("WORKSPACE", "PR", "COMMITS + / −", "BASE");
   const color = (value: string, code: number) =>
     paintAnsi(value, code, process.env.NO_COLOR === undefined);
 
   return details.map(({ item, state, diff, base, accessed }) => {
-    const displayCol = `${cell((item.locked ? "[locked] " : "") + item.name, nameWidth)}  ${color(cell(state, 7), STATE_COLORS[state.replace(/\*$/, "")])}  ${cell(
+    const displayCol = `${cell(candidateLabel(item), nameWidth)}  ${color(cell(state, 7), STATE_COLORS[state.replace(/\*$/, "")])}  ${cell(
       diff,
       diffWidth,
     )
       .replace(/\+\d+/g, (val) => color(val, 32))
       .replace(/-\d+/g, (val) =>
         color(val, 31),
-      )}  ${color(cell(base, baseWidth), 90)}  ${color(accessLabel(accessed), 90)}`;
+      )}  ${color(cell(base, baseWidth), 90)}  ${color(item.existing ? "not initialized" : accessLabel(accessed), item.existing ? 33 : 90)}`;
 
     return {
       item,
@@ -224,7 +240,7 @@ export async function select(
       console.error("No managed worktrees to delete.");
     } else {
       console.error(
-        "No RL workspaces yet. Create one with rl switch <name> --create.",
+        "No worktrees found. Create one with rl switch <name> --create.",
       );
     }
     return [];
@@ -247,7 +263,9 @@ export async function select(
       "Tab select · Ctrl-A all · Enter delete · Esc cancel\nDeletes uncommitted work and local branches.";
     prompt = "Delete › ";
   } else {
-    modeBanner = "Enter open · Esc cancel";
+    modeBanner = items.some((item) => item.existing)
+      ? "Enter initialize/open · Esc cancel · Only the selected worktree is initialized"
+      : "Enter open · Esc cancel";
     prompt = "Workspace › ";
   }
 
@@ -292,7 +310,12 @@ export async function main(argv: string[]): Promise<number> {
   );
   const selected = await select(
     store,
-    candidates(store.repo, canonical(required(values, "base-dir")), store),
+    candidates(
+      store.repo,
+      canonical(required(values, "base-dir")),
+      store,
+      true,
+    ),
     required(values, "default-base"),
     false,
   );

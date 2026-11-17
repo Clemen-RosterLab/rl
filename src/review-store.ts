@@ -40,7 +40,7 @@ export interface Feedback {
   snapshot: string;
   fingerprint: string;
   text: string;
-  agent?: "codex" | "claude" | "agy";
+  agent?: "codex" | "claude" | "agy" | "opencode";
   sessionId?: string;
   status: "saved" | "opened" | "delivered" | "failed";
   error?: string;

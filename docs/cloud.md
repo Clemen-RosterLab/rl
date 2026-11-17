@@ -1,52 +1,41 @@
-# Cloud and SSH configuration
+# Remote workspaces
 
-`rl cloud` has no built-in project, zone, VM name, or VM template. Keep your
-deployment settings in your personal `~/.config/rl/config.toml`, outside the
-repository. Edit that file rather than the public `config.example.toml`.
-If the file already exists, preserve its other settings.
-
-For Google Cloud IAP, add your own values using this fictional example:
-
-```toml
-cloudProject = "example-cloud-project"
-cloudZone = "us-central1-a"
-cloudVm = "dev-box"
-cloudTemplate = "dev-vm-template"
-```
-
-`cloudProject` is required to list or manage GCP VMs. A zone is also required
-for VM lifecycle commands and `rl cloud ssh-config`. `cloudTemplate` selects
-the template for `rl cloud create`; it is optional. Credentials remain managed
-by Google Cloud and SSH—do not put passwords, tokens, or private keys in RL's
-configuration.
-
-For an existing SSH host, only the host alias is needed:
-
-```toml
-cloudVm = "my-ssh-box"
-```
-
-Plain SSH hosts use your normal SSH configuration and do not need a GCP project
-or zone. `rl cloud use <host>` can also save a default host in your local RL
-state.
-
-Settings are selected in this order:
-
-1. Command flags: `--project`, `--zone`, and `--vm`.
-2. Environment variables: `RL_CLOUD_PROJECT`, `RL_CLOUD_ZONE`,
-   `RL_CLOUD_VM`, and `RL_CLOUD_TEMPLATE`.
-3. Your personal configuration file.
-
-Use `RL_CONFIG=/absolute/path/to/config.toml` to select another private file.
-Without `RL_CONFIG`, RL also respects `XDG_CONFIG_HOME`. Missing required GCP
-settings produce an error before running a cloud command; they never select
-the developer's infrastructure as a fallback.
+`rl cloud` opens, lists, creates and reviews workspaces on an existing SSH host.
+Set up the server and SSH connection separately, then choose the host:
 
 ```sh
-rl cloud vms
-rl cloud ssh
-rl cloud review
+rl cloud use dev-box
+rl cloud list
+rl cloud create feature/login --repo frontend
+rl cloud open frontend/feature/login
+rl cloud open frontend/feature/login --code
+rl cloud review frontend/feature/login
 ```
 
-GCP commands require your own authenticated `gcloud` installation and access
-permissions. This setup does not create accounts or grant access.
+Creation requires `rl` installed on the server and a repository registered there
+with `rl repo add <path>`. It creates a branch and worktree using the server's
+normal workflow and prints the remote path. `--base <ref>` overrides the starting
+point; `--no-fetch` uses the server's cached refs. Use `open` afterward to enter it.
+`--repo` on `cloud create` selects the **remote** repository. Without it, RL uses
+the server's default repository or asks you to pick one.
+
+Use `rl cloud repos` to see remote repositories. Existing `code`, `fetch`, and
+`checkout` commands remain available for workspace actions. Opening supports
+`--agent codex|claude|agy` and `--resume`.
+
+For a private configuration file, use `~/.config/rl/config.toml`:
+
+```toml
+cloudHost = "dev-box"
+```
+
+Host selection: `--host` (or `--vm`), then `RL_CLOUD_HOST` (or `RL_CLOUD_VM`),
+then `cloudHost` (or `cloudVm`), then the host saved by `rl cloud use`.
+`RL_CONFIG` and `XDG_CONFIG_HOME` still select alternate private configuration.
+Keep credentials in your normal SSH setup.
+
+VM creation, deletion, start/stop, discovery, SSH configuration generation and
+tunnelling are no longer RL commands. Use SSH and your infrastructure tools for
+those tasks. Existing SSH configuration, including previously generated IAP
+entries, is left untouched and continues to be used by SSH. Old `cloudProject`,
+`cloudZone` and `cloudTemplate` settings are accepted for compatibility but ignored.

@@ -22,6 +22,7 @@ export const MCP_CLIENT_CONFIG_PATHS: Readonly<Record<Agent, string>> = {
   codex: ".codex/config.toml",
   claude: ".mcp.json",
   agy: ".agents/mcp_config.json",
+  opencode: "opencode.json",
 };
 
 export function readWorkspaceMcpConfig(
@@ -215,6 +216,55 @@ function renderCodexTomlMcpConfig(options: {
   return updated;
 }
 
+function renderOpenCodeMcpConfig(options: {
+  before?: string;
+  command: string;
+  argv: string[];
+  file: string;
+}): string {
+  const config =
+    options.before === undefined ? {} : parseJsonObject(options.before);
+  if (config.mcp !== undefined && !object(config.mcp)) {
+    throw new Error(`Expected an mcp object in ${options.file}`);
+  }
+  const servers = object(config.mcp) ? config.mcp : {};
+  const previous = servers.rl;
+  if (
+    previous !== undefined &&
+    (!object(previous) ||
+      !object(previous.environment) ||
+      previous.environment[MARKER] !== "1")
+  ) {
+    throw new Error(
+      `An existing server named rl in ${options.file} is not managed by RL. Keep it, or remove only that entry before running rl setup mcp.`,
+    );
+  }
+  if (
+    object(previous) &&
+    (previous.url !== undefined ||
+      (previous.type !== undefined && previous.type !== "local"))
+  ) {
+    throw new Error(
+      `The existing rl server in ${options.file} is not a local MCP server`,
+    );
+  }
+  const existing = object(previous) ? previous : {};
+  const entry = {
+    ...existing,
+    type: "local",
+    command: [options.command, ...options.argv],
+    enabled: typeof existing.enabled === "boolean" ? existing.enabled : true,
+    environment: {
+      ...(object(existing.environment) ? existing.environment : {}),
+      [MARKER]: "1",
+    },
+  };
+  return (
+    JSON.stringify({ ...config, mcp: { ...servers, rl: entry } }, null, 2) +
+    "\n"
+  );
+}
+
 export function planClientMcpUpdate(options: {
   client: Agent;
   workspace: string;
@@ -234,15 +284,22 @@ export function planClientMcpUpdate(options: {
           workspace: options.workspace,
           file,
         })
-      : renderJsonMcpConfig({
-          before: text,
-          command: options.command,
-          argv: options.serverArgs,
-          file,
-          client: options.client,
-          serverName:
-            options.client === "agy" ? `rl-${options.instanceKey}` : "rl",
-        });
+      : options.client === "opencode"
+        ? renderOpenCodeMcpConfig({
+            before: text,
+            command: options.command,
+            argv: options.serverArgs,
+            file,
+          })
+        : renderJsonMcpConfig({
+            before: text,
+            command: options.command,
+            argv: options.serverArgs,
+            file,
+            client: options.client,
+            serverName:
+              options.client === "agy" ? `rl-${options.instanceKey}` : "rl",
+          });
 
   let action: McpClientUpdate["action"];
   if (text === after) {
