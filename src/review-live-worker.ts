@@ -27,6 +27,7 @@ import type { ViewedFile } from "./review-progress.js";
 import { changedFiles } from "./review-git.js";
 import { workflowReviewState } from "./agent-runner.js";
 import { Store } from "./store.js";
+import { ReviewWatcher } from "./review-live-watch.js";
 const [root, workspaceRepo = root, temporaryRoot, freezeId, remotePr] =
   process.argv.slice(2);
 if (remotePr) {
@@ -34,9 +35,14 @@ if (remotePr) {
   process.env.GH_PROMPT_DISABLED = "1";
 }
 let repository: LiveRepository | undefined;
+// Native watcher setup/teardown can block on filesystem activity. Keep it in
+// the existing isolated process so it cannot stall keyboard input or Quit.
+let watcher: ReviewWatcher | undefined;
+let watchSignature: string | undefined;
 let active = 0,
   disconnected = false;
 function cleanup(): void {
+  watcher?.close();
   try {
     repository?.releaseFreeze();
   } catch {
@@ -61,6 +67,7 @@ interface Request {
   id: number;
   op: string;
   force?: boolean;
+  watch?: boolean;
   mode?: Mode;
   state?: LiveState;
   file?: ReviewFile;
@@ -84,6 +91,13 @@ interface Request {
 process.on("message", async (request: Request) => {
   active++;
   try {
+    // Start fallback polling before the first snapshot, so an initial read
+    // failure still recovers without requiring a manual refresh.
+    if (request.watch && !remotePr && !disconnected)
+      watcher ??= new ReviewWatcher(() => {
+        if (process.connected && !disconnected)
+          process.send!({ changed: true }, () => {});
+      });
     repository ??= new LiveRepository(root, workspaceRepo, {
       temporaryRoot,
       freezeId,
@@ -91,11 +105,16 @@ process.on("message", async (request: Request) => {
     });
     if (request.op !== "refresh") repository.assertIdentity();
     let result: unknown;
-    if (request.op === "refresh")
-      result = request.remote
+    if (request.op === "refresh") {
+      const state = request.remote
         ? repository.remoteState(request.remote.head, request.remote.base)
         : repository.refresh(request.force);
-    else if (request.op === "history")
+      if (watcher && (watchSignature !== state.signature || request.force)) {
+        watcher.update(state);
+        watchSignature = state.signature;
+      }
+      result = state;
+    } else if (request.op === "history")
       result = repository.history(request.head!, request.base);
     else if (request.op === "identity") result = true;
     else if (request.op === "workflow") {

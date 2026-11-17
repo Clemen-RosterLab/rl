@@ -39,7 +39,6 @@ import {
   type Checkpoint,
   type Commit,
 } from "./review-live-engine.js";
-import { ReviewWatcher } from "./review-live-watch.js";
 import { ReviewPreview } from "./review-live-preview.js";
 import {
   visibleReviewFiles,
@@ -136,7 +135,12 @@ class GitWorker {
     reject: (error: Error) => void;
   };
 
-  constructor(root: string, repository = root, remotePr?: number) {
+  constructor(
+    root: string,
+    repository = root,
+    remotePr?: number,
+    private readonly onChange: () => void = () => {},
+  ) {
     // A separate process group lets Quit interrupt synchronous Git commands
     // and their descendants while leaving the terminal process running.
     this.worker = fork(
@@ -161,14 +165,20 @@ class GitWorker {
         result,
         error,
         ready,
+        changed,
       }: {
         id: number;
         result: unknown;
         error?: string;
         ready?: boolean;
+        changed?: boolean;
       }) => {
         if (ready) {
           this.signalReady();
+          return;
+        }
+        if (changed) {
+          if (!this.closed) this.onChange();
           return;
         }
         const task = this.active;
@@ -410,6 +420,7 @@ export async function liveReview(options: LiveOptions): Promise<void> {
     options.root,
     options.repository,
     options.remote?.number,
+    () => void refresh(),
   );
   const preview = new ReviewPreview(options.root);
   const remoteAbort = new AbortController();
@@ -554,9 +565,6 @@ export async function liveReview(options: LiveOptions): Promise<void> {
     status = text;
     render();
   };
-  const watcher = options.remote
-    ? undefined
-    : new ReviewWatcher(() => void refresh());
   const error = (cause: unknown) => {
     if (!stopped) {
       if (textSelection) selectionNotice = message(cause);
@@ -1505,13 +1513,12 @@ export async function liveReview(options: LiveOptions): Promise<void> {
       if (options.remote && !latestPr) return;
       const result = await git.request<LiveState>("refresh", {
         force,
+        watch: !options.remote,
         ...(options.remote && latestPr
           ? { remote: { head: latestPr.headRefOid, base: latestPr.baseRefOid } }
           : {}),
       });
       if (stopped) return;
-      if (latest?.signature !== result.signature || force)
-        watcher?.update(result);
       latest = result;
       if (state?.signature !== result.signature || force) {
         if (frozen) {
@@ -3300,7 +3307,6 @@ export async function liveReview(options: LiveOptions): Promise<void> {
       );
     });
     try {
-      watcher?.close();
       await Promise.all([git.close(state?.gitDir), restored]);
     } finally {
       await releaseInput();

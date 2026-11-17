@@ -67,7 +67,7 @@ if pid == 0:
         assert not pending, f'Mouse packets leaked to the shell: {pending!r}'
         print('SHELL_INPUT_CLEAN', flush=True)
         sys.exit(0)
-    if scenario == "quit":
+    if scenario in ("quit", "quit-watcher"):
         os.execv(node, [node, cli, 'review', '--live'])
     extra = ['--pr', '99', '--local', '--remote-interval', '10'] if scenario in ('pr-navigation', 'pr-freeze') else ['--pr', '99', '--github-repo', 'example/repo', '--remote-interval', '10'] if scenario in ('remote-pr', 'pr-comments') else []
     if scenario == 'pr-comments' and os.environ.get('REVIEW_LOCAL_COMMENTS'):
@@ -917,6 +917,17 @@ def handoff_scenario():
         pump(.008)
     return started
 
+def watcher_quit_scenario():
+    expect_screen('+version-one')
+    expect_screen('Updated')
+    # The injected watcher emits no events. Polling must still refresh the UI.
+    with open(os.path.join(root, 'live.txt'), 'w') as file:
+        file.write('version-two\n')
+    expect_screen('+version-two', timeout=15)
+    started = time.monotonic()
+    key('q')
+    return started
+
 def shell_scenario():
     expect('RL_SHELL_READY> ')
     if scenario == 'shell-function':
@@ -973,6 +984,8 @@ try:
         scratch, quit_started = quit_scenario()
     elif scenario == "handoff":
         quit_started = handoff_scenario()
+    elif scenario == "quit-watcher":
+        quit_started = watcher_quit_scenario()
     elif scenario in ('shell', 'shell-function'):
         shell_scenario()
     elif scenario in ('terminal-raw', 'terminal-noecho'):
@@ -1028,6 +1041,10 @@ try:
     assert b'\x1b[?1000l' in output and b'\x1b[?1006l' in output, 'Mouse tracking not restored'
     assert b'\x1b[?1002h' in output and b'\x1b[?1002l' in output, 'Held-button mouse tracking not enabled and restored'
     assert termios.tcgetattr(fd)[3] & termios.ICANON, 'Terminal remained in raw mode'
+    if scenario == "quit-watcher":
+        elapsed = time.monotonic()-quit_started
+        assert elapsed < .8, f'Watcher shutdown held the terminal for {elapsed:.3f}s'
+        print(f'QUIT_LATENCY={elapsed:.3f}s')
     if scenario == "handoff":
         assert b'SHELL_INPUT_CLEAN' in output, bytes(output[-4000:])
         assert b'^[[<' not in output, 'Late mouse packets were echoed into the shell'

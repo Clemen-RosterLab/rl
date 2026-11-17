@@ -964,6 +964,54 @@ test("batched history statistics preserve initial, rename, binary and merge comm
 });
 
 test(
+  "Quit is independent of a stalled native watcher shutdown",
+  { timeout: 60000 },
+  (t) => {
+    const w = new Workspace(t);
+    write(path.join(w.a, "live.txt"), "version-one\n");
+    const preload = path.join(w.root, "slow-watcher.cjs");
+    w.env.REVIEW_WATCH_MARKER = path.join(w.root, "watch-started");
+    write(
+      preload,
+      String.raw`
+const fs = require('node:fs'), { EventEmitter } = require('node:events');
+let stalled = false;
+fs.watch = function() {
+  fs.writeFileSync(process.env.REVIEW_WATCH_MARKER, String(process.pid));
+  const watcher = new EventEmitter();
+  watcher.close = () => {
+    if (stalled) return;
+    stalled = true;
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 5000);
+  };
+  return watcher;
+};
+`,
+    );
+    w.env.NODE_OPTIONS = `${w.env.NODE_OPTIONS ?? ""} --require=${JSON.stringify(preload)}`;
+    const result = w.command(
+      [
+        "python3",
+        path.join(ROOT, "tests/review-live-pty.py"),
+        w.a,
+        process.execPath,
+        CLI,
+        w.repo,
+        w.state,
+        path.join(w.root, "worktrees/example"),
+        "quit-watcher",
+      ],
+      { timeoutMs: 45000 },
+    );
+    assert.ok(fs.existsSync(w.env.REVIEW_WATCH_MARKER));
+    assert.match(result.stdout, /PTY: quit-watcher.*passed/);
+    t.diagnostic(
+      result.stdout.match(/QUIT_LATENCY=[\d.]+s/)?.[0] ?? result.stdout,
+    );
+  },
+);
+
+test(
   "Quit cancels blocked Git and returns promptly while slow disk cleanup finishes separately",
   { timeout: 120000 },
   (t) => {
