@@ -12,56 +12,48 @@ import { CLI, Workspace, read, readJson, write } from "./helpers.js";
 
 test("gcloud dry-run parser and ssh_config generator preserve user settings and deduplicate rl-cloud alias", () => {
   const sample =
-    '/usr/bin/ssh -t -i /Users/clemen/.ssh/google_compute_engine -o CheckHostIP=no -o HashKnownHosts=no -o HostKeyAlias=compute.1234567890123456789 -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=/Users/clemen/.ssh/google_compute_known_hosts -o "ProxyCommand /opt/homebrew/bin/python3.14 -S /opt/homebrew/Caskroom/gcloud-cli/593.0.0/google-cloud-sdk/lib/gcloud.py compute start-iap-tunnel dev-example-rl %p --listen-on-stdin --project=example-cloud-project --zone=us-central1-a --verbosity=warning" -o ProxyUseFdpass=no developer_example_com@compute.1234567890123456789';
+    '/usr/bin/ssh -t -i /Users/tester/.ssh/google_compute_engine -o CheckHostIP=no -o HashKnownHosts=no -o HostKeyAlias=compute.100001 -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=/Users/tester/.ssh/google_compute_known_hosts -o "ProxyCommand /opt/homebrew/bin/python3 -S /opt/homebrew/google-cloud-sdk/lib/gcloud.py compute start-iap-tunnel dev-vm-1 %p --listen-on-stdin --project=example-cloud-project --zone=us-central1-a --verbosity=warning" -o ProxyUseFdpass=no tester_example_invalid@compute.100001';
 
   const words = parseShellWords(sample);
   assert.equal(words[0], "/usr/bin/ssh");
-  assert.equal(
-    words.at(-1),
-    "developer_example_com@compute.1234567890123456789",
-  );
+  assert.equal(words.at(-1), "tester_example_invalid@compute.100001");
 
   const details = extractDryRunSshDetails(sample);
   assert.deepEqual(details, {
-    user: "developer_example_com",
-    hostKeyAlias: "compute.1234567890123456789",
-    identityFile: "/Users/clemen/.ssh/google_compute_engine",
-    userKnownHostsFile: "/Users/clemen/.ssh/google_compute_known_hosts",
+    user: "tester_example_invalid",
+    hostKeyAlias: "compute.100001",
+    identityFile: "/Users/tester/.ssh/google_compute_engine",
+    userKnownHostsFile: "/Users/tester/.ssh/google_compute_known_hosts",
   });
 
   const blockA = buildManagedSshBlock({
-    vm: "dev-example-rl",
+    vm: "dev-vm-1",
     isDefault: true,
     project: "example-cloud-project",
     zone: "us-central1-a",
     gcloudPath: "/opt/homebrew/bin/gcloud",
     details,
   });
-  assert.match(blockA, /Host dev-example-rl rl-cloud/);
+  assert.match(blockA, /Host dev-vm-1 rl-cloud/);
   assert.match(blockA, /ControlMaster auto/);
-  assert.match(blockA, /start-iap-tunnel dev-example-rl %p/);
+  assert.match(blockA, /start-iap-tunnel dev-vm-1 %p/);
 
   const existing = "Host github.com\n  User git\n";
-  const withA = upsertSshConfigContent(existing, "dev-example-rl", blockA, true);
+  const withA = upsertSshConfigContent(existing, "dev-vm-1", blockA, true);
   assert.match(withA, /Host github\.com/);
-  assert.match(withA, /Host dev-example-rl rl-cloud/);
+  assert.match(withA, /Host dev-vm-1 rl-cloud/);
 
   const blockB = buildManagedSshBlock({
-    vm: "dev-clemen-api",
+    vm: "dev-vm-2",
     isDefault: true,
     project: "example-cloud-project",
     zone: "us-central1-a",
     gcloudPath: "/opt/homebrew/bin/gcloud",
     details: { ...details, hostKeyAlias: "compute.99999" },
   });
-  const withBoth = upsertSshConfigContent(
-    withA,
-    "dev-clemen-api",
-    blockB,
-    true,
-  );
-  assert.match(withBoth, /Host dev-example-rl\n/);
-  assert.match(withBoth, /Host dev-clemen-api rl-cloud\n/);
+  const withBoth = upsertSshConfigContent(withA, "dev-vm-2", blockB, true);
+  assert.match(withBoth, /Host dev-vm-1\n/);
+  assert.match(withBoth, /Host dev-vm-2 rl-cloud\n/);
 });
 
 test("end-to-end cloud repos, list, ssh-config, fetch, checkout and uncommitted cloud review", (t) => {
@@ -70,6 +62,12 @@ test("end-to-end cloud repos, list, ssh-config, fetch, checkout and uncommitted 
   const cloudHome = path.join(w.root, "cloud-home");
   fs.mkdirSync(localHome, { recursive: true });
   fs.mkdirSync(cloudHome, { recursive: true });
+
+  // Configure cloudProject and cloudZone locally in config.toml (no hardcoded defaults).
+  write(
+    w.config,
+    'cloudProject = "example-cloud-project"\ncloudZone = "us-central1-a"\n',
+  );
 
   // Isolate os.homedir() for the local CLI process so ~/.ssh/config is written inside w.root.
   const preload = path.join(w.root, "home-preload.cjs");
@@ -80,18 +78,18 @@ test("end-to-end cloud repos, list, ssh-config, fetch, checkout and uncommitted 
   w.env.NODE_OPTIONS =
     `${w.env.NODE_OPTIONS ?? ""} --require ${JSON.stringify(preload)}`.trim();
 
-  // Set shared GitHub origin identity on local repo (alias: "frontend") and cloud repo (alias: "rosterlab-frontend").
+  // Set shared GitHub origin identity on local repo (alias: "frontend") and cloud repo (alias: "webapp").
   w.git(
     w.repo,
     "remote",
     "add",
     "origin",
-    "https://github.com/rosterlab/rosterlab-frontend.git",
+    "https://github.com/example/webapp.git",
   );
   w.rl(["repo", "add", "frontend", w.repo, "--base", "develop"]);
 
   // Prepare simulated remote RL installation + repositories inside cloudHome.
-  const cloudRepo = path.join(cloudHome, "rosterlab-frontend");
+  const cloudRepo = path.join(cloudHome, "webapp");
   const cloudUnregistered = path.join(cloudHome, "playground-api");
   const cloudStateDir = path.join(cloudHome, ".rl/instances");
   const cloudWorktreeDir = path.join(cloudHome, ".rl/worktrees");
@@ -102,7 +100,7 @@ test("end-to-end cloud repos, list, ssh-config, fetch, checkout and uncommitted 
     "remote",
     "set-url",
     "origin",
-    "git@github.com:rosterlab/rosterlab-frontend.git",
+    "git@github.com:example/webapp.git",
   );
   w.command(["git", "init", "-q", "-b", "main", cloudUnregistered]);
   w.git(cloudUnregistered, "commit", "-q", "--allow-empty", "-m", "Init api");
@@ -117,22 +115,16 @@ test("end-to-end cloud repos, list, ssh-config, fetch, checkout and uncommitted 
     GIT_CONFIG_NOSYSTEM: "1",
     GIT_CONFIG_GLOBAL: "/dev/null",
     GIT_AUTHOR_NAME: "Cloud Dev",
-    GIT_AUTHOR_EMAIL: "cloud@rosterlab.com",
+    GIT_AUTHOR_EMAIL: "cloud@example.invalid",
     GIT_COMMITTER_NAME: "Cloud Dev",
-    GIT_COMMITTER_EMAIL: "cloud@rosterlab.com",
+    GIT_COMMITTER_EMAIL: "cloud@example.invalid",
   };
   write(path.join(cloudHome, "empty.toml"), "# cloud\n");
-
-  const runOnCloud = (argv: string[], cwd = cloudRepo) => {
-    const res = w.command([CLI, ...argv], { cwd });
-    return res;
-  };
-  void runOnCloud;
 
   // Register cloudRepo and create a cloud RL workspace with both a commit AND uncommitted changes.
   const cloudWorktree = path.join(
     cloudWorktreeDir,
-    "rosterlab-frontend/ROS-9999-cloud-feature",
+    "webapp/cloud-sync-feature",
   );
   fs.mkdirSync(path.dirname(cloudWorktree), { recursive: true });
   w.git(
@@ -141,7 +133,7 @@ test("end-to-end cloud repos, list, ssh-config, fetch, checkout and uncommitted 
     "add",
     "-q",
     "-b",
-    "ROS-9999-cloud-feature",
+    "cloud-sync-feature",
     cloudWorktree,
     "develop",
   );
@@ -155,10 +147,7 @@ test("end-to-end cloud repos, list, ssh-config, fetch, checkout and uncommitted 
 
   // Run RL on cloudHome to register the repo and adopt the worktree.
   for (const [cmd, cwd] of [
-    [
-      ["repo", "add", "rosterlab-frontend", cloudRepo, "--base", "develop"],
-      cloudRepo,
-    ],
+    [["repo", "add", "webapp", cloudRepo, "--base", "develop"], cloudRepo],
     [["setup", "adopt"], cloudWorktree],
   ] as const) {
     const prevEnv = w.env;
@@ -185,21 +174,21 @@ test("end-to-end cloud repos, list, ssh-config, fetch, checkout and uncommitted 
     `
 const args = process.argv.slice(2);
 if (args[0] === "config" && args[1] === "get-value" && args[2] === "account") {
-  console.log("clemen@rosterlab.com");
+  console.log("tester@example.invalid");
   process.exit(0);
 }
 if (args[0] === "compute" && args[1] === "instances" && args[2] === "list") {
   console.log(JSON.stringify([{
-    name: "dev-example-rl",
+    name: "dev-vm-1",
     zone: "https://www.googleapis.com/compute/v1/projects/p/zones/us-central1-a",
     machineType: "zones/us-central1-a/machineTypes/e2-standard-4",
     status: "RUNNING",
-    labels: { owner: "clemen" }
+    labels: { owner: "tester" }
   }]));
   process.exit(0);
 }
 if (args[0] === "compute" && args[1] === "ssh" && args.includes("--dry-run")) {
-  console.log("/usr/bin/ssh -t -i /tmp/fake_key -o HostKeyAlias=compute.12345 -o UserKnownHostsFile=/tmp/fake_kh developer_example_com@compute.12345");
+  console.log("/usr/bin/ssh -t -i /tmp/fake_key -o HostKeyAlias=compute.12345 -o UserKnownHostsFile=/tmp/fake_kh tester_example_invalid@compute.12345");
   process.exit(0);
 }
 console.error("Unexpected gcloud call: " + args.join(" "));
@@ -234,7 +223,6 @@ for (let i = 0; i < argv.length; i++) {
   if (argv[i].startsWith("-")) continue;
   rest.push(argv[i]);
 }
-const host = rest[0];
 const remoteCmd = rest.slice(1).join(" ");
 const env = {
   ...process.env,
@@ -266,37 +254,34 @@ fs.appendFileSync(process.env.CODE_CALL_LOG, JSON.stringify(process.argv.slice(2
   // 1. rl cloud vms
   const vmsJson = JSON.parse(w.rl(["cloud", "vms", "--json"]).stdout);
   assert.equal(vmsJson.vms.length, 1);
-  assert.equal(vmsJson.vms[0].name, "dev-example-rl");
+  assert.equal(vmsJson.vms[0].name, "dev-vm-1");
 
   // 2. rl cloud ssh-config writes ~/.ssh/config inside localHome
   w.rl(["cloud", "ssh-config"]);
   const sshCfg = read(path.join(localHome, ".ssh/config"));
-  assert.match(sshCfg, /Host dev-example-rl rl-cloud/);
+  assert.match(sshCfg, /Host dev-vm-1 rl-cloud/);
   assert.match(sshCfg, /ControlMaster auto/);
 
   // 3. rl cloud repos discovers both registered RL repo AND unregistered git repo in $HOME
   const cloudRepos = JSON.parse(w.rl(["cloud", "repos", "--json"]).stdout);
-  assert.equal(cloudRepos.vm, "dev-example-rl");
+  assert.equal(cloudRepos.vm, "dev-vm-1");
   const repoNames = cloudRepos.repositories.map(
     (r: { name: string }) => r.name,
   );
-  assert.ok(repoNames.includes("rosterlab-frontend"));
+  assert.ok(repoNames.includes("webapp"));
   assert.ok(repoNames.includes("playground-api"));
 
   // 4. rl list --cloud and rl list --include-cloud
   const cloudList = JSON.parse(w.rl(["list", "--cloud", "--json"]).stdout);
-  assert.equal(cloudList.vm, "dev-example-rl");
+  assert.equal(cloudList.vm, "dev-vm-1");
   assert.equal(cloudList.instances.length, 1);
-  assert.equal(cloudList.instances[0].id, "ROS-9999-cloud-feature");
-  assert.equal(
-    cloudList.instances[0].repositoryName,
-    "dev-example-rl:rosterlab-frontend",
-  );
+  assert.equal(cloudList.instances[0].id, "cloud-sync-feature");
+  assert.equal(cloudList.instances[0].repositoryName, "dev-vm-1:webapp");
 
   const combinedList = JSON.parse(
     w.rl(["list", "--all", "--include-cloud", "--json"]).stdout,
   );
-  assert.equal(combinedList.cloudVm, "dev-example-rl");
+  assert.equal(combinedList.cloudVm, "dev-vm-1");
   assert.ok(
     combinedList.instances.some(
       (i: { repositoryName: string }) => i.repositoryName === "frontend",
@@ -304,23 +289,22 @@ fs.appendFileSync(process.env.CODE_CALL_LOG, JSON.stringify(process.argv.slice(2
   );
   assert.ok(
     combinedList.instances.some(
-      (i: { repositoryName: string }) =>
-        i.repositoryName === "dev-example-rl:rosterlab-frontend",
+      (i: { repositoryName: string }) => i.repositoryName === "dev-vm-1:webapp",
     ),
   );
 
   // 5. rl cloud code opens VS Code Remote-SSH URI
-  w.rl(["cloud", "code", "ROS-9999-cloud-feature"]);
+  w.rl(["cloud", "code", "cloud-sync-feature"]);
   const codeArgs = readJson(codeLog);
   assert.equal(codeArgs[0], "--folder-uri");
   assert.match(
     codeArgs[1],
-    /^vscode-remote:\/\/ssh-remote\+dev-example-rl\/.*ROS-9999-cloud-feature$/,
+    /^vscode-remote:\/\/ssh-remote\+dev-vm-1\/.*cloud-sync-feature$/,
   );
 
   // 6. rl cloud review --json and --diff inspect BOTH committed and uncommitted cloud changes locally!
   const reviewJson = JSON.parse(
-    w.rl(["cloud", "review", "ROS-9999-cloud-feature", "--json"]).stdout,
+    w.rl(["cloud", "review", "cloud-sync-feature", "--json"]).stdout,
   );
   assert.equal(reviewJson.dirty, true);
   assert.equal(reviewJson.commits.length, 1);
@@ -331,7 +315,7 @@ fs.appendFileSync(process.env.CODE_CALL_LOG, JSON.stringify(process.argv.slice(2
   const reviewDiff = w.rl([
     "cloud",
     "review",
-    "ROS-9999-cloud-feature",
+    "cloud-sync-feature",
     "--diff",
   ]).stdout;
   assert.match(reviewDiff, /\+export const cloud = 1;/);
@@ -349,19 +333,14 @@ fs.appendFileSync(process.env.CODE_CALL_LOG, JSON.stringify(process.argv.slice(2
   w.env.RL_SHELL_OUTPUT = destOut;
   w.env.RL_SHELL_PROTOCOL = "v2";
   try {
-    w.rl([
-      "cloud",
-      "checkout",
-      "ROS-9999-cloud-feature",
-      "--include-uncommitted",
-    ]);
+    w.rl(["cloud", "checkout", "cloud-sync-feature", "--include-uncommitted"]);
   } finally {
     delete w.env.RL_SHELL_OUTPUT;
     delete w.env.RL_SHELL_PROTOCOL;
   }
   const localCheckedOut = path.join(
     w.root,
-    "worktrees/example/ROS-9999-cloud-feature",
+    "worktrees/example/cloud-sync-feature",
   );
   assert.equal(read(destOut).trim(), `cd:${fs.realpathSync(localCheckedOut)}`);
   assert.equal(
@@ -372,4 +351,59 @@ fs.appendFileSync(process.env.CODE_CALL_LOG, JSON.stringify(process.argv.slice(2
     read(path.join(localCheckedOut, "uncommitted.ts")),
     "export const draft = true;\n",
   );
+});
+
+test("rl cloud works with any plain SSH host without gcloud or GCP config", (t) => {
+  const w = new Workspace(t);
+  const localHome = path.join(w.root, "local-home");
+  const remoteHome = path.join(w.root, "remote-home");
+  fs.mkdirSync(path.join(localHome, ".ssh"), { recursive: true });
+  fs.mkdirSync(remoteHome, { recursive: true });
+
+  const preload = path.join(w.root, "home-preload.cjs");
+  write(
+    preload,
+    `require('node:os').homedir = () => ${JSON.stringify(localHome)}; require('node:module').syncBuiltinESMExports();`,
+  );
+  w.env.NODE_OPTIONS =
+    `${w.env.NODE_OPTIONS ?? ""} --require ${JSON.stringify(preload)}`.trim();
+
+  // Pre-existing user SSH host in ~/.ssh/config (no cloudProject / cloudZone in config.toml).
+  write(
+    path.join(localHome, ".ssh/config"),
+    "Host my-ssh-box\n  HostName 127.0.0.1\n  User developer\n",
+  );
+
+  const remoteRepo = path.join(remoteHome, "service-api");
+  w.command(["git", "init", "-q", "-b", "main", remoteRepo]);
+  w.git(remoteRepo, "commit", "-q", "--allow-empty", "-m", "Init");
+
+  w.env.REMOTE_HOME = remoteHome;
+  w.stub(
+    "ssh",
+    `
+const { spawnSync } = require("node:child_process");
+const argv = process.argv.slice(2);
+const flagsWithArg = new Set(["-o", "-L", "-i", "-p", "-l", "-F", "-S"]);
+const rest = [];
+for (let i = 0; i < argv.length; i++) {
+  if (flagsWithArg.has(argv[i])) { i++; continue; }
+  if (argv[i].startsWith("-")) continue;
+  rest.push(argv[i]);
+}
+const remoteCmd = rest.slice(1).join(" ");
+const res = spawnSync("/bin/sh", ["-c", remoteCmd], {
+  cwd: process.env.REMOTE_HOME,
+  env: { ...process.env, HOME: process.env.REMOTE_HOME, NODE_OPTIONS: "" },
+  stdio: "inherit",
+});
+process.exit(res.status ?? 1);
+`,
+  );
+
+  w.rl(["cloud", "use", "my-ssh-box"]);
+  const reposJson = JSON.parse(w.rl(["cloud", "repos", "--json"]).stdout);
+  assert.equal(reposJson.vm, "my-ssh-box");
+  assert.equal(reposJson.repositories.length, 1);
+  assert.equal(reposJson.repositories[0].name, "service-api");
 });

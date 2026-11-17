@@ -846,7 +846,7 @@ const topics: Record<string, Topic> = {
     description: "Browse, connect and sync cloud dev workspaces",
     usage: "rl cloud [command] [options]",
     options: [
-      "--vm <name>          Target a specific cloud VM (e.g. dev-example-rl)",
+      "--vm <name>          Target a specific SSH host or cloud VM (e.g. dev-box)",
       "--code               Open the selected cloud workspace in VS Code Remote-SSH",
       "--agent codex|claude|agy  Start an agent after entering the cloud workspace",
       "--resume             Resume a saved agent conversation in the cloud workspace",
@@ -854,14 +854,14 @@ const topics: Record<string, Topic> = {
     notes: [
       "With no subcommand, opens an interactive picker of cloud repositories and workspaces.",
       "Picker shortcuts: Enter opens an SSH shell in the remote directory, Alt-O opens VS Code, Alt-R reviews locally, Alt-C checks out locally.",
-      "Configures ~/.ssh/config automatically for IAP tunneling and connection multiplexing.",
+      "Works with any SSH host via `rl cloud use <host>` or `cloudVm` in config.toml, or with GCP IAP VMs when `cloudProject` and `cloudZone` are configured.",
     ],
     examples: [
       "rl cloud",
       "rl cloud repos",
       "rl cloud list",
       "rl cloud review",
-      "rl cloud checkout ROS-2484-mobile-slow-load",
+      "rl cloud checkout feature/login",
       "rl cloud ssh-config",
       "rl cloud tunnel 3000",
     ],
@@ -920,7 +920,7 @@ const topics: Record<string, Topic> = {
   },
   "cloud create": {
     description: "Create a shared cloud dev VM from template",
-    usage: "rl cloud create <dev-name> [machine-type]",
+    usage: "rl cloud create <vm> [machine-type]",
   },
   "cloud start": {
     description: "Start a stopped cloud dev VM",

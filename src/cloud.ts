@@ -33,13 +33,11 @@ import { padCell, paintAnsi, sanitizeTerminalText } from "./tui/ansi.js";
 import { type FzfItem, runFzf } from "./tui/fzf.js";
 import { loadUserConfig, resolveCliEnvironment } from "./user-config.js";
 
-const DEFAULT_PROJECT = "example-cloud-project";
-const DEFAULT_ZONE = "us-central1-a";
-const DEFAULT_TEMPLATE = "example-dev-template";
 const DEFAULT_MACHINE_TYPE = "e2-standard-4";
 const DEFAULT_TUNNEL_PORT = 3000;
 const SSH_MUX_REL_PATH = "~/.rl/ssh/%C";
-const VM_NAME_PATTERN = /^dev-[a-z0-9](?:[-a-z0-9]*[a-z0-9])?$/;
+const HOST_NAME_PATTERN = /^[A-Za-z0-9](?:[A-Za-z0-9._@-]{0,126}[A-Za-z0-9])?$/;
+const GCP_VM_PATTERN = /^[a-z](?:[-a-z0-9]{0,61}[a-z0-9])?$/;
 const PROJECT_PATTERN = /^[a-z][a-z0-9-]{4,29}$/;
 const ZONE_PATTERN = /^[a-z]+-[a-z]+\d+-[a-z]$/;
 const SUPPORTED_AGENTS = new Set(["codex", "claude", "agy"]);
@@ -103,9 +101,9 @@ interface CloudProbeResult {
 }
 
 interface CloudSettings {
-  project: string;
-  zone: string;
-  template: string;
+  project?: string;
+  zone?: string;
+  template?: string;
   stateDir: string;
   worktreeDir: string;
   configuredVm?: string;
@@ -390,9 +388,9 @@ if (dirty) {
       ["commit-tree", treeRes.stdout, "-p", head, "-m", "rl cloud working tree snapshot"],
       {
         GIT_AUTHOR_NAME: "RL Cloud Snapshot",
-        GIT_AUTHOR_EMAIL: "rl-cloud@rosterlab.local",
+        GIT_AUTHOR_EMAIL: "rl-cloud@example.invalid",
         GIT_COMMITTER_NAME: "RL Cloud Snapshot",
-        GIT_COMMITTER_EMAIL: "rl-cloud@rosterlab.local",
+        GIT_COMMITTER_EMAIL: "rl-cloud@example.invalid",
       },
     );
     if (!commitRes.ok) throw new Error(commitRes.stderr || "Cannot create snapshot commit");
@@ -422,22 +420,36 @@ process.stdout.write(JSON.stringify({
 }) + "\n");
 `;
 
-function validateVmName(name: string): string {
-  if (!VM_NAME_PATTERN.test(name) || name.length > 63) {
+function validateHostName(name: string): string {
+  if (!HOST_NAME_PATTERN.test(name)) {
     throw new UsageError(
-      "Choose a valid VM name beginning with dev-, for example dev-example-rl",
+      "Choose a valid SSH host or VM name, for example dev-box or user@host",
     );
   }
   return name;
 }
 
-function validateProjectAndZone(project: string, zone: string): void {
+function validateGcpVmName(name: string): string {
+  if (!GCP_VM_PATTERN.test(name) || name.length > 63) {
+    throw new UsageError(
+      "Choose a valid Compute Engine VM name (lowercase letters, digits, hyphens; max 63 chars)",
+    );
+  }
+  return name;
+}
+
+function validateProjectId(project: string): string {
   if (!PROJECT_PATTERN.test(project)) {
     throw new UsageError(`Invalid Google Cloud project ID: ${project}`);
   }
+  return project;
+}
+
+function validateZoneName(zone: string): string {
   if (!ZONE_PATTERN.test(zone)) {
     throw new UsageError(`Invalid Google Cloud zone: ${zone}`);
   }
+  return zone;
 }
 
 function normalizeGitOriginIdentity(
@@ -479,20 +491,21 @@ function resolveCloudSettings(
     overrides.project ||
     process.env.RL_CLOUD_PROJECT ||
     config.cloudProject ||
-    DEFAULT_PROJECT;
+    undefined;
   const zone =
     overrides.zone ||
     process.env.RL_CLOUD_ZONE ||
     config.cloudZone ||
-    DEFAULT_ZONE;
+    undefined;
   const template =
-    process.env.RL_CLOUD_TEMPLATE || config.cloudTemplate || DEFAULT_TEMPLATE;
-  validateProjectAndZone(project, zone);
+    process.env.RL_CLOUD_TEMPLATE || config.cloudTemplate || undefined;
+  if (project) validateProjectId(project);
+  if (zone) validateZoneName(zone);
 
   const configuredVm =
     overrides.vm || process.env.RL_CLOUD_VM || config.cloudVm || undefined;
   if (configuredVm) {
-    validateVmName(configuredVm);
+    validateHostName(configuredVm);
   }
 
   return {
@@ -503,6 +516,24 @@ function resolveCloudSettings(
     worktreeDir: overrides.worktreeDir ?? envResolved.worktreeDir,
     configuredVm,
   };
+}
+
+function requireProject(settings: Pick<CloudSettings, "project">): string {
+  if (!settings.project) {
+    throw new RlError(
+      "No Google Cloud project configured. Set cloudProject in ~/.config/rl/config.toml or pass --project <id>.",
+    );
+  }
+  return validateProjectId(settings.project);
+}
+
+function requireZone(settings: Pick<CloudSettings, "zone">): string {
+  if (!settings.zone) {
+    throw new RlError(
+      "No Google Cloud zone configured. Set cloudZone in ~/.config/rl/config.toml or pass --zone <zone>.",
+    );
+  }
+  return validateZoneName(settings.zone);
 }
 
 function cloudStateFile(stateDir: string): string {
@@ -517,7 +548,7 @@ function readCloudState(stateDir: string): PersistedCloudState {
   try {
     const raw = readJson(file);
     const defaultVm =
-      typeof raw.defaultVm === "string" && VM_NAME_PATTERN.test(raw.defaultVm)
+      typeof raw.defaultVm === "string" && HOST_NAME_PATTERN.test(raw.defaultVm)
         ? raw.defaultVm
         : null;
     return { schemaVersion: 1, defaultVm };
@@ -527,7 +558,7 @@ function readCloudState(stateDir: string): PersistedCloudState {
 }
 
 async function saveDefaultVm(stateDir: string, vmName: string): Promise<void> {
-  validateVmName(vmName);
+  validateHostName(vmName);
   await locked(stateDir, ".cloud.lock", () => {
     writeJson(cloudStateFile(stateDir), {
       schemaVersion: 1,
@@ -536,16 +567,14 @@ async function saveDefaultVm(stateDir: string, vmName: string): Promise<void> {
   });
 }
 
-function gcloudFlags(settings: Pick<CloudSettings, "project">): string[] {
-  return [
-    `--project=${settings.project}`,
-    `--billing-project=${settings.project}`,
-  ];
+function gcloudFlags(project: string): string[] {
+  return [`--project=${project}`, `--billing-project=${project}`];
 }
 
 async function listCloudVms(
   settings: Pick<CloudSettings, "project">,
 ): Promise<CloudVm[]> {
+  const project = requireProject(settings);
   const gcloud = requireGcloudPath();
   const result = await execute(
     [
@@ -553,7 +582,7 @@ async function listCloudVms(
       "compute",
       "instances",
       "list",
-      ...gcloudFlags(settings),
+      ...gcloudFlags(project),
       "--format=json(name,zone,machineType,status,labels)",
     ],
     process.cwd(),
@@ -562,7 +591,7 @@ async function listCloudVms(
   if (result.code !== 0) {
     throw new RlError(
       result.stderr.trim() ||
-        "Failed to list cloud VMs. Check 'gcloud auth login YOUR_NAME@rosterlab.com'.",
+        "Failed to list cloud VMs. Verify your gcloud authentication ('gcloud auth login').",
     );
   }
   let parsed: unknown;
@@ -606,7 +635,10 @@ async function currentGcloudOwner(): Promise<string | null> {
   if (result.code !== 0) return null;
   const email = result.stdout.trim();
   if (!email.includes("@")) return null;
-  return email.split("@")[0]!.replaceAll(".", "-");
+  return email
+    .split("@")[0]!
+    .toLowerCase()
+    .replace(/[^a-z0-9_-]/g, "-");
 }
 
 async function resolveTargetVm(
@@ -614,17 +646,23 @@ async function resolveTargetVm(
   options: { allowPick?: boolean; requireRunning?: boolean } = {},
 ): Promise<string> {
   if (settings.configuredVm) {
-    return validateVmName(settings.configuredVm);
+    return validateHostName(settings.configuredVm);
   }
   const saved = readCloudState(settings.stateDir);
   if (saved.defaultVm) {
     return saved.defaultVm;
   }
 
+  if (!settings.project) {
+    throw new RlError(
+      "No cloud host configured. Run 'rl cloud use <ssh-host>', set cloudVm in ~/.config/rl/config.toml, or pass --vm <host>.",
+    );
+  }
+
   const vms = await listCloudVms(settings);
   if (vms.length === 0) {
     throw new RlError(
-      "No cloud VMs found. Create one with 'rl cloud create dev-<name>-rl'.",
+      "No cloud VMs found. Create one with 'rl cloud create <name>' or select an SSH host with 'rl cloud use <host>'.",
     );
   }
 
@@ -816,11 +854,18 @@ function sshConfigPaths(home = os.homedir()): {
   };
 }
 
-function hasManagedSshHost(vmName: string, home = os.homedir()): boolean {
+function hasSshHostEntry(vmName: string, home = os.homedir()): boolean {
   const { configFile } = sshConfigPaths(home);
   if (!fs.existsSync(configFile)) return false;
   const content = fs.readFileSync(configFile, "utf8");
-  return content.includes(`# >>> rl cloud ssh (${vmName}) >>>`);
+  if (content.includes(`# >>> rl cloud ssh (${vmName}) >>>`)) {
+    return true;
+  }
+  return content.split(/\r?\n/).some((line) => {
+    const trimmed = line.trim();
+    if (!trimmed.toLowerCase().startsWith("host ")) return false;
+    return trimmed.slice(5).trim().split(/\s+/).includes(vmName);
+  });
 }
 
 export function buildManagedSshBlock(params: {
@@ -911,7 +956,9 @@ async function configureSshForVm(
   block: string;
   wrote: boolean;
 }> {
-  validateVmName(vmName);
+  validateGcpVmName(vmName);
+  const project = requireProject(settings);
+  const zone = requireZone(settings);
   const gcloudPath = requireGcloudPath();
   const dryRun = await execute(
     [
@@ -919,8 +966,8 @@ async function configureSshForVm(
       "compute",
       "ssh",
       vmName,
-      ...gcloudFlags(settings),
-      `--zone=${settings.zone}`,
+      ...gcloudFlags(project),
+      `--zone=${zone}`,
       "--tunnel-through-iap",
       "--dry-run",
     ],
@@ -942,8 +989,8 @@ async function configureSshForVm(
   const block = buildManagedSshBlock({
     vm: vmName,
     isDefault,
-    project: settings.project,
-    zone: settings.zone,
+    project,
+    zone,
     gcloudPath,
     details,
   });
@@ -982,7 +1029,13 @@ async function ensureVmSshReady(
 ): Promise<void> {
   const { muxDir } = sshConfigPaths();
   fs.mkdirSync(muxDir, { recursive: true, mode: 0o700 });
-  if (!hasManagedSshHost(vmName)) {
+  if (
+    !hasSshHostEntry(vmName) &&
+    !vmName.includes("@") &&
+    settings.project &&
+    settings.zone &&
+    GCP_VM_PATTERN.test(vmName)
+  ) {
     await configureSshForVm(settings, vmName);
   }
 }
@@ -1016,6 +1069,9 @@ async function runSshCommand(
   });
   if (
     res.code === 255 &&
+    settings.project &&
+    settings.zone &&
+    GCP_VM_PATTERN.test(vmName) &&
     /REMOTE HOST IDENTIFICATION HAS CHANGED|Host key verification failed|Permission denied/i.test(
       res.stderr,
     )
@@ -2449,7 +2505,7 @@ export async function main(
     case "ssh-config": {
       arity(positionals, 0, 1);
       const vm = positionals[0]
-        ? validateVmName(positionals[0])
+        ? validateGcpVmName(positionals[0])
         : await resolveTargetVm(settings, { allowPick: true });
       const configured = await configureSshForVm(settings, vm, {
         dryRun: Boolean(values["dry-run"]),
@@ -2472,11 +2528,12 @@ export async function main(
 
     case "vms": {
       arity(positionals, 0);
+      const project = requireProject(settings);
       const vms = await listCloudVms(settings);
       const defaultVm =
         settings.configuredVm ?? readCloudState(settings.stateDir).defaultVm;
       if (values.json) {
-        json({ project: settings.project, defaultVm, vms });
+        json({ project, defaultVm, vms });
       } else {
         renderVmsTable(vms, defaultVm);
       }
@@ -2487,7 +2544,7 @@ export async function main(
       arity(positionals, 0, 1);
       let vmName = positionals[0];
       if (vmName) {
-        validateVmName(vmName);
+        validateHostName(vmName);
       } else {
         const vms = await listCloudVms(settings);
         if (vms.length === 0) {
@@ -2510,14 +2567,14 @@ export async function main(
         vmName = picked.items[0]!.name;
       }
       await saveDefaultVm(settings.stateDir, vmName);
-      console.log(`Default cloud VM: ${vmName}`);
+      console.log(`Default cloud host: ${vmName}`);
       return 0;
     }
 
     case "ssh": {
       arity(positionals, 0, 1);
       const vm = positionals[0]
-        ? validateVmName(positionals[0])
+        ? validateHostName(positionals[0])
         : await resolveTargetVm(settings, {
             allowPick: true,
             requireRunning: true,
@@ -2536,13 +2593,14 @@ export async function main(
       let vm: string;
       let portRaw: string | undefined;
       if (positionals.length === 2) {
-        vm = validateVmName(positionals[0]!);
+        vm = validateHostName(positionals[0]!);
         portRaw = positionals[1];
       } else if (
         positionals.length === 1 &&
-        VM_NAME_PATTERN.test(positionals[0]!)
+        !/^\d+$/.test(positionals[0]!) &&
+        HOST_NAME_PATTERN.test(positionals[0]!)
       ) {
-        vm = validateVmName(positionals[0]!);
+        vm = validateHostName(positionals[0]!);
         portRaw = undefined;
       } else {
         vm = await resolveTargetVm(settings, {
@@ -2588,7 +2646,9 @@ export async function main(
 
     case "create": {
       arity(positionals, 1, 2);
-      const vm = validateVmName(positionals[0]!);
+      const vm = validateGcpVmName(positionals[0]!);
+      const project = requireProject(settings);
+      const zone = requireZone(settings);
       const machineType = positionals[1] ?? DEFAULT_MACHINE_TYPE;
       if (!/^[a-z0-9-]+$/.test(machineType)) {
         throw new UsageError(`Invalid machine type: ${machineType}`);
@@ -2600,28 +2660,30 @@ export async function main(
         { timeoutMs: 10000 },
       );
       const account = accountRes.stdout.trim();
-      if (!/^[a-z0-9._-]+@rosterlab\.com$/.test(account)) {
-        throw new RlError(
-          "Sign in with your RosterLab Google identity: gcloud auth login YOUR_NAME@rosterlab.com",
-        );
+      if (!account || !account.includes("@")) {
+        throw new RlError("Sign in with Google Cloud first: gcloud auth login");
       }
-      const owner = account.split("@")[0]!.replaceAll(".", "-");
-      const res = await execute(
-        [
-          gcloud,
-          "compute",
-          "instances",
-          "create",
-          vm,
-          ...gcloudFlags(settings),
-          `--zone=${settings.zone}`,
-          `--source-instance-template=${settings.template}`,
-          `--machine-type=${machineType}`,
-          `--labels=environment=dev,owner=${owner}`,
-        ],
-        process.cwd(),
-        { interactive: true },
-      );
+      const owner = account
+        .split("@")[0]!
+        .toLowerCase()
+        .replace(/[^a-z0-9_-]/g, "-");
+      const createArgs = [
+        gcloud,
+        "compute",
+        "instances",
+        "create",
+        vm,
+        ...gcloudFlags(project),
+        `--zone=${zone}`,
+        ...(settings.template
+          ? [`--source-instance-template=${settings.template}`]
+          : []),
+        `--machine-type=${machineType}`,
+        `--labels=environment=dev,owner=${owner}`,
+      ];
+      const res = await execute(createArgs, process.cwd(), {
+        interactive: true,
+      });
       if (res.code === 0) {
         await saveDefaultVm(settings.stateDir, vm);
       }
@@ -2631,8 +2693,10 @@ export async function main(
     case "start":
     case "stop": {
       arity(positionals, 0, 1);
+      const project = requireProject(settings);
+      const zone = requireZone(settings);
       const vm = positionals[0]
-        ? validateVmName(positionals[0])
+        ? validateGcpVmName(positionals[0])
         : await resolveTargetVm(settings, { allowPick: true });
       const gcloud = requireGcloudPath();
       const res = await execute(
@@ -2642,8 +2706,8 @@ export async function main(
           "instances",
           sub,
           vm,
-          ...gcloudFlags(settings),
-          `--zone=${settings.zone}`,
+          ...gcloudFlags(project),
+          `--zone=${zone}`,
         ],
         process.cwd(),
         { interactive: true },
@@ -2653,7 +2717,9 @@ export async function main(
 
     case "delete": {
       arity(positionals, 1);
-      const vm = validateVmName(positionals[0]!);
+      const project = requireProject(settings);
+      const zone = requireZone(settings);
+      const vm = validateGcpVmName(positionals[0]!);
       const gcloud = requireGcloudPath();
       const res = await execute(
         [
@@ -2662,8 +2728,8 @@ export async function main(
           "instances",
           "delete",
           vm,
-          ...gcloudFlags(settings),
-          `--zone=${settings.zone}`,
+          ...gcloudFlags(project),
+          `--zone=${zone}`,
         ],
         process.cwd(),
         { interactive: true },

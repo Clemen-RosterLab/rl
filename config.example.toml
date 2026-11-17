@@ -8,3 +8,11 @@ defaultBase = "origin/test"
 # Optional registered repository alias; `rl --repo <alias>` overrides this.
 # Without it, RL selects by current worktree, then the `rl repo use` default.
 # repo = "frontend"
+
+# Optional cloud / remote SSH workspace settings (`rl cloud`).
+# `cloudVm` can be any SSH host or GCP VM name; GCP settings are only required
+# for GCP IAP VM lifecycle commands (`vms`, `start`, `stop`, `create`, `delete`).
+# cloudVm = "dev-box"
+# cloudProject = "my-cloud-project"
+# cloudZone = "us-central1-a"
+# cloudTemplate = "dev-vm-template"

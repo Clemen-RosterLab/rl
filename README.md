@@ -56,6 +56,7 @@ Use `rl help` or `rl <command> --help` for command options.
 
 - [Workflow configuration](docs/reference.md#session-driven-agent-workflows): roles, models, review rules, and execution levels.
 - [Full reference](docs/reference.md): setup, review controls, PRs, notes, and troubleshooting.
+- [Cloud configuration](docs/cloud.md): connect using your own private settings.
 - [Adding screenshots](docs/images/README.md): image locations and replacement instructions.
 
 ## Development
