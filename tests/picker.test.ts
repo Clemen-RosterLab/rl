@@ -72,6 +72,22 @@ test("offline pickers mark cached PR snapshots stale and do not invent absence",
   for (const name of names)
     assert.ok(fs.existsSync(path.join(w.root, "worktrees/example", name)));
 });
+test("opening a switched worktree preserves the original branch's instance", (t) => {
+  const w = new Workspace(t);
+  const root = w.managed("original");
+  const record = path.join(w.status(root).stateDirectory, "instance.json");
+  const before = fs.readFileSync(record, "utf8");
+  w.git(root, "switch", "-qc", "other-branch");
+  const captured = capture(w);
+  w.env.SELECT_NAME = "original";
+  assert.equal(w.rl([]).stdout.trim(), root);
+  assert.match(
+    readJson(captured).rows.find((row: string) => row.startsWith("original\t")),
+    /branch switched/,
+  );
+  assert.equal(fs.readFileSync(record, "utf8"), before);
+  assert.equal(w.git(root, "branch", "--show-current"), "other-branch");
+});
 test("picker decorated selection opens the exact nested workspace and deletion selects only that row", (t) => {
   const w = new Workspace(t),
     nested = w.managed("feature/nested"),

@@ -9,11 +9,13 @@ notes, and agent conversations together, then pick up where you left off.
 
 ```sh
 npm install --global rl-workspaces
+rl setup install
 ```
 
-Requires macOS or Linux and Node.js 22+. Global installation enables shell
-integration automatically for zsh or bash; open a new terminal afterward.
-Run `rl setup install` to install missing tools or repair shell setup.
+Requires macOS or Linux and Node.js 22+. The setup command installs missing tools
+and enables directory switching in zsh and bash. Open a new terminal afterward.
+Use `rl setup install --shell-only` to enable directory switching without
+installing tools.
 Install and authenticate your chosen agent CLI separately. For GitHub features,
 run `gh auth login`.
 
@@ -43,6 +45,7 @@ and review GitHub PRs without a checkout. Navigate with the keyboard or mouse.
 ```sh
 rl review
 rl review --pr https://github.com/owner/repo/pull/123
+rl review feature/login --base origin/main
 ```
 
 ## Agent workflows

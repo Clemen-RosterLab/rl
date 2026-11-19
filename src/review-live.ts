@@ -38,6 +38,7 @@ import {
   type ReviewFile,
   type Checkpoint,
   type Commit,
+  type BranchReview,
 } from "./review-live-engine.js";
 import { ReviewPreview } from "./review-live-preview.js";
 import {
@@ -140,6 +141,7 @@ class GitWorker {
     repository = root,
     remotePr?: number,
     private readonly onChange: () => void = () => {},
+    branch?: BranchReview,
   ) {
     // A separate process group lets Quit interrupt synchronous Git commands
     // and their descendants while leaving the terminal process running.
@@ -150,7 +152,9 @@ class GitWorker {
         repository,
         this.temporaryRoot,
         this.freezeId,
-        ...(remotePr ? [String(remotePr)] : []),
+        remotePr ? String(remotePr) : "",
+        branch?.ref ?? "",
+        branch?.base ?? "",
       ],
       {
         detached: true,
@@ -326,6 +330,7 @@ export interface LiveOptions {
   pr?: number;
   remoteInterval?: number;
   remote?: RemoteReviewTarget;
+  branch?: BranchReview;
 }
 const esc = "\x1b[";
 export function sourceLine(
@@ -359,53 +364,32 @@ export function sourceLine(
 }
 const help = [
   "KEYBOARD",
-  "1 / 2 / 3    Focus commits / files / diff",
-  "Tab / Shift-Tab    Cycle panels",
-  "Expanded: Tab / Shift-Tab or ] / [    Next / previous file",
-  "Drag preview text    Select text; y / Ctrl-c copies; Esc clears",
-  "Drag divider / - +    Resize sidebar; = restores default width",
-  "j k / Up Down    Move selection or scroll",
-  "Left Right    Panel focus; in diff: horizontal scroll",
-  "PgUp PgDn / Ctrl-u Ctrl-d    Page",
-  "Enter    Files, then diff; in diff: expand / restore",
-  "Click    Select a commit, file, panel or footer action",
-  "Space / checkbox / Shift-click    Toggle commits in the selection",
-  "Selected commits show their own patches, grouped by commit.",
-  "Wheel    Diff: three lines; commits: browse without changing selection",
-  "Scrollbar    Click to jump; hold and drag the thumb to scroll",
-  "Shift-Wheel    Scroll the diff horizontally",
-  "Home End    Start / end of selected diff",
-  "Esc    Back / close help or input",
-  "w    Live working tree (staged + unstaged + untracked)",
-  "p    Branch / PR merge-base comparison (committed)",
-  "r    Enter FROM TO revision range",
-  "s    Compare checkpoint to current source and index",
-  "m    Mark exact inspected target reviewed",
-  "f    Freeze / unfreeze snapshot",
-  "t    Toggle tests, styles and boilerplate (hidden by default)",
-  "T    Configure hidden categories; choices are saved for this worktree",
-  "v    Toggle file reviewed · u / U next / previous unreviewed",
-  "{ / }    Previous / next hunk · C expands diff context",
-  "c    Toggle full-file context · e switches before / after",
-  "b    Pick comparison base and target revisions",
-  "d    Toggle changes since this file was last viewed",
-  "L    Logic-first ordering · A explicit agent ranking",
-  "Ctrl-f    Cross-file search · Tab changes search scope",
-  "o    Open reviewed version · O open current worktree file",
-  "i    Draft inline GitHub comment (PR comparison only)",
-  "Click a preview line, or scroll it to the top, then press i.",
-  "D    Edit / delete saved local PR review drafts",
-  "R    Review summary and submit: Comment / Approve / Request changes",
-  "W    Live workflow: roles, blockers, criteria, validation and findings",
-  "Composer: Enter saves locally · Ctrl-j adds a newline · Esc cancels",
-  "/    Search file paths and selected diff",
-  "n / N    Next / previous match",
-  "Ctrl-r    Refresh local state and PR metadata",
-  "?    Toggle help",
-  "q / Ctrl-c    Quit",
+  "1 / 2 / 3        Focus Commits / Files / Diff",
+  "Tab / Shift-Tab  Switch panels (or next/prev file when expanded)",
+  "Up / Down, j / k Scroll diff (when Diff focused) or move list cursor",
+  "PgUp / PgDn      Page diff from any panel (also Ctrl-u / Ctrl-d, J / K)",
+  "Home / End       Jump to start / end of diff",
+  "[ / ]            Previous / next file",
+  "Enter / z        Expand or collapse full-width diff (in Commits: select commit)",
+  "Space / Click    Toggle commit selection · a selects all commits",
+  "Click a commit   Inspect that commit; click it again to show all changes",
+  "v                Mark file reviewed · u / U next / previous unreviewed",
+  "t / T            Show all files / configure hidden categories",
+  "/                Search files or diff · n / N next / previous match",
+  "Ctrl-f           Search across all files · Tab changes search scope",
+  "c / C / e        Full-file context / more diff context / before vs after",
+  "{ / }            Previous / next diff hunk",
+  "o / O            Open reviewed file / current worktree file in VS Code",
+  "w / p            Working tree changes / full branch or PR comparison",
+  "m / s / f        Save checkpoint / compare since checkpoint / freeze snapshot",
+  "i / D / R        PR inline comment / local drafts / submit GitHub review",
+  "Drag text        Select diff text · y or Ctrl-c copies · Esc clears",
+  "Drag divider     Resize sidebar (or - / +; = resets)",
+  "Ctrl-r           Refresh Git state and PR metadata",
+  "?                Toggle help",
+  "q / Ctrl-c       Quit",
   "",
   "Merges compare with their first parent. Initial commits use an empty tree.",
-  "Live refresh preserves selection and scroll. Freeze retains immutable trees.",
   "Git files remain read-only. Only explicit R submission writes to GitHub.",
 ];
 
@@ -421,6 +405,7 @@ export async function liveReview(options: LiveOptions): Promise<void> {
     options.repository,
     options.remote?.number,
     () => void refresh(),
+    options.branch,
   );
   const preview = new ReviewPreview(options.root);
   const remoteAbort = new AbortController();
@@ -430,10 +415,12 @@ export async function liveReview(options: LiveOptions): Promise<void> {
     frozen = false,
     newer = false,
     updates = 0;
-  let mode: Mode = options.remote
-    ? { kind: "branch", base: options.defaultBase }
-    : options.since
-      ? { kind: "range", from: options.since, to: "HEAD" }
+  const committedOnly = Boolean(options.remote || options.branch);
+  let preferBranchAll = committedOnly;
+  let mode: Mode = options.since
+    ? { kind: "range", from: options.since, to: "HEAD" }
+    : committedOnly
+      ? { kind: "branch", base: options.branch?.base ?? options.defaultBase }
       : { kind: "working" };
   let comparison: Comparison | undefined,
     allFiles: ReviewFile[] = [],
@@ -442,7 +429,7 @@ export async function liveReview(options: LiveOptions): Promise<void> {
     fileIndex = 0,
     commitIndex = 0,
     commitScroll = 0,
-    focus = 0,
+    focus = 2,
     scroll = 0,
     horizontal = 0,
     helpScroll = 0,
@@ -479,7 +466,6 @@ export async function liveReview(options: LiveOptions): Promise<void> {
     filterMenuIndex = 0,
     filterPreviousFocus = 0,
     prompt:
-      | "range"
       | "search"
       | "hidePaths"
       | "showPaths"
@@ -524,6 +510,7 @@ export async function liveReview(options: LiveOptions): Promise<void> {
       expandedDiff,
       sidebarWidth,
       lineNumbers && !helpOpen && !filterMenuOpen && !menu ? 12 : 0,
+      !committedOnly,
     );
   const height = () => geometry().viewport.height;
   let frame: ReviewFrame | undefined;
@@ -589,6 +576,7 @@ export async function liveReview(options: LiveOptions): Promise<void> {
     frame = reviewFrame({
       width,
       remoteOnly: Boolean(options.remote),
+      branchOnly: Boolean(options.branch),
       rows,
       focus,
       expanded: expandedDiff,
@@ -650,7 +638,9 @@ export async function liveReview(options: LiveOptions): Promise<void> {
             : undefined,
       branch: options.remote
         ? `${options.remote.repository} · PR #${options.pr}${pr ? " / " + pr.headRefName : ""}`
-        : (state?.snapshot.branch ?? path.basename(options.root)),
+        : options.branch
+          ? options.branch.ref.replace(/^refs\/(heads|remotes)\//, "")
+          : (state?.snapshot.branch ?? path.basename(options.root)),
       head: state?.snapshot.head ?? "",
       frozen,
       newer,
@@ -678,7 +668,7 @@ export async function liveReview(options: LiveOptions): Promise<void> {
         ? prompt === "comment" || prompt === "review-body"
           ? composerError ||
             "Enter Save draft · Ctrl-j Newline · Esc Cancel · R submits after saving"
-          : `${prompt === "range" ? "Range FROM TO" : prompt === "search" ? `Search files / diff [${searchScope}; Tab changes scope]` : prompt === "wheel" ? "Wheel lines (1–20)" : prompt === "hidePaths" ? "Hide paths (comma-separated globs)" : "Always show paths (comma-separated globs)"}: ${input}▏`
+          : `${prompt === "search" ? `Search files / diff [${searchScope}; Tab changes scope]` : prompt === "wheel" ? "Wheel lines (1–20)" : prompt === "hidePaths" ? "Hide paths (comma-separated globs)" : "Always show paths (comma-separated globs)"}: ${input}▏`
         : undefined,
       remote,
       pr: pr
@@ -732,22 +722,90 @@ export async function liveReview(options: LiveOptions): Promise<void> {
     }
     render();
   }
-  function selectCommit(index: number): void {
-    if (options.remote && index === 0) {
-      onKey("p", { name: "p" });
+  function minCommitIndex(): number {
+    return geometry().narrow && !committedOnly ? 0 : 1;
+  }
+  function ensureCommitCursor(): void {
+    const commits = timeline();
+    if (!commits.length) {
+      commitIndex = 0;
       return;
     }
+    const min = minCommitIndex();
+    commitIndex = Math.max(min, Math.min(commits.length, commitIndex || 1));
+  }
+  function defaultAllMode(): Mode {
+    if (committedOnly || pr || preferBranchAll) {
+      return {
+        kind: "branch",
+        base: pr?.baseRefOid ?? options.branch?.base ?? options.defaultBase,
+        ...(options.pr && pr ? { head: pr.headRefOid } : {}),
+      };
+    }
+    return { kind: "working" };
+  }
+  function currentSelectedShas(): Set<string> {
+    const commits = timeline();
+    if (mode.kind === "branch")
+      return new Set(commits.map((commit) => commit.sha));
+    if (mode.kind === "commits")
+      return new Set(mode.commits.map((commit) => commit.sha));
+    if (mode.kind === "commit") return new Set([mode.sha]);
+    return new Set();
+  }
+  function selectAllCommits(): void {
+    const commits = timeline();
+    if (!commits.length && committedOnly) return;
     rememberViewed();
     navigationVersion++;
     clearTextSelection();
     helpOpen = false;
     rememberPosition();
-    commitIndex = Math.max(0, Math.min(timeline().length, index));
-    mode = commitIndex
-      ? { kind: "commit", sha: timeline()[commitIndex - 1].sha }
-      : { kind: "working" };
+    if (!committedOnly && !pr && mode.kind === "working" && commits.length) {
+      preferBranchAll = true;
+    }
+    mode = defaultAllMode();
+    ensureCommitCursor();
     revealCommit();
     void compare();
+    render();
+  }
+  function selectCommit(index: number): void {
+    if (index === 0) {
+      if (committedOnly) {
+        selectAllCommits();
+        return;
+      }
+      preferBranchAll = false;
+      rememberViewed();
+      navigationVersion++;
+      clearTextSelection();
+      helpOpen = false;
+      rememberPosition();
+      commitIndex = 0;
+      mode = { kind: "working" };
+      revealCommit();
+      void compare();
+      return;
+    }
+    const commits = timeline();
+    const commit = commits[index - 1];
+    if (!commit) return;
+    rememberViewed();
+    navigationVersion++;
+    clearTextSelection();
+    helpOpen = false;
+    rememberPosition();
+    commitIndex = index;
+    const selected = currentSelectedShas();
+    const isSoleSelected =
+      mode.kind !== "branch" && selected.size === 1 && selected.has(commit.sha);
+    mode = isSoleSelected
+      ? defaultAllMode()
+      : { kind: "commit", sha: commit.sha };
+    revealCommit();
+    void compare();
+    render();
   }
   function toggleCommit(index: number): void {
     navigationVersion++;
@@ -759,28 +817,22 @@ export async function liveReview(options: LiveOptions): Promise<void> {
     helpOpen = false;
     rememberPosition();
     commitIndex = index;
-    const selection = new Set<string>();
-    if (mode.kind === "commits") {
-      for (const selected of mode.commits) selection.add(selected.sha);
-    } else if (mode.kind === "commit" && mode.sha !== commit.sha) {
-      selection.add(mode.sha);
-    }
+    const selection = currentSelectedShas();
     if (selection.has(commit.sha)) selection.delete(commit.sha);
     else selection.add(commit.sha);
-    mode = selection.size
-      ? {
-          kind: "commits",
-          commits: commits.filter((entry) => selection.has(entry.sha)),
-        }
-      : options.remote
-        ? {
-            kind: "branch",
-            base: pr?.baseRefOid ?? options.defaultBase,
-            head: pr?.headRefOid ?? state?.snapshot.head,
-          }
-        : { kind: "working" };
+    const allCommitsSelected =
+      commits.length > 0 &&
+      selection.size === commits.length &&
+      (committedOnly || Boolean(pr) || preferBranchAll);
+    mode =
+      selection.size === 0 || allCommitsSelected
+        ? defaultAllMode()
+        : {
+            kind: "commits",
+            commits: commits.filter((entry) => selection.has(entry.sha)),
+          };
     commitIndex = Math.max(
-      0,
+      1,
       timeline().findIndex((entry) => entry.sha === commit.sha) + 1,
     );
     revealCommit();
@@ -788,20 +840,20 @@ export async function liveReview(options: LiveOptions): Promise<void> {
     render();
   }
   function moveCommit(delta: number): void {
-    if (mode.kind === "commits") {
-      commitIndex = Math.max(
-        1,
-        Math.min(timeline().length, commitIndex + delta),
-      );
-      revealCommit();
-      render();
-    } else selectCommit(commitIndex + delta);
+    const commits = timeline();
+    const min = minCommitIndex();
+    if (!commits.length && min > 0) return;
+    commitIndex = Math.max(
+      min,
+      Math.min(commits.length, (commitIndex || min) + delta),
+    );
+    revealCommit();
+    render();
   }
   function scrollCommits(delta: number): void {
     const layout = geometry();
     const capacity = Math.max(1, Math.floor((layout.commits.height - 2) / 3));
-    const count =
-      timeline().length + (layout.narrow && !options.remote ? 1 : 0);
+    const count = timeline().length + (layout.narrow && !committedOnly ? 1 : 0);
     commitScroll = Math.max(
       0,
       Math.min(Math.max(0, count - capacity), commitScroll + delta),
@@ -813,7 +865,7 @@ export async function liveReview(options: LiveOptions): Promise<void> {
     const capacity = Math.max(1, Math.floor((layout.commits.height - 2) / 3));
     const row = Math.max(
       0,
-      commitIndex - (layout.narrow && !options.remote ? 0 : 1),
+      commitIndex - (layout.narrow && !committedOnly ? 0 : 1),
     );
     if (row < commitScroll) commitScroll = row;
     else if (row >= commitScroll + capacity) commitScroll = row - capacity + 1;
@@ -917,12 +969,12 @@ export async function liveReview(options: LiveOptions): Promise<void> {
     openMenu({
       kind: "base",
       title: "COMPARE · CHOOSE BASE",
-      subtitle: "Base → target · immutable revisions; r accepts typed refs",
+      subtitle: "Base → target · immutable revisions",
       index: 0,
       items: [
         {
-          label: options.remote
-            ? "Last reviewed → current PR HEAD"
+          label: committedOnly
+            ? "Last reviewed → current branch HEAD"
             : "Last reviewed → current working tree",
           detail: "Use your exact saved source and index checkpoint",
         },
@@ -1345,6 +1397,8 @@ export async function liveReview(options: LiveOptions): Promise<void> {
         if (hit.action === "toggle-commit" || event.button & 4)
           toggleCommit(hit.index);
         else selectCommit(hit.index);
+      } else {
+        ensureCommitCursor();
       }
       render();
       return;
@@ -1533,6 +1587,7 @@ export async function liveReview(options: LiveOptions): Promise<void> {
           updates++;
           if (branchChanged) {
             workflowSnapshot = undefined;
+            preferBranchAll = false;
             mode = { kind: "working" };
             commitIndex = 0;
             status =
@@ -1542,6 +1597,7 @@ export async function liveReview(options: LiveOptions): Promise<void> {
               0,
               timeline().findIndex((c) => c.sha === sha) + 1,
             );
+          if (focus === 0) ensureCommitCursor();
           await compare();
         }
       }
@@ -1604,7 +1660,7 @@ export async function liveReview(options: LiveOptions): Promise<void> {
       await patch();
       status = frozen
         ? "Frozen snapshot · background detection continues"
-        : `Updated · ${files.length} file layers${rankStale ? " · ranking stale: L refreshes" : ""} · f freezes the inspected snapshot`;
+        : `Updated · ${files.length} ${files.length === 1 ? "file" : "files"}${rankStale ? " · ranking stale: L refreshes" : ""}`;
     } catch (cause) {
       if (version === compareVersion) {
         preview.cancel();
@@ -1706,7 +1762,7 @@ export async function liveReview(options: LiveOptions): Promise<void> {
   }
   let remoteBusy = false;
   async function discover(): Promise<void> {
-    if (remoteBusy || stopped) return;
+    if (remoteBusy || stopped || options.branch) return;
     remoteBusy = true;
     const navigation = navigationVersion;
     try {
@@ -1756,11 +1812,13 @@ export async function liveReview(options: LiveOptions): Promise<void> {
             timeline().findIndex((c) => c.sha === selectedSha) + 1,
           );
         if (followBranch && navigation === navigationVersion && !frozen) {
+          preferBranchAll = true;
           mode = {
             kind: "branch",
             base: result.baseRefOid,
             head: result.headRefOid,
           };
+          if (focus === 0) ensureCommitCursor();
           if (!options.remote) void compare();
         }
       }
@@ -1785,25 +1843,38 @@ export async function liveReview(options: LiveOptions): Promise<void> {
     if (!search) return;
     helpOpen = false;
     if (focus !== 1) focus = 2;
+    let found = false;
     if (focus === 1) {
-      for (let n = 1; n <= files.length; n++) {
-        const i = (fileIndex + direction * n + files.length) % files.length;
-        if (files[i].path.toLowerCase().includes(search.toLowerCase())) {
-          selectFile(i);
-          break;
+      if (files.length) {
+        for (let n = 1; n <= files.length; n++) {
+          const i =
+            (((fileIndex + direction * n) % files.length) + files.length) %
+            files.length;
+          if (files[i].path.toLowerCase().includes(search.toLowerCase())) {
+            selectFile(i);
+            found = true;
+            break;
+          }
         }
       }
     } else {
       const content = displayedLines();
-      for (let n = 1; n <= content.length; n++) {
-        const i = (scroll + direction * n + content.length) % content.length;
-        if (content[i].toLowerCase().includes(search.toLowerCase())) {
-          scroll = i;
-          break;
+      if (content.length) {
+        for (let n = 1; n <= content.length; n++) {
+          const i =
+            (((scroll + direction * n) % content.length) + content.length) %
+            content.length;
+          if (content[i].toLowerCase().includes(search.toLowerCase())) {
+            scroll = Math.min(i, scrollLimit(content.length, height()));
+            rememberPosition();
+            found = true;
+            break;
+          }
         }
       }
     }
-    render();
+    if (!found) setStatus(`No match for "${search}"`);
+    else render();
   }
   async function mark(): Promise<void> {
     if (textSelection && textSelection.lines !== lines)
@@ -1859,9 +1930,9 @@ export async function liveReview(options: LiveOptions): Promise<void> {
   let workflowSnapshot: WorkflowReviewState | undefined;
   async function showWorkflow(poll = false): Promise<void> {
     if (workflowBusy || stopped) return;
-    if (options.remote) {
+    if (committedOnly) {
       setStatus(
-        "Remote-only review has no local workflow records · open its local worktree to inspect agent evidence",
+        "Committed review has no local workflow records · open its local worktree to inspect agent evidence",
       );
       return;
     }
@@ -2665,21 +2736,7 @@ export async function liveReview(options: LiveOptions): Promise<void> {
         const kind = prompt;
         prompt = undefined;
         input = "";
-        if (kind === "range") {
-          const refs = value.trim().split(/\s+/);
-          if (refs.length !== 2)
-            setStatus(
-              "Enter exactly two revisions: FROM TO (e.g. HEAD~3 HEAD)",
-            );
-          else {
-            navigationVersion++;
-            rememberViewed();
-            clearTextSelection();
-            mode = { kind: "range", from: refs[0], to: refs[1] };
-            rememberPosition();
-            void compare();
-          }
-        } else if (kind === "search") {
+        if (kind === "search") {
           search = value;
           if (searchScope === "changes" || searchScope === "files")
             void searchAcrossFiles(value).catch(error);
@@ -2708,7 +2765,7 @@ export async function liveReview(options: LiveOptions): Promise<void> {
       render();
       return;
     }
-    if (text === "q") {
+    if (text === "q" || text === "Q") {
       finish();
       return;
     }
@@ -2817,7 +2874,10 @@ export async function liveReview(options: LiveOptions): Promise<void> {
         expandedDiff = false;
       } else if (search) {
         search = "";
-      } else focus = Math.max(0, focus - 1);
+      } else {
+        focus = Math.max(0, focus - 1);
+        if (focus === 0) ensureCommitCursor();
+      }
       render();
       return;
     }
@@ -2963,10 +3023,14 @@ export async function liveReview(options: LiveOptions): Promise<void> {
       void patch();
       return;
     }
-    if (text === "r" && !keypress.ctrl) {
-      prompt = "range";
-      input = "";
+    if (text === "z" && !keypress.ctrl && !keypress.meta) {
+      expandedDiff = !expandedDiff;
+      if (expandedDiff) focus = 2;
       render();
+      return;
+    }
+    if (text === "a" && !keypress.ctrl && !keypress.meta) {
+      selectAllCommits();
       return;
     }
     if (text === "t" && !keypress.ctrl && !keypress.meta) {
@@ -3019,12 +3083,13 @@ export async function liveReview(options: LiveOptions): Promise<void> {
       return;
     }
     if (text === "w") {
-      if (options.remote) {
+      if (committedOnly) {
         setStatus(
-          "Remote PR review has no working tree · p shows the PR · o opens a captured file",
+          "Committed review has no working tree · p shows the branch · o opens a captured file",
         );
         return;
       }
+      preferBranchAll = false;
       navigationVersion++;
       rememberViewed();
       clearTextSelection();
@@ -3035,14 +3100,16 @@ export async function liveReview(options: LiveOptions): Promise<void> {
       return;
     }
     if (text === "p") {
+      preferBranchAll = true;
       navigationVersion++;
       rememberViewed();
       clearTextSelection();
       mode = {
         kind: "branch",
-        base: pr?.baseRefOid ?? options.defaultBase,
+        base: pr?.baseRefOid ?? options.branch?.base ?? options.defaultBase,
         ...(options.pr && pr ? { head: pr.headRefOid } : {}),
       };
+      if (focus === 0) ensureCommitCursor();
       rememberPosition();
       void compare();
       return;
@@ -3079,6 +3146,12 @@ export async function liveReview(options: LiveOptions): Promise<void> {
       return;
     }
     if (text === "o" || text === "O") {
+      if (text === "O" && committedOnly) {
+        setStatus(
+          "Committed review has no checkout · use o to open the captured Git version",
+        );
+        return;
+      }
       const file = textSelection ? selectionSource : loadedFile;
       if (!file) return;
       if (patchBusy || compareBusy) {
@@ -3108,16 +3181,10 @@ export async function liveReview(options: LiveOptions): Promise<void> {
         editor.unref();
       };
       if (text === "O")
-        if (options.remote) {
-          setStatus(
-            "Remote PR review has no checkout · use o to open the captured Git version",
-          );
-          return;
-        } else
-          void git
-            .request("identity")
-            .then(() => open(path.join(options.root, file.path)))
-            .catch(error);
+        void git
+          .request("identity")
+          .then(() => open(path.join(options.root, file.path)))
+          .catch(error);
       else
         void git
           .request<string>("editor", {
@@ -3136,6 +3203,7 @@ export async function liveReview(options: LiveOptions): Promise<void> {
     }
     if (["1", "2", "3"].includes(text)) {
       focus = Number(text) - 1;
+      if (focus === 0) ensureCommitCursor();
       if (focus !== 2) expandedDiff = false;
       render();
       return;
@@ -3147,6 +3215,7 @@ export async function liveReview(options: LiveOptions): Promise<void> {
         return;
       }
       focus = (focus + (keypress.shift ? 2 : 1)) % 3;
+      if (focus === 0) ensureCommitCursor();
       if (focus !== 2) expandedDiff = false;
       render();
       return;
@@ -3182,41 +3251,53 @@ export async function liveReview(options: LiveOptions): Promise<void> {
       return;
     }
     if (name === "return") {
-      if (focus === 2) expandedDiff = !expandedDiff;
-      else focus = Math.min(2, focus + 1);
+      if (focus === 0) {
+        selectCommit(commitIndex || 1);
+        return;
+      }
+      if (focus === 1) focus = 2;
+      else expandedDiff = !expandedDiff;
       render();
       return;
     }
     if (name === "left" || name === "right") {
       if (focus === 2)
         horizontal = Math.max(0, horizontal + (name === "left" ? -2 : 2));
-      else focus = Math.max(0, Math.min(2, focus + (name === "left" ? -1 : 1)));
+      else {
+        focus = Math.max(0, Math.min(2, focus + (name === "left" ? -1 : 1)));
+        if (focus === 0) ensureCommitCursor();
+      }
       rememberPosition();
       render();
       return;
     }
-    if (focus === 2 && (name === "home" || name === "end")) {
+    if (name === "home" || name === "end") {
       scrollDiff(name === "home" ? -Infinity : Infinity);
       return;
     }
-    const direction =
-      name === "down" ||
-      text === "j" ||
+    if (
       name === "pagedown" ||
-      (keypress.ctrl && name === "d")
+      name === "pageup" ||
+      (keypress.ctrl && (name === "d" || name === "u"))
+    ) {
+      const dir = name === "pagedown" || name === "d" ? 1 : -1;
+      scrollDiff(dir * Math.max(1, height() - 2));
+      return;
+    }
+    if ((text === "J" || text === "K") && !keypress.ctrl && !keypress.meta) {
+      scrollDiff(text === "J" ? 1 : -1);
+      return;
+    }
+    const direction =
+      name === "down" || text === "j"
         ? 1
-        : name === "up" ||
-            text === "k" ||
-            name === "pageup" ||
-            (keypress.ctrl && name === "u")
+        : name === "up" || text === "k"
           ? -1
           : 0;
-    const amount =
-      name?.startsWith("page") || keypress.ctrl ? Math.max(1, height() - 2) : 1;
     if (direction) {
-      if (focus === 0 && state) moveCommit(direction * amount);
-      else if (focus === 1) selectFile(fileIndex + direction * amount);
-      else scrollDiff(direction * amount);
+      if (focus === 0 && state) moveCommit(direction);
+      else if (focus === 1) selectFile(fileIndex + direction);
+      else scrollDiff(direction);
       render();
     }
   }

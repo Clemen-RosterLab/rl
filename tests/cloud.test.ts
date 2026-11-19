@@ -4,7 +4,28 @@ import fs from "node:fs";
 import path from "node:path";
 import { CLI, Workspace, read, readJson, write } from "./helpers.js";
 
-test("end-to-end SSH workspace listing, creation, checkout and uncommitted review", (t) => {
+test("end-to-end SSH workspace listing, creation, checkout and uncommitted review", async (t) => {
+  t.after(() => {
+    const jobDirectory = path.join(
+      w.root,
+      "cloud-home/.rl/instances/cloud-jobs",
+    );
+    if (!fs.existsSync(jobDirectory)) return;
+    for (const id of fs.readdirSync(jobDirectory)) {
+      if (!/^[a-f\d-]{36}$/.test(id)) continue;
+      try {
+        const job = readJson(path.join(jobDirectory, id, "job.json"));
+        if (
+          Number.isInteger(job.pid) &&
+          job.pid > 0 &&
+          ["starting", "running"].includes(job.status)
+        )
+          process.kill(-job.pid, "SIGKILL");
+      } catch {
+        /* Test-owned process already exited. */
+      }
+    }
+  });
   const w = new Workspace(t);
   const localHome = path.join(w.root, "local-home");
   const cloudHome = path.join(w.root, "cloud-home");
@@ -307,6 +328,222 @@ fs.appendFileSync(process.env.CODE_CALL_LOG, JSON.stringify(process.argv.slice(2
     /not registered/,
   );
   w.rl(["cloud", "code", "webapp/feature/new-work"]);
+  // Cloud switch shares creation, then either opens interactively or starts a
+  // supervised job with all terminal descriptors detached from SSH.
+  const agentCalls = path.join(w.root, "cloud-agent-calls.jsonl");
+  const release = path.join(w.root, "release-agent");
+  w.env.CLOUD_AGENT_CALLS = agentCalls;
+  w.env.CLOUD_AGENT_RELEASE = release;
+  w.env.CLOUD_AGENT_MODE = "hold";
+  w.stub(
+    "agy",
+    String.raw`
+const fs = require('node:fs');
+fs.appendFileSync(process.env.CLOUD_AGENT_CALLS, JSON.stringify({argv: process.argv.slice(2), cwd: process.cwd(), pid: process.pid}) + '\n');
+if (process.env.CLOUD_AGENT_MODE === 'fail') { setInterval(() => { if (fs.existsSync(process.env.CLOUD_AGENT_RELEASE + '.fail')) { console.error('Authentication failed'); process.exit(7); } }, 50); }
+if (process.env.CLOUD_AGENT_MODE === 'hold') {
+  setInterval(() => { if (fs.existsSync(process.env.CLOUD_AGENT_RELEASE)) { console.log('Task finished'); process.exit(0); } }, 50);
+}
+`,
+  );
+  const prompt =
+    "  exact 'quoted' \"text\" $HOME $(touch should-not-exist) `pwd`\\\nsecond line\n\n";
+  const job = JSON.parse(
+    w.rl([
+      "cloud",
+      "switch",
+      "-c",
+      "prompt-work",
+      "--repo",
+      "webapp",
+      "--base",
+      "develop",
+      "--no-fetch",
+      "--host",
+      "dev-vm-1",
+      "-p",
+      prompt,
+      "--json",
+    ]).stdout,
+  );
+  assert.equal(job.host, "dev-vm-1");
+  assert.equal(job.status, "running");
+  assert.equal(job.agent, "agy");
+  assert.equal(job.model, undefined);
+  assert.match(
+    job.resume,
+    /\/bin\/rl['"]? cloud open .* --agent agy --resume$/,
+  );
+  const waitFor = async (predicate: () => boolean) => {
+    const deadline = Date.now() + 15000;
+    while (!predicate()) {
+      assert.ok(
+        Date.now() < deadline,
+        "Timed out waiting for detached cloud job",
+      );
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+  };
+  await waitFor(() => fs.existsSync(agentCalls));
+  const first = read(agentCalls)
+    .trim()
+    .split("\n")
+    .map((line) => JSON.parse(line))[0];
+  assert.deepEqual(first.argv, ["--print", prompt]);
+  assert.equal(first.cwd, job.workspace);
+  assert.ok(!fs.existsSync(path.join(job.workspace, "should-not-exist")));
+  assert.ok(
+    !read(sshLog).includes("touch should-not-exist"),
+    "Prompt must travel on stdin, not in SSH command text",
+  );
+  assert.equal(w.git(job.workspace, "branch", "--show-current"), "prompt-work");
+  assert.equal(
+    JSON.parse(
+      w.command(["/bin/sh", "-c", `rl() { return 91; }; ${job.inspect} --json`])
+        .stdout,
+    ).status,
+    "running",
+  );
+  assert.match(
+    w.rl(["cloud", "switch", "prompt-work", "-p", "overlap"], { ok: false })
+      .stderr,
+    /already has a job lock/,
+  );
+  assert.match(
+    w.rl(["cloud", "switch", "prompt", "-p", "no fuzzy match"], { ok: false })
+      .stderr,
+    /not found/,
+  );
+  assert.match(
+    w.rl(["cloud", "switch", "missing-workspace", "-p", "missing"], {
+      ok: false,
+    }).stderr,
+    /not found/,
+  );
+  assert.match(
+    w.rl(
+      ["cloud", "switch", "-c", "prompt-work", "--no-fetch", "-p", "duplicate"],
+      { ok: false },
+    ).stderr,
+    /already/,
+  );
+  write(release, "continue");
+  const jobFile = path.join(path.dirname(job.log), "job.json");
+  await waitFor(() => readJson(jobFile).status === "completed");
+  assert.equal(readJson(jobFile).exitCode, 0);
+  assert.match(read(job.log), /Task finished/);
+  assert.ok(!fs.existsSync(job.lock));
+
+  // Model flags go through each existing native adapter; no permission flags
+  // or authentication overrides are injected by the cloud launcher.
+  w.env.CLOUD_AGENT_MODE = "finish";
+  for (const agent of ["agy", "codex", "claude", "opencode"]) {
+    const result = JSON.parse(
+      w.rl([
+        "cloud",
+        "switch",
+        "prompt-work",
+        "--repo",
+        "webapp",
+        "--agent",
+        agent,
+        "--model",
+        "MODEL ' $name",
+        "--prompt",
+        prompt,
+        "--json",
+      ]).stdout,
+    );
+    const file = path.join(path.dirname(result.log), "job.json");
+    await waitFor(() => readJson(file).status === "completed");
+    const calls =
+      agent === "agy"
+        ? read(agentCalls)
+            .trim()
+            .split("\n")
+            .map((line) => JSON.parse(line))
+        : w.calls();
+    const argv = calls.at(-1).argv;
+    assert.equal(argv[argv.indexOf("--model") + 1], "MODEL ' $name");
+    assert.equal(argv.at(-1), prompt);
+    assert.equal(calls.at(-1).cwd, job.workspace);
+    assert.ok(!argv.some((arg: string) => /bypass|dangerously|yolo/.test(arg)));
+  }
+  // Both creation spellings share prompt support.
+  const alias = JSON.parse(
+    w.rl([
+      "cloud",
+      "create",
+      "alias-job",
+      "--base",
+      "develop",
+      "--no-fetch",
+      "-p",
+      "alias prompt",
+      "--json",
+    ]).stdout,
+  );
+  await waitFor(
+    () =>
+      readJson(path.join(path.dirname(alias.log), "job.json")).status ===
+      "completed",
+  );
+  // Without a prompt, keep the interactive SSH agent-open path.
+  w.rl([
+    "cloud",
+    "switch",
+    "-c",
+    "interactive-work",
+    "--base",
+    "develop",
+    "--no-fetch",
+    "-a",
+    "codex",
+    "-m",
+    "native-model",
+  ]);
+  assert.deepEqual(w.calls().at(-1).argv.slice(1), ["--model", "native-model"]);
+  w.rl(["cloud", "switch", "interactive-work", "--code"]);
+  assert.match(read(codeLog), /interactive-work/);
+  w.rl([
+    "cloud",
+    "create",
+    "alias-interactive",
+    "--base",
+    "develop",
+    "--no-fetch",
+    "-a",
+    "codex",
+    "-m",
+    "alias-model",
+  ]);
+  assert.deepEqual(w.calls().at(-1).argv.slice(1), ["--model", "alias-model"]);
+
+  w.env.CLOUD_AGENT_MODE = "fail";
+  const failed = JSON.parse(
+    w.rl(["cloud", "switch", "prompt-work", "-p", "failing task", "--json"])
+      .stdout,
+  );
+  const failedFile = path.join(path.dirname(failed.log), "job.json");
+  write(release + ".fail", "fail now");
+  await waitFor(() => readJson(failedFile).status === "failed");
+  const failure = readJson(failedFile);
+  assert.match(read(failure.log), /Authentication failed/);
+  const reported = JSON.parse(
+    w.rl(["cloud", "job", failure.id, "--json"], { ok: false }).stdout,
+  );
+  assert.equal(reported.status, "failed");
+  assert.equal(reported.exitCode, 7);
+  assert.ok(!fs.existsSync(failure.lock));
+  for (const args of [
+    ["-p", ""],
+    ["-p", "x", "-a", "missing-agent"],
+    ["-m", "model"],
+    ["--base", "develop"],
+    ["-p", "x", "--resume"],
+    ["-p", "x", "--code"],
+  ])
+    w.rl(["cloud", "switch", "prompt-work", ...args], { ok: false });
   assert.equal(w.git(w.repo, "rev-parse", "HEAD"), localHead);
   assert.equal(w.git(w.repo, "status", "--porcelain"), localStatus);
   assert.equal(

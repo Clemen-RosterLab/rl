@@ -125,9 +125,10 @@ const topics: Record<string, Topic> = {
     group: "Code and reviews",
     description:
       "Live Git/PR review in the current terminal, plus saved snapshots",
-    usage: "rl review [worktree] [action] [options]",
+    usage: "rl review [branch|worktree] [action] [options]",
     options: [
       "--all                     Choose a worktree from the review queue",
+      "--branch <name>           Review a local or remote-tracking branch without checkout",
       "--cloud                   Review a workspace on the cloud dev VM over SSH",
       "--pr <number|URL>         Review a remote GitHub PR without a checkout",
       "--github-repo <owner/repo> Select a remote repository (optional HOST/ prefix)",
@@ -136,7 +137,7 @@ const topics: Record<string, Topic> = {
       "--remote-interval <sec>   PR polling interval (default 60; minimum 10)",
       "--summary                 AI implementation summary (manual fallback if unavailable)",
       "--diff                    Complete feature diff against the fixed baseline",
-      "--base <ref>              Explicitly pin a legacy baseline (merge-base with HEAD)",
+      "--base <ref>              Branch comparison target; pin baseline for legacy worktree actions",
       "--checkpoint              Save an inspected source/index checkpoint",
       "--checkpoints             List saved checkpoints",
       "--since-last-review       Compare with the latest checkpoint",
@@ -159,6 +160,7 @@ const topics: Record<string, Topic> = {
     ],
     notes: [
       "Default: live commits/files/diff for the current worktree. 1/2/3 focus; Tab cycles; j/k navigate; w working; p branch; r range; f freeze; m mark; s since; / search; o VS Code; ? help; q quit.",
+      "A branch without an RL workspace shows committed changes from its merge-base with the configured default base (override with --base). Existing workspace names keep working-tree behavior; --branch explicitly chooses committed review. Remote-tracking branches use locally fetched refs; no automatic fetch or checkout.",
       "Local review watches source, HEAD and index. --pr uses an isolated bare Git cache and remote polling; no checkout is created. m/s retain exact reviewed revisions.",
       "In PR mode: i drafts an inline comment, D manages local drafts, and R submits a GitHub review after confirmation. Git files remain read-only.",
       "W opens live local workflow roles, blockers, criteria, check receipts and findings. Select a finding to open its diff or prepare a GitHub comment draft.",
@@ -170,6 +172,8 @@ const topics: Record<string, Topic> = {
     ],
     examples: [
       "rl review",
+      "rl review feature/login",
+      "rl review origin/feature/login --base origin/main",
       "rl review feature/login --base origin/test",
       "rl review feature/login --diff",
       "rl review feature/login --checkpoint",
@@ -873,9 +877,10 @@ const topics: Record<string, Topic> = {
   },
   "setup install": {
     description: "Complete or repair RL installation and shell integration",
-    usage: "rl setup install [--shell zsh|bash]",
+    usage: "rl setup install [--shell-only] [--shell zsh|bash]",
     notes: [
       "Installs missing Git, zsh, fzf and gh, then registers zsh and bash shell integration in your startup files.",
+      "Pass --shell-only to configure shell integration without installing tools.",
       "Pass --shell zsh or --shell bash to configure only one shell.",
       "Preserves your settings and updates one RL-owned block per file. New terminals load RL automatically; reload the installing terminal once.",
       "Run once after npm install --global rl-workspaces, or again at any time to repair setup.",
@@ -907,6 +912,9 @@ const topics: Record<string, Topic> = {
       "rl cloud list",
       "rl cloud review",
       "rl cloud checkout feature/login",
+      'rl cloud switch -c "blah" -p "My prompt"',
+      'rl cloud switch -c "blah" -a agy -m "MODEL_NAME" -p "My prompt"',
+      'rl cloud switch "blah"',
       "rl cloud create feature/login --repo frontend",
     ],
     related: ["list", "review"],
@@ -915,6 +923,41 @@ const topics: Record<string, Topic> = {
     description: "Pick or enter a cloud repository or workspace",
     usage:
       "rl cloud [open] [selector] [--host <name>] [--code] [--agent codex|claude|agy|opencode] [--resume]",
+  },
+  "cloud switch": {
+    description:
+      "Open a remote workspace, or create one and launch a detached agent",
+    usage:
+      "rl cloud switch [-c] <workspace> [-p <prompt>] [-a <agent>] [-m <model>] [options]",
+    options: [
+      "-c, --create          Create a Git branch and worktree on the existing host",
+      "-p, --prompt <text>   Launch a detached background job (default agent: agy)",
+      "-a, --agent <name>    agy, codex, claude or opencode",
+      "-m, --model <name>    Native model override; omitted preserves agent configuration",
+      "--host <host>        Existing SSH host",
+      "--repo <name>        Remote repository; disambiguates existing workspace names",
+      "--base <ref>         Starting revision when creating",
+      "--no-fetch           Create using cached refs",
+      "--setup              Run normal workspace setup when creating",
+      "--code / --resume    Existing interactive open actions (without --prompt)",
+      "--json               Print detached job details as JSON",
+    ],
+    notes: [
+      "Without --create, the workspace must already exist; names match exactly.",
+      "Without --prompt, enters the workspace interactively over SSH. With --prompt, returns after launch confirmation; the job survives SSH disconnects.",
+      "One detached job per workspace. Launch confirmation does not mean task success; inspect its exit status and log with rl cloud job <id>.",
+      "Uses existing SSH authentication and native agent permission settings; no bypass flags are added.",
+    ],
+  },
+  "cloud job": {
+    description:
+      "Inspect a detached agent job's status, exit code and log location",
+    usage: "rl cloud job <id> [--host <host>] [--json]",
+    notes: [
+      "Prints log-following and conversation-resume commands. Resume after the job stops and its normal agent hooks have recorded a conversation.",
+      "Failed/interrupted jobs return nonzero. A completed job means the agent process exited successfully; review its output to verify the work.",
+      "After an unreported supervisor crash, the workspace lock stays in place. Inspect remote processes before removing that job's lock directory manually.",
+    ],
   },
   "cloud repos": {
     description: "List repositories on the SSH host",
@@ -951,11 +994,12 @@ const topics: Record<string, Topic> = {
   "cloud create": {
     description: "Create a workspace on an existing SSH host",
     usage:
-      "rl cloud create <name> [--repo <remote-repository>] [--host <host>] [--base <ref>] [--no-fetch]",
+      "rl cloud create <name> [--repo <remote-repository>] [--host <host>] [--base <ref>] [--no-fetch] [-p <prompt>] [-a <agent>] [-m <model>]",
     notes: [
       "Requires rl and a registered repository on the server. Uses its default repository, or asks you to select one.",
       "Creates a Git worktree and branch using the server's normal rl workflow, and prints its path. Use rl cloud open to enter it.",
       "--repo selects a remote repository; it does not use your locally selected repository.",
+      "Compatibility alias for the same creation flow as cloud switch --create. With --prompt it launches the same detached job. By default it prints the created path; explicit --agent, --code or --resume opens it afterward.",
     ],
     examples: [
       "rl cloud create feature/login --repo frontend",

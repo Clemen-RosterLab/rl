@@ -344,6 +344,140 @@ test(
   },
 );
 
+test("branch arguments review local and fetched remote refs without touching a checkout", (t) => {
+  const w = new Workspace(t);
+  write(path.join(w.a, "branch.txt"), "branch content\n");
+  w.git(w.a, "add", "branch.txt");
+  w.git(w.a, "commit", "-qm", "Branch change");
+  const head = w.git(w.a, "rev-parse", "HEAD");
+  w.git(w.repo, "branch", "review/topic", head);
+  w.git(w.repo, "update-ref", "refs/remotes/origin/review/topic", head);
+  write(path.join(w.a, "dirty.txt"), "exclude this worktree\n");
+  write(path.join(w.b, "other.txt"), "exclude current worktree\n");
+  const before = [w.repo, w.a, w.b].map((root) => [
+    w.git(root, "rev-parse", "HEAD"),
+    w.git(root, "status", "--porcelain"),
+  ]);
+  for (const selector of [
+    "review/topic",
+    "origin/review/topic",
+    "feature/a",
+    "refs/heads/review/topic",
+  ]) {
+    const result = JSON.parse(
+      w.rl(
+        [
+          "review",
+          ...(selector === "feature/a" ? ["--branch", selector] : [selector]),
+          "--base",
+          "develop",
+          "--json",
+        ],
+        { cwd: w.b },
+      ).stdout,
+    );
+    assert.equal(result.snapshot.head, head);
+    assert.equal(result.comparison.target, head);
+    assert.deepEqual(
+      result.files.map((file: any) => file.path),
+      ["branch.txt"],
+    );
+    assert.equal(result.commits[0].sha, head);
+  }
+  const range = JSON.parse(
+    w.rl(
+      [
+        "review",
+        "--branch",
+        "review/topic",
+        "--since",
+        "HEAD~1",
+        "--default-base",
+        "develop",
+        "--json",
+      ],
+      { cwd: w.b },
+    ).stdout,
+  );
+  assert.equal(range.comparison.target, head);
+  const branchRepository = new engine.LiveRepository(w.repo, w.repo, {
+    branch: { ref: "refs/heads/review/topic", base: "develop" },
+  });
+  const branchState = branchRepository.refresh();
+  const baseTree = w.git(w.repo, "rev-parse", "develop^{tree}");
+  const since = branchRepository.comparison(
+    {
+      kind: "since",
+      checkpoint: {
+        branch: branchState.snapshot.branch,
+        head: w.git(w.repo, "rev-parse", "develop"),
+        tree: baseTree,
+        index: baseTree,
+        label: "base",
+      },
+    },
+    branchState,
+  );
+  assert.equal(since.target, head);
+  assert.match(since.label, /branch HEAD/);
+  assert.equal(branchRepository.files(since, branchState).length, 1);
+  assert.match(
+    w.rl(["review", "review/topic", "--base", "develop", "--diff"], {
+      cwd: w.b,
+    }).stdout,
+    /\+branch content/,
+  );
+  assert.match(
+    w.rl(["review", "--branch", "missing", "--json"], { cwd: w.b, ok: false })
+      .stderr,
+    /Branch not found/,
+  );
+  assert.match(
+    w.rl(["review", "review/topic", "--branch", "feature/a"], {
+      cwd: w.b,
+      ok: false,
+    }).stderr,
+    /not both/,
+  );
+  assert.deepEqual(
+    [w.repo, w.a, w.b].map((root) => [
+      w.git(root, "rev-parse", "HEAD"),
+      w.git(root, "status", "--porcelain"),
+    ]),
+    before,
+  );
+});
+
+test(
+  "branch TUI follows ref updates, freezes revisions and checkpoints the selected branch",
+  { timeout: 60000 },
+  (t) => {
+    const w = new Workspace(t);
+    write(path.join(w.a, "live.txt"), "version-one\n");
+    w.git(w.a, "add", "live.txt");
+    w.git(w.a, "commit", "-qm", "First branch change");
+    w.git(w.repo, "branch", "review/topic", "feature/a");
+    write(path.join(w.a, "live.txt"), "version-two\n");
+    w.git(w.a, "commit", "-qam", "Second branch change");
+    w.env.REVIEW_BRANCH_NEXT = w.git(w.a, "rev-parse", "HEAD");
+    const result = w.command(
+      [
+        "python3",
+        path.join(ROOT, "tests/review-live-pty.py"),
+        w.b,
+        process.execPath,
+        CLI,
+        w.repo,
+        w.state,
+        path.join(w.root, "worktrees/example"),
+        "branch",
+      ],
+      { timeoutMs: 45000 },
+    );
+    assert.match(result.stdout, /PTY: branch.*passed/);
+  },
+);
+
 test("CLI revision ranges use the active worktree; explicit PR discovery uses gh and authentication failures keep local data", (t) => {
   const w = new Workspace(t);
   write(path.join(w.a, "committed.txt"), "commit in A\n");

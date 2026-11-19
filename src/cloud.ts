@@ -1,6 +1,9 @@
 import { createHash, randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
+import { adapters } from "./agent-registry.js";
+import type { CloudJob } from "./cloud-job-runner.js";
 import { accessLabel } from "./access.js";
 import { writeWorkspaceOutput } from "./command-context.js";
 import {
@@ -21,7 +24,12 @@ import {
 } from "./common.js";
 import { findExecutable } from "./dependencies.js";
 import { RlError, UsageError } from "./errors.js";
-import { type Candidate, pickerRows, prState } from "./picker.js";
+import {
+  type Candidate,
+  openPickerWorktree,
+  pickerRows,
+  prState,
+} from "./picker.js";
 import { discoverPrs } from "./pr-discovery.js";
 import { type OverviewRow, renderOverviewTable, worktrees } from "./repos.js";
 import { changedFiles, reviewGit } from "./review-git.js";
@@ -32,7 +40,7 @@ import { type FzfItem, runFzf } from "./tui/fzf.js";
 import { loadUserConfig, resolveCliEnvironment } from "./user-config.js";
 
 const HOST_NAME_PATTERN = /^[A-Za-z0-9](?:[A-Za-z0-9._@-]{0,126}[A-Za-z0-9])?$/;
-const SUPPORTED_AGENTS = new Set(["codex", "claude", "agy", "opencode"]);
+const SUPPORTED_AGENTS = new Set(Object.keys(adapters));
 
 const STATE_COLORS: Readonly<Record<string, number>> = {
   merged: 35,
@@ -494,7 +502,12 @@ async function runSshCommand(
   settings: CloudSettings,
   vmName: string,
   remoteCommand: string,
-  options: { interactive?: boolean; tty?: boolean; timeoutMs?: number } = {},
+  options: {
+    interactive?: boolean;
+    tty?: boolean;
+    timeoutMs?: number;
+    input?: string;
+  } = {},
 ): Promise<{ code: number; stdout: string; stderr: string }> {
   const buildArgv = () => [
     "ssh",
@@ -515,6 +528,7 @@ async function runSshCommand(
 
   return execute(buildArgv(), process.cwd(), {
     timeoutMs: options.timeoutMs ?? 45000,
+    input: options.input,
   });
 }
 
@@ -891,7 +905,7 @@ async function sshIntoRemoteDirectory(
   settings: CloudSettings,
   vm: string,
   remotePath: string,
-  options: { agent?: string; resume?: boolean } = {},
+  options: { agent?: string; resume?: boolean; model?: string } = {},
 ): Promise<number> {
   const pathSetup = `export PATH="$HOME/.local/share/rl/bin:$HOME/.local/bin:/usr/local/bin:$PATH"`;
   let innerAction = `exec "\${SHELL:-/bin/bash}" -l`;
@@ -899,7 +913,15 @@ async function sshIntoRemoteDirectory(
     const agentArg = options.agent ? ` ${shellQuote(options.agent)}` : "";
     innerAction = `rl resume${agentArg}`;
   } else if (options.agent) {
-    innerAction = `rl agent start ${shellQuote(options.agent)}`;
+    innerAction = [
+      "rl",
+      "agent",
+      "start",
+      options.agent,
+      ...(options.model === undefined ? [] : ["--", "--model", options.model]),
+    ]
+      .map(shellQuote)
+      .join(" ");
   }
   const remoteCmd = `${pathSetup} && cd -- ${shellQuote(remotePath)} && ${innerAction}`;
   const res = await runSshCommand(settings, vm, remoteCmd, {
@@ -1592,11 +1614,13 @@ export async function pickWorkspaceWithCloud(options: {
 
   const choice = picked.items[0]!;
   if (choice.kind === "local") {
-    const [root, branch] = options.store.worktree(choice.candidate.path);
-    if (branch !== choice.candidate.branch)
-      throw new Error("Workspace branch changed during selection; retry");
-    await options.store.adopt(root, options.defaultBase);
-    writeWorkspaceOutput(root);
+    writeWorkspaceOutput(
+      await openPickerWorktree(
+        options.store,
+        choice.candidate,
+        options.defaultBase,
+      ),
+    );
     return 0;
   }
   return sshIntoRemoteDirectory(settings, vm, choice.target.path);
@@ -1699,6 +1723,193 @@ function renderCloudReposTable(
   }
 }
 
+function exactCloudWorkspace(
+  vm: string,
+  probe: CloudProbeResult,
+  selector: string,
+  repo?: string,
+): CloudPickerTarget {
+  const targets = buildCloudPickerTargets(vm, probe).filter(
+    (target) =>
+      target.kind === "cloud-workspace" &&
+      (!repo || target.repositoryName === repo) &&
+      [
+        target.name,
+        target.branch,
+        target.path,
+        `${target.repositoryName}/${target.name}`,
+        `${target.repositoryName}:${target.name}`,
+        `${target.repositoryName}/${target.branch}`,
+        `${target.repositoryName}:${target.branch}`,
+      ].includes(selector),
+  );
+  if (targets.length !== 1)
+    throw new RlError(
+      targets.length
+        ? `Ambiguous remote workspace: ${selector}; choose --repo <name>`
+        : `Remote workspace not found: ${selector}. Use rl cloud list or rl cloud switch -c ${shellQuote(selector)}.`,
+    );
+  return targets[0];
+}
+
+async function cloudJob(
+  settings: CloudSettings,
+  host: string,
+  request: Record<string, unknown>,
+): Promise<CloudJob> {
+  const source = fs.readFileSync(
+    new URL("./cloud-job-runner.js", import.meta.url),
+    "utf8",
+  );
+  const command = `export PATH="$HOME/.local/share/rl/bin:$HOME/.local/bin:/usr/local/bin:/opt/homebrew/bin:$PATH"; node --input-type=module -e ${shellQuote(source)}`;
+  const result = await runSshCommand(settings, host, command, {
+    input: JSON.stringify({
+      ...request,
+      ...(request.action === "launch" ? { source } : {}),
+    }),
+    timeoutMs: 45000,
+  });
+  if (result.code !== 0)
+    throw new RlError(result.stderr.trim() || "Remote job request failed");
+  const parsed: unknown = JSON.parse(
+    result.stdout.trim().split("\n").at(-1) || "null",
+  );
+  if (
+    !object(parsed) ||
+    typeof parsed.id !== "string" ||
+    typeof parsed.workspace !== "string" ||
+    typeof parsed.status !== "string"
+  )
+    throw new RlError("Invalid remote job response");
+  return parsed as unknown as CloudJob;
+}
+
+function printCloudJob(host: string, job: CloudJob, structured: boolean): void {
+  const command = (argv: string[]) => argv.map(shellQuote).join(" ");
+  // The caller may be running a checkout alongside an older rl on PATH.
+  const cli = fileURLToPath(new URL("../bin/rl", import.meta.url));
+  const inspect = command([cli, "cloud", "job", job.id, "--host", host]);
+  const logs = command([
+    "ssh",
+    host,
+    command(["tail", "-n", "100", "-f", "--", job.log]),
+  ]);
+  const resume = command([
+    cli,
+    "cloud",
+    "open",
+    job.workspace,
+    "--host",
+    host,
+    "--agent",
+    job.agent,
+    "--resume",
+  ]);
+  if (structured) {
+    json({ host, ...job, inspect, logs, resume });
+    return;
+  }
+  for (const line of [
+    `Host: ${host}`,
+    `Workspace: ${job.workspace}`,
+    `Job: ${job.id}`,
+    `Agent: ${job.agent}${job.model ? ` · model: ${job.model}` : " · configured model"}`,
+    `Status: ${job.status}${job.exitCode !== undefined ? ` · exit: ${job.exitCode}` : job.status === "running" ? " (launch confirmed; task completion is not yet known)" : ""}`,
+    ...(job.error ? [`Error: ${job.error}`] : []),
+    `Inspect: ${inspect}`,
+    `Log: ${logs}`,
+    `Resume a saved conversation after the job stops: ${resume}`,
+    `In the workspace, run rl agent sessions ${sanitizeTerminalText(job.agent)} to see saved conversations. Use Inspect or Log to check the job.`,
+  ])
+    console.log(sanitizeTerminalText(line));
+}
+
+async function validateCloudWorkspaceName(name: string): Promise<void> {
+  if (name.startsWith("-") || /[\x00-\x1f\x7f]/.test(name)) {
+    throw new UsageError("Expected a workspace branch name");
+  }
+  const valid = await execute(
+    ["git", "check-ref-format", "--branch", name],
+    process.cwd(),
+  );
+  if (valid.code !== 0) throw new UsageError("Invalid workspace branch name");
+}
+
+async function createCloudWorkspace(
+  settings: CloudSettings,
+  vm: string,
+  probe: CloudProbeResult,
+  name: string,
+  values: Record<string, string | boolean | undefined>,
+  detached: boolean,
+): Promise<number | undefined> {
+  if (!probe.rlInstalled) {
+    throw new RlError("Install rl on the SSH host before creating workspaces.");
+  }
+  const repos = probe.repositories.filter((repo) => repo.registered);
+  const requested = values.repo as string | undefined;
+  let repo = requested
+    ? repos.find((entry) => entry.name === requested)
+    : (repos.find((entry) => entry.name === probe.defaultRepo) ??
+      (repos.length === 1 ? repos[0] : undefined));
+  if (requested && !repo) {
+    throw new UsageError(
+      `Remote repository is not registered: ${requested}. Run rl repo add on the server first.`,
+    );
+  }
+  if (!repo) {
+    if (!repos.length)
+      throw new RlError(
+        "No registered remote repositories. Run rl repo add on the server first.",
+      );
+    if (!process.stdin.isTTY || !process.stderr.isTTY) {
+      throw new UsageError(
+        "Multiple remote repositories; choose --repo <name>",
+      );
+    }
+    const picked = await runFzf(
+      repos.map((entry) => ({
+        id: entry.name,
+        line: `${sanitizeTerminalText(entry.name)}  ${sanitizeTerminalText(entry.root)}`,
+        value: entry,
+      })),
+      {
+        cwd: process.cwd(),
+        prompt: "Create workspace in › ",
+        header: "Enter select repository · Esc cancel",
+        errorLabel: "Remote repository picker",
+        unknownNoun: "repository",
+      },
+    );
+    if (!picked) return undefined;
+    repo = picked.items[0];
+  }
+  values.repo = repo.name;
+  const remoteArgs = [
+    "rl",
+    "--repo",
+    repo.name,
+    "switch",
+    name,
+    "--create",
+    ...(values.base ? ["--base", String(values.base)] : []),
+    ...(values["no-fetch"] ? ["--no-fetch"] : []),
+    ...(values.setup ? ["--setup"] : []),
+  ];
+  const command = `export PATH="$HOME/.local/share/rl/bin:$HOME/.local/bin:/usr/local/bin:$PATH" && cd -- ${shellQuote(repo.root)} && ${remoteArgs.map(shellQuote).join(" ")}`;
+  const result = await runSshCommand(settings, vm, command, {
+    interactive: !detached,
+    timeoutMs: 120000,
+  });
+  if (detached && result.code !== 0)
+    throw new RlError(
+      result.stderr.trim() ||
+        result.stdout.trim() ||
+        "Remote workspace creation failed",
+    );
+  return result.code;
+}
+
 export async function main(
   argv: string[],
   context: {
@@ -1739,7 +1950,7 @@ export async function main(
 
   const { values, positionals } = args(
     subArgv,
-    ["host", "vm", "agent", "output-path", "repo", "base"],
+    ["host", "vm", "agent", "model", "prompt", "output-path", "repo", "base"],
     [
       "json",
       "fetch",
@@ -1749,8 +1960,21 @@ export async function main(
       "no-fetch",
       "remote",
       "include-uncommitted",
+      "create",
+      "setup",
     ],
+    { create: "c", prompt: "p", agent: "a", model: "m" },
   );
+  if (
+    sub !== "switch" &&
+    sub !== "create" &&
+    ["create", "prompt", "model", "setup"].some(
+      (name) => values[name] !== undefined,
+    )
+  )
+    throw new UsageError(
+      "--create, --prompt, --model and --setup are options for cloud switch/create",
+    );
 
   const settings = resolveCloudSettings({
     stateDir: context.stateDir,
@@ -1759,78 +1983,121 @@ export async function main(
   });
 
   switch (sub) {
-    case "create": {
+    case "create":
+    case "switch": {
       arity(positionals, 1);
-      const name = positionals[0];
-      if (name.startsWith("-") || /[\x00-\x1f\x7f]/.test(name)) {
-        throw new UsageError("Expected a workspace branch name");
-      }
-      const valid = await execute(
-        ["git", "check-ref-format", "--branch", name],
-        process.cwd(),
-      );
-      if (valid.code !== 0)
-        throw new UsageError("Invalid workspace branch name");
-      const vm = await resolveTargetVm(settings);
-      const probe = await probeCloudHost(settings, vm);
-      if (!probe.rlInstalled) {
-        throw new RlError(
-          "Install rl on the SSH host before creating workspaces.",
-        );
-      }
-      const repos = probe.repositories.filter((repo) => repo.registered);
-      const requested = values.repo as string | undefined;
-      let repo = requested
-        ? repos.find((entry) => entry.name === requested)
-        : (repos.find((entry) => entry.name === probe.defaultRepo) ??
-          (repos.length === 1 ? repos[0] : undefined));
-      if (requested && !repo) {
+      const create = sub === "create" || Boolean(values.create);
+      const prompt =
+        typeof values.prompt === "string" ? values.prompt : undefined;
+      if (prompt !== undefined && (!prompt.trim() || prompt.includes("\0")))
         throw new UsageError(
-          `Remote repository is not registered: ${requested}. Run rl repo add on the server first.`,
+          "--prompt requires non-empty text without NUL characters",
         );
-      }
-      if (!repo) {
-        if (!repos.length)
-          throw new RlError(
-            "No registered remote repositories. Run rl repo add on the server first.",
-          );
-        if (!process.stdin.isTTY || !process.stderr.isTTY) {
-          throw new UsageError(
-            "Multiple remote repositories; choose --repo <name>",
-          );
-        }
-        const picked = await runFzf(
-          repos.map((entry) => ({
-            id: entry.name,
-            line: `${sanitizeTerminalText(entry.name)}  ${sanitizeTerminalText(entry.root)}`,
-            value: entry,
-          })),
-          {
-            cwd: process.cwd(),
-            prompt: "Create workspace in › ",
-            header: "Enter select repository · Esc cancel",
-            errorLabel: "Remote repository picker",
-            unknownNoun: "repository",
-          },
+      const agent =
+        typeof values.agent === "string"
+          ? values.agent
+          : prompt !== undefined
+            ? "agy"
+            : undefined;
+      if (agent && !SUPPORTED_AGENTS.has(agent))
+        throw new UsageError(
+          `Unsupported agent: choose ${[...SUPPORTED_AGENTS].join(", ")}`,
         );
-        if (!picked) return 0;
-        repo = picked.items[0];
+      if (
+        values.model !== undefined &&
+        (!agent ||
+          !String(values.model).trim() ||
+          String(values.model).includes("\0"))
+      )
+        throw new UsageError(
+          "--model requires an agent or prompt, and a non-empty model name",
+        );
+      if (values.resume && (prompt !== undefined || values.model !== undefined))
+        throw new UsageError(
+          "--resume cannot be combined with --prompt or --model",
+        );
+      if (prompt !== undefined && values.code)
+        throw new UsageError(
+          "Use --prompt for a detached job or --code for VS Code, not both",
+        );
+      if (!create && (values.base || values["no-fetch"] || values.setup))
+        throw new UsageError("--base, --no-fetch and --setup require --create");
+      if (values.json && prompt === undefined)
+        throw new UsageError(
+          "--json requires --prompt for cloud switch/create",
+        );
+      if (create) await validateCloudWorkspaceName(positionals[0]);
+      const vm = await resolveTargetVm(settings);
+      let probe = await probeCloudHost(settings, vm);
+      if (prompt !== undefined && !probe.rlInstalled)
+        throw new RlError(
+          "Install rl on the SSH host before launching agent jobs.",
+        );
+      let requestedRepo = values.repo as string | undefined;
+      if (create) {
+        const code = await createCloudWorkspace(
+          settings,
+          vm,
+          probe,
+          positionals[0],
+          values,
+          prompt !== undefined,
+        );
+        if (code === undefined) return 0;
+        if (
+          code !== 0 ||
+          (sub === "create" &&
+            prompt === undefined &&
+            !agent &&
+            !values.code &&
+            !values.resume)
+        )
+          return code;
+        // Resolve the result through server metadata, never guess a workspace path.
+        probe = await probeCloudHost(settings, vm);
+        // The create implementation selected the repo when one was omitted.
+        requestedRepo =
+          typeof values.repo === "string" ? values.repo : undefined;
       }
-      const remoteArgs = [
-        "rl",
-        "--repo",
-        repo.name,
-        "switch",
-        name,
-        "--create",
-        ...(values.base ? ["--base", String(values.base)] : []),
-        ...(values["no-fetch"] ? ["--no-fetch"] : []),
-      ];
-      const command = `export PATH="$HOME/.local/share/rl/bin:$HOME/.local/bin:/usr/local/bin:$PATH" && cd -- ${shellQuote(repo.root)} && ${remoteArgs.map(shellQuote).join(" ")}`;
-      const result = await runSshCommand(settings, vm, command, {
-        interactive: true,
+      const target = exactCloudWorkspace(
+        vm,
+        probe,
+        positionals[0],
+        requestedRepo,
+      );
+      if (prompt !== undefined) {
+        const job = await cloudJob(settings, vm, {
+          action: "launch",
+          workspace: target.path,
+          repository: target.repositoryName,
+          repositoryRoot: target.repositoryRoot,
+          branch: target.branch,
+          agent: agent!,
+          prompt,
+          ...(values.model === undefined
+            ? {}
+            : { model: String(values.model) }),
+        });
+        printCloudJob(vm, job, Boolean(values.json));
+        return 0;
+      }
+      if (values.code) return openInVsCodeRemote(settings, vm, target.path);
+      return sshIntoRemoteDirectory(settings, vm, target.path, {
+        agent,
+        resume: Boolean(values.resume),
+        model: values.model as string | undefined,
       });
-      return result.code;
+    }
+
+    case "job": {
+      arity(positionals, 1);
+      const vm = await resolveTargetVm(settings);
+      const job = await cloudJob(settings, vm, {
+        action: "status",
+        id: positionals[0],
+      });
+      printCloudJob(vm, job, Boolean(values.json));
+      return job.status === "failed" || job.status === "interrupted" ? 1 : 0;
     }
 
     case "open": {

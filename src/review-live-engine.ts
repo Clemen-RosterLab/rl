@@ -70,6 +70,25 @@ export interface Checkpoint {
   label: string;
 }
 const hash = (s: string) => createHash("sha256").update(s).digest("hex");
+/** Resolve branch names only; never interpret revision expressions or pathspecs. */
+export function reviewBranch(root: string, name: string): string | undefined {
+  const refs = name.startsWith("refs/")
+    ? [name].filter((ref) => /^refs\/(heads|remotes)\//.test(ref))
+    : [`refs/heads/${name}`, `refs/remotes/${name}`];
+  for (const ref of refs) {
+    try {
+      reviewGit(root, ["show-ref", "--verify", "--hash", ref]);
+      return ref;
+    } catch {
+      // Prefer an exact local branch, then an exact remote-tracking branch.
+    }
+  }
+  return undefined;
+}
+export interface BranchReview {
+  ref: string;
+  base: string;
+}
 const ignored = new Set([
   ".git",
   "node_modules",
@@ -115,6 +134,7 @@ export class LiveRepository {
       temporaryRoot?: string;
       freezeId?: string;
       remote?: number;
+      branch?: BranchReview;
     } = {},
   ) {
     this.freezeRef = `refs/rl/live-freeze/${options.freezeId ?? randomUUID()}`;
@@ -177,6 +197,12 @@ export class LiveRepository {
     this.pinned.clear();
   }
   refresh(force = false): LiveState {
+    if (this.options.branch)
+      return this.committedState(
+        this.options.branch.ref,
+        this.options.branch.base,
+        this.options.branch.ref,
+      );
     if (this.options.remote)
       return this.remoteState(
         revision(this.root, `refs/rl/live-pr/${this.options.remote}/head`),
@@ -297,6 +323,13 @@ export class LiveRepository {
   remoteState(headRef: string, baseRef: string): LiveState {
     if (!this.options.remote)
       throw new Error("Remote state requires a remote review cache");
+    return this.committedState(headRef, baseRef, `pr/${this.options.remote}`);
+  }
+  private committedState(
+    headRef: string,
+    baseRef: string,
+    branch: string,
+  ): LiveState {
     this.assertIdentity();
     const head = revision(this.root, headRef),
       base = revision(this.root, baseRef);
@@ -308,7 +341,7 @@ export class LiveRepository {
       id: randomUUID(),
       at: now(),
       head,
-      branch: `pr/${this.options.remote}`,
+      branch,
       headTree: tree,
       indexTree: tree,
       worktreeTree: tree,
@@ -326,7 +359,13 @@ export class LiveRepository {
       signature,
       remote: { head, base },
       gitDir: this.identity,
-      commonDir: this.identity,
+      commonDir: canonical(
+        reviewGit(this.root, [
+          "rev-parse",
+          "--path-format=absolute",
+          "--git-common-dir",
+        ]).trim(),
+      ),
       directories: [],
       workingFiles: [],
       commits: this.history(head, base),
@@ -424,9 +463,9 @@ export class LiveRepository {
     const s = state.snapshot;
     switch (mode.kind) {
       case "working":
-        if (this.options.remote)
+        if (this.options.remote || this.options.branch)
           throw new Error(
-            "Remote PR review has no working tree; press p for the PR comparison",
+            "Committed review has no working tree; press p for the branch comparison",
           );
         return {
           label: `HEAD ${s.head.slice(0, 8) || "(unborn)"} → working tree · separate index / source layers`,
@@ -471,7 +510,12 @@ export class LiveRepository {
       case "branch": {
         if (!s.head) throw new Error("Branch comparison requires a commit");
         const target = revision(this.root, mode.head ?? s.head),
-          base = revision(this.root, mode.base);
+          base = revision(
+            this.root,
+            this.options.branch && mode.base === this.options.branch.base
+              ? state.remote!.base
+              : mode.base,
+          );
         const from = reviewGit(this.root, ["merge-base", base, target]).trim();
         return {
           label: `Merge-base with ${mode.base} (${from.slice(0, 8)}) → ${target.slice(0, 8)} · committed branch`,
@@ -506,18 +550,34 @@ export class LiveRepository {
             rewritten = true;
           }
         return {
-          label: `Reviewed ${p.label} → ${this.options.remote ? "PR HEAD" : "current source"}${rewritten ? " · history rewritten; exact saved trees retained" : ""}`,
-          target: this.options.remote ? s.head : s.worktreeTree,
-          scopes: this.options.remote
-            ? [{ name: "PR since review", from: p.tree, to: s.headTree }]
-            : [
-                {
-                  name: "source since review",
-                  from: p.tree,
-                  to: s.worktreeTree,
-                },
-                { name: "index since review", from: p.index, to: s.indexTree },
-              ],
+          label: `Reviewed ${p.label} → ${this.options.remote ? "PR HEAD" : this.options.branch ? "branch HEAD" : "current source"}${rewritten ? " · history rewritten; exact saved trees retained" : ""}`,
+          target:
+            this.options.remote || this.options.branch
+              ? s.head
+              : s.worktreeTree,
+          scopes:
+            this.options.remote || this.options.branch
+              ? [
+                  {
+                    name: this.options.remote
+                      ? "PR since review"
+                      : "branch since review",
+                    from: p.tree,
+                    to: s.headTree,
+                  },
+                ]
+              : [
+                  {
+                    name: "source since review",
+                    from: p.tree,
+                    to: s.worktreeTree,
+                  },
+                  {
+                    name: "index since review",
+                    from: p.index,
+                    to: s.indexTree,
+                  },
+                ],
         };
       }
     }

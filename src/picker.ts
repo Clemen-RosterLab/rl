@@ -31,6 +31,7 @@ export interface Candidate {
   branch: string;
   locked: boolean;
   existing?: boolean;
+  switched?: boolean;
 }
 
 const escapePickerToken = (value: string): string =>
@@ -66,7 +67,8 @@ export function candidates(
       const root = canonical(record.worktree);
       const managed = inside(root, base);
       const branch = (record.branch ?? "").replace(/^refs\/heads\//, "");
-      const existing = adopted.get(root) !== branch;
+      const recordedBranch = adopted.get(root);
+      const existing = recordedBranch !== branch;
       if (
         root === repo ||
         (!managed && existing && !includeExisting) ||
@@ -81,6 +83,7 @@ export function candidates(
           branch,
           locked: "locked" in record,
           ...(store && existing ? { existing: true } : {}),
+          ...(recordedBranch && existing ? { switched: true } : {}),
         },
       ];
     });
@@ -96,6 +99,18 @@ export function candidates(
     used.add(outside.name);
   }
   return found;
+}
+
+export async function openPickerWorktree(
+  store: Store,
+  item: Candidate,
+  defaultBase: string,
+): Promise<string> {
+  const [root, branch] = store.worktree(item.path);
+  if (branch !== item.branch)
+    throw new Error("Workspace branch changed during selection; retry");
+  if (!item.switched) await store.adopt(root, defaultBase);
+  return root;
 }
 
 export function prState(data?: Pick<Instance, "pr">): string {
@@ -123,7 +138,8 @@ export function pickerRows(
   const fallback = repositoryBase(store.repo, defaultBase);
 
   const details = items.map((item) => {
-    const data = activeRecords.get(item.path);
+    const record = activeRecords.get(item.path);
+    const data = record?.branch === item.branch ? record : undefined;
     const lookup = prs.get(item.branch);
     const pr = lookup ? lookup.pr : data?.pr;
     const prBase = pullRequestBase(store.repo, pr);
@@ -215,7 +231,7 @@ export function pickerRows(
       .replace(/\+\d+/g, (val) => color(val, 32))
       .replace(/-\d+/g, (val) =>
         color(val, 31),
-      )}  ${color(cell(base, baseWidth), 90)}  ${color(item.existing ? "not initialized" : accessLabel(accessed), item.existing ? 33 : 90)}`;
+      )}  ${color(cell(base, baseWidth), 90)}  ${color(item.switched ? "branch switched" : item.existing ? "not initialized" : accessLabel(accessed), item.existing ? 33 : 90)}`;
 
     return {
       item,

@@ -4,7 +4,11 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
 import { atomicWrite, canonical, inside, shellQuote } from "./common.js";
-import { inspectDependencies, setupDependencies } from "./dependencies.js";
+import {
+  findExecutable,
+  setupDependencies,
+  TOOL_NAMES,
+} from "./dependencies.js";
 
 const BEGIN = "# >>> rl shell integration >>>";
 const END = "# <<< rl shell integration <<<";
@@ -115,7 +119,7 @@ export function configureShell(host: InstallHost, requestedShell?: string) {
   const shell = requestedShell ?? detected;
   if (!isSupportedShell(shell))
     throw new Error(
-      `Automatic RL shell setup supports zsh and bash. Run 'rl setup install --shell zsh' or '--shell bash' for the shell you use.`,
+      `RL shell setup supports zsh and bash. Run 'rl setup install --shell zsh' or '--shell bash' for the shell you use.`,
     );
   const shells: ShellName[] = requestedShell
     ? [shell]
@@ -136,9 +140,10 @@ export function configureShell(host: InstallHost, requestedShell?: string) {
   const toolDirectories = [
     ...new Set([
       nodeDirectory,
-      ...inspectDependencies(env).flatMap((tool) =>
-        tool.path ? [path.dirname(tool.path)] : [],
-      ),
+      ...TOOL_NAMES.flatMap((tool) => {
+        const executable = findExecutable(tool, env);
+        return executable ? [path.dirname(executable)] : [];
+      }),
     ]),
   ];
   const profiles = shells.flatMap((targetShell) => {
@@ -183,67 +188,27 @@ export function configureShell(host: InstallHost, requestedShell?: string) {
   };
 }
 
-/** npm global installs opt into shell setup; project dependencies never do. */
-export function autoConfigureShell(host: InstallHost = {}): void {
-  const env = host.env ?? process.env;
-  if (
-    env.npm_config_global !== "true" ||
-    /^(1|true)$/i.test(env.RL_SKIP_SHELL_SETUP ?? "") ||
-    /^(1|true)$/i.test(env.CI ?? "")
-  )
-    return;
-  if ((host.uid ?? process.getuid?.()) === 0 || env.SUDO_USER || env.SUDO_UID) {
-    console.warn(
-      "rl: shell setup skipped for elevated installation. Run rl setup install as your normal user.",
-    );
-    return;
-  }
-  // npm also sets global=true for dependencies of other global packages.
-  // Only the directly installed RL package may change startup configuration.
-  const root = canonical(host.packageRoot ?? PACKAGE_ROOT);
-  if (
-    !env.npm_config_prefix ||
-    canonical(
-      path.join(env.npm_config_prefix, "lib/node_modules/rl-workspaces"),
-    ) !== root
-  )
-    return;
-  try {
-    const shell = path.basename(
-      env.SHELL ||
-        ((host.platform ?? process.platform) === "darwin" ? "zsh" : "bash"),
-    );
-    const configured = configureShell(host, shell);
-    console.log(
-      `rl: shell integration enabled in ${configured.profiles.join(", ")}. Open a new terminal to activate workspace switching.`,
-    );
-    console.log(
-      `For this terminal: eval "$(command rl setup shell ${configured.shell})"`,
-    );
-  } catch (error) {
-    // A dotfile problem must not make the installed CLI unavailable.
-    console.warn(
-      `rl: automatic shell setup skipped: ${error instanceof Error ? error.message : String(error)}. Run rl setup install to repair it.`,
-    );
-  }
-}
-
 export async function installRl(
   argv: string[],
   host: InstallHost = {},
 ): Promise<number> {
   const { values, positionals } = parseArgs({
     args: argv,
-    options: { shell: { type: "string" } },
+    options: {
+      shell: { type: "string" },
+      "shell-only": { type: "boolean" },
+    },
     allowPositionals: true,
   });
   if (positionals.length) {
-    throw new Error("Usage: rl setup install [--shell zsh|bash]");
+    throw new Error(
+      "Usage: rl setup install [--shell-only] [--shell zsh|bash]",
+    );
   }
 
-  const code = await setupDependencies([], host);
-  if (code !== 0) {
-    return code;
+  if (!values["shell-only"]) {
+    const code = await setupDependencies([], host);
+    if (code !== 0) return code;
   }
 
   const configured = configureShell(host, values.shell);

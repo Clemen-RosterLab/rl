@@ -238,6 +238,86 @@ test("reviewFrame keeps the footer authoritative on ultra-short terminals", () =
   });
 
   const bottomPlain = stripAnsiSgr(frame.rows.at(-1)!);
-  assert.match(bottomPlain, /Q Quit/);
+  assert.match(bottomPlain, /q Quit/);
   assert.match(bottomPlain, /1 Commits/);
+  assert.doesNotMatch(bottomPlain, /r Range/);
+});
+
+test("reviewFrame selects all commits by default on branches, labels expand, and explains diff scroll state", () => {
+  const commits = [
+    {
+      sha: "8aab87ae11111111111111111111111111111111",
+      parents: ["0f1a3ae000000000000000000000000000000000"],
+      subject: "fix: record manual Re-generate",
+      author: "Dev",
+      date: "2026-01-01T00:00:00Z",
+      files: 4,
+      additions: 10,
+      deletions: 2,
+    },
+    {
+      sha: "0f1a3ae000000000000000000000000000000000",
+      parents: [],
+      subject: "feat: initial PR commit",
+      author: "Dev",
+      date: "2026-01-01T00:00:00Z",
+      files: 2,
+      additions: 20,
+      deletions: 0,
+    },
+  ];
+  const baseView = {
+    width: 140,
+    rows: 28,
+    focus: 2,
+    expanded: false,
+    remoteOnly: true,
+    branch: "org/repo · PR #1 / feat",
+    head: commits[0].sha,
+    frozen: false,
+    newer: false,
+    mode: { kind: "branch" as const, base: "main", head: commits[0].sha },
+    commits,
+    commitIndex: 1,
+    commitScroll: 0,
+    files: [],
+    fileIndex: 0,
+    hideNoise: true,
+    hiddenFiles: 0,
+    workingFiles: [],
+    hiddenWorkingFiles: 0,
+    lines: ["+short diff"],
+    scroll: 0,
+    horizontal: 0,
+    search: "",
+    status: "Updated · 1 file",
+    remote: "#1 head 8aab87ae (polled separately)",
+    updates: 1,
+  };
+
+  const allFrame = reviewFrame(baseView)
+    .rows.map((r) => stripAnsiSgr(r))
+    .join("\n");
+  assert.match(allFrame, /1 COMMITS · All 2 selected/);
+  assert.match(allFrame, /\[x\].*8aab87a/);
+  assert.match(allFrame, /\[x\].*0f1a3ae/);
+  assert.match(allFrame, /\[Enter: Expand\]/);
+  assert.match(allFrame, /All lines shown · \[ \/ \] Prev\/Next file/);
+  assert.doesNotMatch(allFrame, /REMOTE PR/);
+  assert.doesNotMatch(allFrame, /j\/k Scroll/);
+
+  const singleCommitFrame = reviewFrame({
+    ...baseView,
+    focus: 1,
+    mode: { kind: "commit", sha: commits[0].sha },
+    lines: Array.from({ length: 60 }, (_, i) => `+line ${i + 1}`),
+  })
+    .rows.map((r) => stripAnsiSgr(r))
+    .join("\n");
+  assert.match(singleCommitFrame, /1 COMMITS · 1\/2 selected/);
+  assert.match(singleCommitFrame, /\[a: All\]/);
+  assert.match(singleCommitFrame, /\[x\].*8aab87a/);
+  assert.match(singleCommitFrame, /\[ \].*0f1a3ae/);
+  assert.match(singleCommitFrame, /\[z: Expand\]/);
+  assert.match(singleCommitFrame, /3 Focus to scroll · PgUp\/PgDn Page/);
 });

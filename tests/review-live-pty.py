@@ -72,6 +72,8 @@ if pid == 0:
     extra = ['--pr', '99', '--local', '--remote-interval', '10'] if scenario in ('pr-navigation', 'pr-freeze') else ['--pr', '99', '--github-repo', 'example/repo', '--remote-interval', '10'] if scenario in ('remote-pr', 'pr-comments') else []
     if scenario == 'pr-comments' and os.environ.get('REVIEW_LOCAL_COMMENTS'):
         extra = ['--pr', '99', '--local', '--remote-interval', '10']
+    if scenario == 'branch':
+        extra = ['review/topic', '--base', 'develop']
     os.execv(node, [node, cli, 'review', '--repo', repo, '--state-dir', state,
                       '--base-dir', base, '--default-base', 'develop', '--live', *extra])
 
@@ -283,8 +285,8 @@ def mouse_scenario():
     click('A b.txt')
     expect_position(position)
     assert_selected('A b.txt')
-    click('[Expand]')
-    expect_screen('[Back]')
+    click('[Enter: Expand]')
+    expect_screen('[Enter/Esc: Back]')
     assert not any('1 COMMITS' in row for row in screen()[3:31]), 'Expand kept sidebar'
     key('\x1b[F')
     expect_screen('+b120')
@@ -292,7 +294,7 @@ def mouse_scenario():
     expect_screen('+b001')
     key('\x1b[6~')
     expect_screen('+b016')
-    click('[Back]')
+    click('[Enter/Esc: Back]')
     expect_screen('WORKING TREE')
     click('a.txt (unstaged)')
     expect_screen('+++working-a')
@@ -320,13 +322,26 @@ def mouse_scenario():
     click('Middle source')
     expect_screen('+middle-only')
     assert not any('files grouped by commit' in row for row in screen()), 'A regular click should restore single selection'
+    click('Middle source')
+    expect_screen('+++working-a')
     assert b'Marked inspected snapshot' not in output, 'Mouse packet triggered m shortcut'
-    click('r Range')
-    expect_screen('Range FROM TO')
-    click('Q Quit')
+    assert not any('r Range' in row for row in screen()), 'Confusing r Range remained in footer'
+    key('r')
+    pump(.1)
+    assert not any('Range FROM TO' in row for row in screen()), 'r opened removed Range prompt'
+    click('z Expand')
+    expect_screen('[Enter/Esc: Back]')
+    click('z Back')
+    expect_screen('1 COMMITS')
+    click('q Quit')
 
 def preview_scenario():
     expect_screen('+alpha')
+    # Diff is focused on launch so j/k scrolls immediately without extra setup.
+    key('jj')
+    expect_position(3)
+    key('kk')
+    expect_position(1)
     diff_x, diff_y = locate('3 DIFF PREVIEW')
     divider_x = diff_x - 2
     mouse(0, divider_x, diff_y+4)
@@ -377,20 +392,20 @@ def preview_scenario():
     key('=')
     expect_screen('Sidebar 56 columns')
     assert locate('3 DIFF PREVIEW')[0] == diff_x
-    click('[Expand]')
-    expect_screen('[Back]')
+    click('[Enter: Expand]')
+    expect_screen('[Enter/Esc: Back]')
     key('jjjj')
     expect_position(5)
     key('\t')
     expect_screen('+beta')
-    expect_screen('[Back]')
+    expect_screen('[Enter/Esc: Back]')
     assert not any('1 COMMITS' in row for row in screen()), 'Tab collapsed the expanded preview'
     key('\x1b[Z')
     expect_position(5)
-    expect_screen('[Back]')
+    expect_screen('[Enter/Esc: Back]')
     key(']')
     expect_screen('+beta')
-    expect_screen('[Back]')
+    expect_screen('[Enter/Esc: Back]')
     key('[')
     expect_position(5)
     key('\x1b[H')
@@ -411,7 +426,7 @@ def preview_scenario():
     assert clipboard() == "newer 界é    omega\n+a00", clipboard()
     key('\x1b')
     expect_screen('Sidebar 56 columns')
-    expect_screen('[Back]')
+    expect_screen('[Enter/Esc: Back]')
     key('\x1b')
     expect_screen('1 COMMITS')
     key('q')
@@ -608,10 +623,10 @@ def improvements_scenario():
 
 def pr_navigation_scenario():
     expect_screen('+local pending')
-    key('rHEAD~1 HEAD\r')
-    expect_screen('Range HEAD~1')
+    click('Old remote')
+    expect_screen('+old remote')
     expect_screen('PR polled')
-    assert any('Range HEAD~1' in row for row in screen()), 'Delayed PR discovery replaced the selected range'
+    assert not any('committed branch' in row for row in screen()), 'Delayed PR discovery replaced the selected commit'
     key('q')
 
 def pr_freeze_scenario():
@@ -651,7 +666,7 @@ def switch_performance_scenario():
     expect_screen('+a-v1')
     expect_screen('Updated')
     key('3\r')
-    expect_screen('[Back]')
+    expect_screen('[Enter/Esc: Back]')
     with open(os.environ['REVIEW_PAUSE_GIT'], 'w'):
         pass
     with open(os.path.join(root, 'a.txt'), 'w') as file:
@@ -684,7 +699,7 @@ def remote_pr_scenario():
     key('p')
     expect_screen('Updated')
     key('3\r')
-    expect_screen('[Back]')
+    expect_screen('[Enter/Esc: Back]')
     key('c')
     expect_screen('3 FILE · AFTER')
     expect_screen('remote version one')
@@ -722,9 +737,13 @@ def remote_pr_scenario():
     expect_screen('PR HEAD')
     expect_screen('-remote version one')
     expect_screen('+remote version two')
-    key('rBASE HEAD\r')
-    expect_screen('Range BASE')
-    expect_screen('+remote version two')
+    key('zp')
+    expect_screen('1 COMMITS · All ')
+    click('Remote correction')
+    expect_screen('[a: All]')
+    click('Remote correction')
+    expect_screen('1 COMMITS · All ')
+    expect_screen('Updated')
     key('O')
     expect_screen('no checkout')
     key('o')
@@ -810,7 +829,7 @@ def pr_comments_scenario():
     key('\x1b')
     expect_screen('+review this line')
     # Old commits cannot receive comments pretending to target the PR diff.
-    key('1j3')
+    key('1\r3')
     expect_screen('pr-comment.txt · commit')
     expect_screen('Updated')
     key('i')
@@ -928,6 +947,32 @@ def watcher_quit_scenario():
     key('q')
     return started
 
+def branch_scenario():
+    expect_screen('review/topic')
+    expect_screen('+version-one')
+    expect_screen('Updated')
+    expect('Marked inspected snapshot', key('m'))
+    expect('FROZEN', key('f'))
+    subprocess.run(['git', '-C', repo, 'update-ref', 'refs/heads/review/topic', os.environ['REVIEW_BRANCH_NEXT']], check=True)
+    expect_screen('NEW CHANGES', timeout=15)
+    assert '+version-two' not in screen(), 'Frozen branch preview changed'
+    key('f')
+    expect_screen('+version-two')
+    key('s')
+    expect_screen('-version-one')
+    expect_screen('+version-two')
+    key('w')
+    expect_screen('no working tree')
+    key('p')
+    expect_screen('committed branch')
+    expect_screen('All 2 selected')
+    key('1\r')
+    expect_screen('1/2 selected')
+    expect_screen('[a: All]')
+    key(' ')
+    expect_screen('All 2 selected')
+    key('Q')
+
 def shell_scenario():
     expect('RL_SHELL_READY> ')
     if scenario == 'shell-function':
@@ -986,6 +1031,8 @@ try:
         quit_started = handoff_scenario()
     elif scenario == "quit-watcher":
         quit_started = watcher_quit_scenario()
+    elif scenario == "branch":
+        branch_scenario()
     elif scenario in ('shell', 'shell-function'):
         shell_scenario()
     elif scenario in ('terminal-raw', 'terminal-noecho'):

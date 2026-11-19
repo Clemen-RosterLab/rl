@@ -11,7 +11,7 @@ import {
 } from "./command-context.js";
 import { args, arity, execute, inside, json, now, readJson } from "./common.js";
 import { findExecutable } from "./dependencies.js";
-import { UsageError } from "./errors.js";
+import { UsageError, WorkspaceNotFoundError } from "./errors.js";
 import { candidates } from "./picker.js";
 import {
   analyse,
@@ -31,7 +31,12 @@ import {
   type Snapshot,
 } from "./review-git.js";
 import { GhReviewService } from "./review-github.js";
-import { LiveRepository, reviewRoot, type Mode } from "./review-live-engine.js";
+import {
+  LiveRepository,
+  reviewRoot,
+  reviewBranch,
+  type Mode,
+} from "./review-live-engine.js";
 import { liveReview } from "./review-live.js";
 import { ReviewStore, reviewStatus } from "./review-store.js";
 import { browseDiff, choose, page, visible } from "./review-terminal.js";
@@ -781,6 +786,7 @@ export async function main(argv: string[]): Promise<number> {
     [
       ...contextOptions,
       "base",
+      "branch",
       "since",
       "snapshot",
       "filter",
@@ -852,6 +858,54 @@ export async function main(argv: string[]): Promise<number> {
   if (values.all && positionals.length > 0) {
     throw new UsageError("Expected --all without a worktree selector");
   }
+  if (values.branch && positionals.length)
+    throw new UsageError(
+      "Pass a branch either positionally or with --branch, not both",
+    );
+  let branchName =
+    values.branch ??
+    (!values.snapshot &&
+    !values["since-last-review"] &&
+    !values.interactive &&
+    !values.filter &&
+    selectors.every((s) => s === "diff")
+      ? positionals[0]
+      : undefined);
+  if (branchName && !values.branch) {
+    try {
+      resolveWorkspace(context, String(branchName));
+      // Preserve existing workspace selectors; --branch explicitly chooses refs.
+      branchName = undefined;
+    } catch (error) {
+      if (!(error instanceof WorkspaceNotFoundError)) throw error;
+    }
+  }
+  const branchRef = branchName
+    ? reviewBranch(context.repo, String(branchName))
+    : undefined;
+  if (values.branch && !branchRef)
+    throw new UsageError(
+      `Branch not found: ${values.branch}. Use a local branch or a fetched remote-tracking branch, such as origin/feature.`,
+    );
+  const branch = branchRef
+    ? { ref: branchRef, base: String(values.base ?? context.defaultBase) }
+    : undefined;
+  if (
+    branch &&
+    (values.pr ||
+      values.all ||
+      values.snapshot ||
+      values["since-last-review"] ||
+      values.interactive ||
+      values.filter)
+  )
+    throw new UsageError(
+      "Branch review cannot be combined with PR, queue or legacy snapshot options",
+    );
+  if (branch && values.base && values.since)
+    throw new UsageError(
+      "Use either --base for a branch comparison or --since for a revision range",
+    );
 
   const remoteInterval = Number(values["remote-interval"] ?? 60);
   if (!Number.isFinite(remoteInterval) || remoteInterval < 10) {
@@ -861,6 +915,10 @@ export async function main(argv: string[]): Promise<number> {
   const revisionSince =
     typeof values.since === "string" &&
     !/^[a-f\d]{8}-[a-f\d-]{27}$/i.test(values.since);
+  if (branch && values.since && !revisionSince)
+    throw new UsageError(
+      "Branch --since expects a Git revision, not a legacy workspace checkpoint UUID",
+    );
   const isTerminal = Boolean(process.stdin.isTTY && process.stdout.isTTY);
   const useLive =
     !values.all &&
@@ -874,11 +932,11 @@ export async function main(argv: string[]): Promise<number> {
     (!values.since || revisionSince) &&
     (isTerminal || Boolean(values.live));
 
-  if (useLive || values.pr || revisionSince) {
+  if (useLive || values.pr || revisionSince || branch) {
     if (
       values.all ||
       values.snapshot ||
-      values.base ||
+      (values.base && !branch) ||
       values["since-last-review"] ||
       selectors.some((s) => s !== "diff")
     ) {
@@ -886,15 +944,18 @@ export async function main(argv: string[]): Promise<number> {
         "Expected live review options without legacy snapshot actions",
       );
     }
-    const root = positionals[0]
-      ? resolveWorkspace(context, positionals[0]).path
-      : reviewRoot(process.cwd(), context.repo);
+    const root = branch
+      ? context.repo
+      : positionals[0]
+        ? resolveWorkspace(context, positionals[0]).path
+        : reviewRoot(process.cwd(), context.repo);
 
     const liveOptions = {
       root,
       repository: context.repo,
       directory: context.store.root,
       defaultBase: context.defaultBase,
+      branch,
       since: revisionSince ? String(values.since) : undefined,
       pr: values.pr ? Number(values.pr) : undefined,
       remoteInterval: remoteInterval * 1000,
@@ -903,11 +964,13 @@ export async function main(argv: string[]): Promise<number> {
     if ((isTerminal && !values.json && !values.diff) || values.live) {
       await liveReview(liveOptions);
     } else {
-      const repository = new LiveRepository(root, context.repo);
+      const repository = new LiveRepository(root, context.repo, { branch });
       const state = repository.refresh();
       let mode: Mode = revisionSince
         ? { kind: "range", from: String(values.since), to: "HEAD" }
-        : { kind: "working" };
+        : branch
+          ? { kind: "branch", base: branch.base }
+          : { kind: "working" };
       let pr;
       let warning: string | undefined;
 

@@ -35,24 +35,15 @@ Install from npm:
 npm install --global rl-workspaces
 ```
 
-Global npm installs automatically register shell integration for your current zsh
-or bash shell. Open a new terminal to use directory switching. Existing settings
-are preserved, and upgrades update the same managed block. The installer does not
-download system tools. Use `rl setup install` to install missing tools or repair
-shell integration.
-
-Automatic setup is skipped for local/dependency installs, CI, elevated installs,
-or `RL_SKIP_SHELL_SETUP=1`. npm's `--ignore-scripts` also disables it. Unsupported
-shells or startup-file errors leave the CLI installed and print manual setup
-guidance. No installer can change the directory or functions of its parent shell;
-use the activation command below for the terminal that ran npm.
+The npm install makes the CLI available. Run `rl setup install` as your normal
+user to install missing tools through your package manager and register shell
+integration. The setup command preserves your shell settings and updates the
+same RL block when rerun. Pass `--shell-only` to configure integration without
+installing tools, and `--shell zsh` or `--shell bash` to configure just one shell.
+Open a new terminal afterward so that `rl` can switch its working directory.
 
 See Development below to build and try unpublished changes.
 
-`rl setup install` installs missing tools through your package manager, preserves
-your shell settings, and registers RL integration for both zsh and bash (pass
-`--shell zsh` or `--shell bash` to configure only one). Open a new terminal
-afterward; bare `rl` can then select a workspace and change directory.
 For the terminal that ran setup, use the activation command printed by
 `rl setup install`, or:
 
@@ -126,7 +117,9 @@ branches, including those outside RL's usual worktree directory. Selecting one
 registers it and installs the usual workspace hooks; its path, files and branch
 stay in place. Worktrees without RL state are labelled `not initialized` until
 selected or explicitly adopted. Opening or cancelling the picker, and listing
-worktrees, does not initialize them.
+worktrees, does not initialize them. If you change branches in an adopted
+worktree, the picker labels it `branch switched`. Selecting it opens the directory.
+Switch back to the recorded branch to use its saved RL instance.
 `setup adopt` defaults to the current directory, and accepts a relative or
 absolute path belonging to the selected repository. Use `rl --repo <alias>`
 to choose a registered repository explicitly. Detached worktrees can be listed
@@ -248,26 +241,27 @@ review palette. Below 85 columns, the focused panel takes the full width. Node's
 keep the CLI dependency-light; no React, browser, server or extra TUI executable
 is needed for single-worktree review.
 
-Use `1`/`2`/`3` and Tab/Shift-Tab to focus panels; `j`/`k` or arrows navigate;
+Use `1`/`2`/`3` and Tab/Shift-Tab to focus panels; arrows or `j`/`k` navigate;
 Click commits, files, working-tree entries or footer actions to select them.
-Use the commit checkboxes or press Space in the commits panel to select several
-commits. The file list shows each selected commit’s patch under its commit SHA.
-Click a commit title to return to a single commit.
+In branch and PR reviews, all commits are selected by default. Click a commit
+title (or press Enter in the commits panel) to inspect only that commit, and
+click it again, uncheck it, or press `a` to show all changes again. Use the
+commit checkboxes or Space to select multiple commits.
 The mouse wheel scrolls the panel under the pointer; over a file diff it scrolls
 only that file, three lines at a time; rapid trackpad events are rate-limited.
 Sidebar wheel navigation stays at one entry per step. Scrolling commits browses
 the timeline without changing the selected commit or diff; click a commit to
 inspect it. The
 selected file stays highlighted while the diff has focus. Each file remembers
-its scroll position. Enter advances focus;
-in the diff, Enter or the clickable `[Expand]` control opens a full-width file
-view. `[Back]` or Escape restores the sidebar. PageUp/PageDown scroll by a page,
-Home/End jump to the start/end. Click the scrollbar track to jump, or click and
+its scroll position. Press `z`, or Enter in the diff, or click `[Enter: Expand]`
+to open a full-width file view; `[Enter/Esc: Back]`, `z`, or Escape restores the
+sidebar. PageUp/PageDown scroll the diff by a page from any panel, and Home/End
+jump to the start/end. Click the scrollbar track to jump, or click and
 hold the thumb to drag it; scrolling continues with the pointer outside the bar
 until you release the button. In the diff,
 Left/Right or Shift+wheel scroll horizontally. `w` selects staged, unstaged and
-untracked layers; `p` compares the committed branch with its target merge-base;
-`r` accepts `FROM TO` revisions. Initial commits compare against the empty tree;
+untracked layers; `p` compares the committed branch with its target merge-base.
+Initial commits compare against the empty tree;
 merge commits compare with their first parent. The timeline includes the latest
 10 commits, loaded with their statistics in one Git call. `/` searches file paths in the files panel and text in the selected
 diff; `n`/`N` jump between matches. `o` opens the captured Git version and source

@@ -28,8 +28,15 @@ import { changedFiles } from "./review-git.js";
 import { workflowReviewState } from "./agent-runner.js";
 import { Store } from "./store.js";
 import { ReviewWatcher } from "./review-live-watch.js";
-const [root, workspaceRepo = root, temporaryRoot, freezeId, remotePr] =
-  process.argv.slice(2);
+const [
+  root,
+  workspaceRepo = root,
+  temporaryRoot,
+  freezeId,
+  remotePr,
+  branchRef,
+  branchBase,
+] = process.argv.slice(2);
 if (remotePr) {
   process.env.GIT_TERMINAL_PROMPT = "0";
   process.env.GH_PROMPT_DISABLED = "1";
@@ -102,6 +109,7 @@ process.on("message", async (request: Request) => {
       temporaryRoot,
       freezeId,
       remote: remotePr ? Number(remotePr) : undefined,
+      branch: branchRef ? { ref: branchRef, base: branchBase } : undefined,
     });
     if (request.op !== "refresh") repository.assertIdentity();
     let result: unknown;
@@ -118,7 +126,7 @@ process.on("message", async (request: Request) => {
       result = repository.history(request.head!, request.base);
     else if (request.op === "identity") result = true;
     else if (request.op === "workflow") {
-      if (remotePr) result = null;
+      if (remotePr || branchRef) result = null;
       else {
         const store = new Store(
           workspaceRepo,
@@ -224,18 +232,19 @@ process.on("message", async (request: Request) => {
         commands.join("\n") + "\n",
       );
     } else if (request.op === "checkpoint")
-      result = remotePr
-        ? loadCheckpoint(request.directory!, request.key!)
-        : loadUnifiedCheckpoint(
-            root,
-            workspaceRepo,
-            request.directory!,
-            request.key!,
-            request.branch!,
-            request.pr,
-          );
+      result =
+        remotePr || branchRef
+          ? loadCheckpoint(request.directory!, request.key!)
+          : loadUnifiedCheckpoint(
+              root,
+              workspaceRepo,
+              request.directory!,
+              request.key!,
+              request.branch!,
+              request.pr,
+            );
     else if (request.op === "mark") {
-      if (remotePr)
+      if (remotePr || branchRef)
         saveCheckpoint(root, request.directory!, request.key!, request.point!);
       else
         await saveUnifiedCheckpoint(

@@ -132,6 +132,7 @@ export function reviewLayout(
   expanded = false,
   sidebarWidth?: number,
   gutterWidth = 0,
+  hasWorkingPanel = true,
 ): ReviewLayout {
   width = Math.max(1, width);
   rows = Math.max(1, rows);
@@ -154,10 +155,12 @@ export function reviewLayout(
       );
   const commitHeight = narrow
     ? body.height
-    : Math.max(4, Math.floor(body.height * 0.43));
+    : Math.max(4, Math.floor(body.height * (hasWorkingPanel ? 0.43 : 0.42)));
   const fileHeight = narrow
     ? body.height
-    : Math.max(4, Math.floor(body.height * 0.36));
+    : hasWorkingPanel
+      ? Math.max(4, Math.floor(body.height * 0.36))
+      : Math.max(4, body.height - commitHeight);
   const commits = { x: body.x, y: body.y, width: left, height: commitHeight };
   const files = {
     x: body.x,
@@ -165,14 +168,15 @@ export function reviewLayout(
     width: left,
     height: fileHeight,
   };
-  const working = narrow
-    ? undefined
-    : {
-        x: body.x,
-        y: files.y + files.height,
-        width: left,
-        height: body.height - commitHeight - fileHeight,
-      };
+  const working =
+    narrow || !hasWorkingPanel
+      ? undefined
+      : {
+          x: body.x,
+          y: files.y + files.height,
+          width: left,
+          height: body.height - commitHeight - fileHeight,
+        };
   const diff = {
     x: narrow ? body.x : left + 3,
     y: body.y,
@@ -223,6 +227,7 @@ export interface ReviewView {
   focus: number;
   expanded: boolean;
   remoteOnly?: boolean;
+  branchOnly?: boolean;
   sidebarWidth?: number;
   textSelection?: ReviewTextSelection;
   filterMenu?: {
@@ -357,6 +362,7 @@ export function reviewFrame(view: ReviewView): ReviewFrame {
       view.expanded,
       view.sidebarWidth,
       view.lineNumbers ? 12 : 0,
+      !view.remoteOnly && !view.branchOnly,
     ),
     palette = reviewPalette;
   const spans: {
@@ -513,17 +519,49 @@ export function reviewFrame(view: ReviewView): ReviewFrame {
 
   function commits(): void {
     const rect = layout.commits;
+    const allSelected = view.mode.kind === "branch" && view.commits.length > 0;
     const selectedShas = new Set(
-      view.mode.kind === "commits"
-        ? view.mode.commits.map((commit) => commit.sha)
-        : [],
+      allSelected
+        ? view.commits.map((commit) => commit.sha)
+        : view.mode.kind === "commits"
+          ? view.mode.commits.map((commit) => commit.sha)
+          : view.mode.kind === "commit"
+            ? [view.mode.sha]
+            : [],
     );
-    const selection = selectedShas.size
-      ? `${selectedShas.size} selected`
-      : "Space to select";
-    heading(rect, `1 COMMITS · ${selection}`, view.focus === 0);
+    const filtered =
+      !allSelected &&
+      (view.mode.kind === "commit" || view.mode.kind === "commits") &&
+      selectedShas.size > 0;
+    const selection = allSelected
+      ? `All ${view.commits.length} selected`
+      : filtered
+        ? `${selectedShas.size}/${view.commits.length} selected`
+        : "Click or Space to select";
+    const allButton = filtered ? "[a: All]" : "";
+    const buttonWidth = allButton ? Math.min(rect.width, allButton.length) : 0;
+    paint(
+      rect.x,
+      rect.y,
+      Math.max(0, rect.width - buttonWidth - (buttonWidth ? 1 : 0)),
+      `1 COMMITS · ${selection}`,
+      view.focus === 0 ? palette.blue : palette.muted,
+    );
+    if (buttonWidth) {
+      const buttonX = rect.x + rect.width - buttonWidth;
+      paint(buttonX, rect.y, buttonWidth, allButton, palette.amber);
+      hits.push({
+        x: buttonX,
+        y: rect.y,
+        width: buttonWidth,
+        height: 1,
+        action: "shortcut",
+        shortcut: "a",
+      });
+    }
     hits.push({ ...rect, action: "commits" });
-    const includeWorking = layout.narrow && !view.remoteOnly;
+    const includeWorking =
+      layout.narrow && !view.remoteOnly && !view.branchOnly;
     const capacity = Math.max(1, Math.floor((rect.height - 2) / 3));
     const start = Math.max(
       0,
@@ -538,13 +576,14 @@ export function reviewFrame(view: ReviewView): ReviewFrame {
         y = rect.y + 1 + row * 3;
       if (index !== 0 && !commit) break;
       const checked = commit !== undefined && selectedShas.has(commit.sha);
+      const isCursor = view.focus === 0 && index === view.commitIndex;
       const active =
         index === 0
           ? view.mode.kind === "working"
-          : commit &&
-            (checked ||
-              (view.mode.kind === "commit" && view.mode.sha === commit.sha));
-      const cursor = view.focus === 0 && index === view.commitIndex ? "›" : " ";
+          : allSelected
+            ? isCursor
+            : checked || isCursor;
+      const cursor = isCursor ? "›" : " ";
       const text = commit
         ? `[${checked ? "x" : " "}] ${cursor} ${commit.sha.slice(0, 7)} ${commit.subject}`
         : "● WORKING TREE";
@@ -568,9 +607,9 @@ export function reviewFrame(view: ReviewView): ReviewFrame {
       });
       if (commit)
         hits.push({
-          x: rect.x + 1,
+          x: rect.x,
           y,
-          width: 3,
+          width: 5,
           height: 1,
           action: "toggle-commit",
           index,
@@ -584,7 +623,7 @@ export function reviewFrame(view: ReviewView): ReviewFrame {
     const rect = layout.files;
     heading(
       rect,
-      `2 FILES IN SELECTION${view.reviewed ? ` · ${view.files.filter((file) => view.reviewed!.has(file.key)).length}/${view.files.length} reviewed` : ""}`,
+      `2 FILES${view.reviewed ? ` · ${view.files.filter((file) => view.reviewed!.has(file.key)).length}/${view.files.length} reviewed` : ""}`,
       view.focus === 1,
     );
     hits.push({ ...rect, action: "files" });
@@ -631,17 +670,11 @@ export function reviewFrame(view: ReviewView): ReviewFrame {
         view.hiddenFiles ? "Files filtered · t shows all" : "No changed files",
         palette.muted,
       );
-    if (!layout.narrow) rule(rect, rect.y + rect.height - 1);
+    if (!layout.narrow && layout.working) rule(rect, rect.y + rect.height - 1);
   }
   function working(): void {
     const rect = layout.working;
     if (!rect) return;
-    if (view.remoteOnly) {
-      heading(rect, "REMOTE PR · p", false);
-      line(rect, rect.y + 1, "No checkout · remote polling", palette.muted);
-      hits.push({ ...rect, action: "shortcut", shortcut: "p" });
-      return;
-    }
     heading(
       rect,
       "WORKING TREE  ·  w",
@@ -838,7 +871,11 @@ export function reviewFrame(view: ReviewView): ReviewFrame {
         ? reviewSelectionBounds(view.textSelection)
         : undefined;
     const position = `${view.files.length ? view.fileIndex + 1 : 0} / ${view.files.length}`;
-    const expand = view.expanded ? "[Back]" : "[Expand]";
+    const expand = view.expanded
+      ? "[Enter/Esc: Back]"
+      : view.focus === 2
+        ? "[Enter: Expand]"
+        : "[z: Expand]";
     const controls = Math.min(rect.width, position.length + expand.length + 3);
     paint(
       rect.x,
@@ -967,11 +1004,22 @@ export function reviewFrame(view: ReviewView): ReviewFrame {
       palette.text,
       palette.surface,
     );
+    const scrollHint = view.help
+      ? bar.limit
+        ? "↑/↓ Scroll · Esc Close"
+        : "Esc Close"
+      : !bar.limit
+        ? "All lines shown"
+        : view.focus === 2
+          ? "↑/↓ Scroll · PgUp/PgDn Page"
+          : "3 Focus to scroll · PgUp/PgDn Page";
+    const filesHint = view.help ? "" : " · [ / ] Prev/Next file";
+    const copyHint = view.textSelection ? " · y Copy" : "";
     paint(
       rect.x,
       viewport.y + contentHeight + 1,
       rect.width,
-      `j/k Scroll · [ ] Files · y Copy · ${Math.min(offset + 1, lines.length)}–${Math.min(offset + viewport.height, lines.length)} / ${lines.length}`,
+      `${scrollHint}${filesHint}${copyHint} · ${Math.min(offset + 1, lines.length)}–${Math.min(offset + viewport.height, lines.length)} / ${lines.length}`,
       palette.muted,
     );
     hits.push({ ...rect, action: "diff" });
@@ -1037,27 +1085,21 @@ export function reviewFrame(view: ReviewView): ReviewFrame {
     { text: "1 Commits", key: "1" },
     { text: "2 Files", key: "2" },
     { text: "3 Diff", key: "3" },
-    ...(!view.remoteOnly ? [{ text: "W Workflow", key: "W" }] : []),
+    { text: "Tab Next", key: "\t" },
+    { text: view.expanded ? "z Back" : "z Expand", key: "z" },
     ...(view.pr
       ? [
           { text: "i Comment", key: "i" },
-          {
-            text: `D Drafts${view.draftCount ? `(${view.draftCount})` : ""}`,
-            key: "D",
-          },
+          ...(view.draftCount
+            ? [{ text: `D Drafts(${view.draftCount})`, key: "D" }]
+            : []),
           { text: "R Review", key: "R" },
         ]
       : []),
-    { text: "−", key: "-" },
-    { text: "+", key: "+" },
-    { text: "T Filters", key: "T" },
-    { text: "b Compare", key: "b" },
-    { text: view.hideNoise ? "t Show all" : "t Focus files", key: "t" },
-    { text: "Tab Switch", key: "\t" },
-    { text: "r Range", key: "r" },
-    { text: "S Since Review", key: "s" },
+    { text: "v Reviewed", key: "v" },
+    { text: view.hideNoise ? "t Show all" : "t Focus", key: "t" },
     { text: "/ Search", key: "/" },
-    { text: "F Freeze", key: "f" },
+    { text: "o Open", key: "o" },
     { text: "? Help", key: "?" },
   ];
   let x = 1;
@@ -1075,7 +1117,7 @@ export function reviewFrame(view: ReviewView): ReviewFrame {
     x += item.text.length + 2;
   }
   const quitX = Math.max(0, layout.width - 7);
-  paint(quitX, footerY + 2, Math.min(6, layout.width), "Q Quit", palette.muted);
+  paint(quitX, footerY + 2, Math.min(6, layout.width), "q Quit", palette.muted);
   hits.push({
     x: quitX,
     y: footerY + 2,

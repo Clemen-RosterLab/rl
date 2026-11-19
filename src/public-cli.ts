@@ -18,7 +18,7 @@ import { explicitHelp, topicHelp, usageHintForWords } from "./help.js";
 import { installRl } from "./install.js";
 import { main as mcpSetupMain } from "./mcp-setup.js";
 import { main as mcpMain } from "./mcp.js";
-import { candidates, select } from "./picker.js";
+import { candidates, openPickerWorktree, select } from "./picker.js";
 import { main as prUpdateMain } from "./pr-update.js";
 import { main as prWorkflowMain } from "./pr-workflow.js";
 import {
@@ -410,11 +410,9 @@ export async function runPublicCli(rawArgv: string[]): Promise<number> {
       }
       const selected = await select(store, items, defaultBase, false);
       if (selected.length > 0) {
-        const [root, branch] = store.worktree(selected[0].path);
-        if (branch !== selected[0].branch)
-          throw new Error("Workspace branch changed during selection; retry");
-        await store.adopt(root, defaultBase);
-        writeWorkspaceOutput(root);
+        writeWorkspaceOutput(
+          await openPickerWorktree(store, selected[0], defaultBase),
+        );
       }
       return 0;
     }
