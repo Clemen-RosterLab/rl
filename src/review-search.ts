@@ -1,12 +1,13 @@
 import type { LiveRepository, ReviewFile } from "./review-live-engine.js";
 
-export type ReviewSearchScope = "diff" | "paths" | "changes" | "files";
+export type ReviewSearchScope = "diff" | "paths" | "changes" | "files" | "repo";
 export interface ReviewSearchHit {
   fileKey: string;
   path: string;
   line: number;
   preview: string;
   fullFile: boolean;
+  repoHit?: boolean;
 }
 export interface ReviewSearchResult {
   hits: ReviewSearchHit[];

@@ -999,6 +999,134 @@ def terminal_recovery_scenario():
     expect('SHELL_TYPED_OK', start)
 
 
+def tree_and_file_scenario():
+    expect_screen('3 DIFF PREVIEW')
+    expect_screen('[c: File]')
+    expect_screen('[Tree]')
+    expect_screen('Updated')
+    click('M app.ts')
+    expect_screen('+const changedLine = 2;')
+    # Toggle to full-file view via clickable header control and verify diff highlights.
+    click('[c: File]')
+    expect_screen('3 FILE · AFTER')
+    expect_screen('[c: Diff]')
+    expect_screen('[e: Before]')
+    expect_screen('const headerContext = 1;')
+    expect_screen('const changedLine = 2;')
+    expect_screen('const addedLine = 3;')
+    assert not any('+const changedLine = 2;' in row for row in screen()), 'File view retained diff prefix'
+    assert_background('const changedLine = 2;', (28, 53, 43))
+    assert_background('const addedLine = 3;', (28, 53, 43))
+    assert_background('const headerContext = 1;', (29, 36, 45))
+    # Navigate to the later pure-deletion hunk via } in full-file view.
+    key('\x1b[H}')
+    expect_screen('const afterDeleted = 100;')
+    assert_background('  −1 ', (59, 37, 44))
+    # Switch to Before file view and verify deleted lines are highlighted in red.
+    click('[e: Before]')
+    expect_screen('3 FILE · BEFORE')
+    expect_screen('[e: After]')
+    key('\x1b[H')
+    expect_screen('const changedLine = 1;')
+    assert_background('const changedLine = 1;', (59, 37, 44))
+    # Switch back to Diff view via clickable toggle.
+    click('[c: Diff]')
+    expect_screen('3 DIFF PREVIEW')
+    expect_screen('-const changedLine = 1;')
+    expect_screen('+const changedLine = 2;')
+    # Switch Panel 1 from Commits to Directory Tree tab by clicking [Tree].
+    click('[Tree]')
+    expect_screen('1 TREE')
+    expect_screen('[Commits]')
+    expect_screen('▾ src/ (2)')
+    expect_screen('▸ docs/')
+    # Expand docs/ folder and open an unchanged repository file.
+    click('▸ docs/')
+    expect_screen('▾ docs/')
+    expect_screen('guide.md')
+    click('guide.md')
+    expect_screen('3 FILE · AFTER')
+    expect_screen('Repo')
+    expect_screen('unchanged guide documentation')
+    # Toggling Diff on an unchanged file explains there are no changes; toggling back restores file view.
+    click('[c: Diff]')
+    expect_screen('No changes to this file in the current comparison.')
+    click('[c: File]')
+    expect_screen('unchanged guide documentation')
+    # Clicking a changed file in the directory tree restores diff/file view cleanly.
+    click('M app.ts')
+    expect_screen('3 FILE · AFTER')
+    expect_screen('const changedLine = 2;')
+    assert_background('const changedLine = 2;', (28, 53, 43))
+    # Clicking a deleted file in the directory tree opens it in Before view with deletion highlights.
+    click('D removed.ts')
+    expect_screen('3 FILE · BEFORE')
+    expect_screen('export const gone = true;')
+    assert_background('export const gone = true;', (59, 37, 44))
+    # Switch Panel 1 back to Commits tab via [Commits] button and keyboard x.
+    click('[Commits]')
+    expect_screen('1 COMMITS')
+    key('x')
+    expect_screen('1 TREE')
+    key('x')
+    expect_screen('1 COMMITS')
+    key('q')
+
+
+def definition_and_search_scenario():
+    expect_screen('3 DIFF PREVIEW')
+    expect_screen('+const total = computeBonus(localRate);')
+    expect_screen('Updated')
+    # Ctrl-click (SGR button 16) on `computeBonus` directly inside the diff view.
+    sym_x, sym_y = locate('computeBonus(')
+    mouse(16, sym_x + 3, sym_y)
+    mouse(16, sym_x + 3, sym_y, True)
+    expect_screen('3 FILE · AFTER')
+    expect_screen('src/helpers.ts')
+    expect_screen('export function computeBonus(rate: number)')
+    expect_screen('[← Back]')
+    # Clicking [← Back] returns to the diff we jumped from.
+    click('[← Back]')
+    expect_screen('3 DIFF PREVIEW')
+    expect_screen('src/app.ts')
+    # Ctrl-click on a same-file local variable jumps to its local declaration.
+    rate_x, rate_y = locate('localRate);')
+    mouse(16, rate_x + 2, rate_y)
+    mouse(16, rate_x + 2, rate_y, True)
+    expect_screen('3 FILE · AFTER')
+    expect_screen('const localRate = 42;')
+    expect_screen('[← Back]')
+    # Backspace also jumps back.
+    key('\x7f')
+    expect_screen('3 DIFF PREVIEW')
+    # Ctrl-click on an ambiguous symbol opens the DEFINITIONS picker.
+    amb_x, amb_y = locate('duplicateHelper()')
+    mouse(16, amb_x + 3, amb_y)
+    mouse(16, amb_x + 3, amb_y, True)
+    expect_screen('DEFINITIONS · duplicateHelper (2)')
+    key('\r')
+    expect_screen('export function duplicateHelper()')
+    key('\x7f')
+    expect_screen('3 DIFF PREVIEW')
+    # Keyboard `g` opens Go-to-definition prompt when no symbol is clicked.
+    click('1 COMMITS')
+    key('g')
+    expect_screen('Go to definition / symbol:')
+    key('computeBonus\r')
+    expect_screen('export function computeBonus(rate: number)')
+    key('\x7f')
+    # Repository-wide search finds text inside unchanged repository files via `[repo;` scope.
+    key('/\t\t\t\t')
+    expect_screen('[repo;')
+    key('uniqueRepoNeedle\r')
+    expect_screen('SEARCH RESULTS · 1')
+    expect_screen('docs/notes.md')
+    key('\r')
+    expect_screen('3 FILE · AFTER')
+    expect_screen('uniqueRepoNeedle inside unchanged docs')
+    key('q')
+
+
 try:
     size(34, 160)
     if scenario == "mouse":
@@ -1011,6 +1139,10 @@ try:
         filter_reopen_scenario()
     elif scenario == "improvements":
         improvements_scenario()
+    elif scenario == "tree-and-file":
+        tree_and_file_scenario()
+    elif scenario == "definition-and-search":
+        definition_and_search_scenario()
     elif scenario == "pr-navigation":
         pr_navigation_scenario()
     elif scenario == "pr-freeze":

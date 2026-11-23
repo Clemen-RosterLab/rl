@@ -12,7 +12,7 @@ import {
   type Checkpoint,
 } from "./review-live-engine.js";
 
-function registeredReview(
+export function registeredReview(
   root: string,
   repository: string,
   directory: string,

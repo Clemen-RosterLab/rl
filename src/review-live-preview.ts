@@ -50,62 +50,108 @@ export class ReviewPreview {
     this.current = controller;
     try {
       if (request.fullFile) {
-        const before = request.side === "before";
-        let oid = before ? file.beforeBlob : file.afterBlob;
-        if (!oid) {
-          const tree = before ? file.from : file.to;
-          const name = before ? (file.oldPath ?? file.path) : file.path;
-          oid = (
-            await this.git(
-              ["rev-parse", "--verify", `${tree}:${name}`],
-              controller.signal,
-            )
-          ).text.trim();
-        }
-        if (!OID.test(oid)) throw new Error("Invalid reviewed file identity");
-        if (/^0+$/.test(oid)) return "";
-        const size = Number(
-          (
-            await this.git(["cat-file", "-s", oid], controller.signal)
-          ).text.trim(),
-        );
-        if (size > LIMIT)
-          return `[File exceeds ${LIMIT} bytes; use o to inspect the captured version.]`;
-        if (file.binary) return `[Binary file: ${size} bytes]`;
-        const result = await this.git(
-          ["cat-file", "blob", oid],
-          controller.signal,
-        );
-        return result.text.includes("\0")
-          ? `[Binary file: ${size} bytes]`
-          : result.text;
+        return await this.readBlob(file, request, controller.signal);
       }
-      const from = request.viewed?.tree ?? file.from;
-      if (!OID.test(from) || !OID.test(file.to))
-        throw new Error("Invalid preview revision identity");
-      const paths = [
-        ...new Set(
-          [
-            request.viewed ? request.viewed.path : file.oldPath,
-            file.path,
-          ].filter((name): name is string => !!name),
-        ),
-      ];
-      const result = await this.git(
-        diffArgs(from, file.to, paths, request.context),
-        controller.signal,
-      );
-      return (
-        result.text +
-        (result.truncated
-          ? "\n[Diff truncated at 8 MiB; open the file with o for further inspection.]"
-          : request.viewed && !result.text
-            ? "No changes since you last viewed this file.\n"
-            : "")
-      );
+      return await this.readDiff(file, request, controller.signal);
     } finally {
       if (this.current === controller) this.current = undefined;
     }
+  }
+
+  async readFullFile(
+    file: ReviewFile,
+    request: PreviewRequest & { includePatch?: boolean },
+  ): Promise<{ text: string; patch?: string }> {
+    this.cancel();
+    if (this.closed) throw new Error("Review closed");
+    const gitDir = canonical(request.gitDir);
+    this.gitDir ??= gitDir;
+    if (this.gitDir !== gitDir)
+      throw new Error("Worktree identity changed; reopen review explicitly");
+    const controller = new AbortController();
+    this.current = controller;
+    try {
+      const text = await this.readBlob(file, request, controller.signal);
+      let patch: string | undefined;
+      if (
+        request.includePatch &&
+        !file.binary &&
+        file.from !== file.to &&
+        OID.test(file.from) &&
+        OID.test(file.to)
+      ) {
+        const paths = [
+          ...new Set(
+            [file.oldPath, file.path].filter((name): name is string => !!name),
+          ),
+        ];
+        const diff = await this.git(
+          diffArgs(file.from, file.to, paths, 0),
+          controller.signal,
+        );
+        patch = diff.text;
+      }
+      return { text, patch };
+    } finally {
+      if (this.current === controller) this.current = undefined;
+    }
+  }
+
+  private async readBlob(
+    file: ReviewFile,
+    request: PreviewRequest,
+    signal: AbortSignal,
+  ): Promise<string> {
+    const before = request.side === "before";
+    let oid = before ? file.beforeBlob : file.afterBlob;
+    if (!oid) {
+      const tree = before ? file.from : file.to;
+      const name = before ? (file.oldPath ?? file.path) : file.path;
+      oid = (
+        await this.git(["rev-parse", "--verify", `${tree}:${name}`], signal)
+      ).text.trim();
+    }
+    if (!OID.test(oid)) throw new Error("Invalid reviewed file identity");
+    if (/^0+$/.test(oid)) return "";
+    const size = Number(
+      (await this.git(["cat-file", "-s", oid], signal)).text.trim(),
+    );
+    if (size > LIMIT)
+      return `[File exceeds ${LIMIT} bytes; use o to inspect the captured version.]`;
+    if (file.binary) return `[Binary file: ${size} bytes]`;
+    const result = await this.git(["cat-file", "blob", oid], signal);
+    return result.text.includes("\0")
+      ? `[Binary file: ${size} bytes]`
+      : result.text;
+  }
+
+  private async readDiff(
+    file: ReviewFile,
+    request: PreviewRequest,
+    signal: AbortSignal,
+  ): Promise<string> {
+    const from = request.viewed?.tree ?? file.from;
+    if (!OID.test(from) || !OID.test(file.to))
+      throw new Error("Invalid preview revision identity");
+    const paths = [
+      ...new Set(
+        [request.viewed ? request.viewed.path : file.oldPath, file.path].filter(
+          (name): name is string => !!name,
+        ),
+      ),
+    ];
+    const result = await this.git(
+      diffArgs(from, file.to, paths, request.context),
+      signal,
+    );
+    return (
+      result.text +
+      (result.truncated
+        ? "\n[Diff truncated at 8 MiB; open the file with o for further inspection.]"
+        : request.viewed && !result.text
+          ? "No changes since you last viewed this file.\n"
+          : "")
+    );
   }
 
   private git(

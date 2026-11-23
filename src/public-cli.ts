@@ -465,8 +465,15 @@ export async function runPublicCli(rawArgv: string[]): Promise<number> {
         return code;
       }
 
-      case "workflow":
       case "policy":
+      case "workflow":
+        if (command === "workflow" && rest[0] === "sniperflow") {
+          const { sniperflow } = await import("./orchestration/sniperflow.js");
+          return await sniperflow(
+            new Store(repoRoot, envSettings.stateDir),
+            rest.slice(1),
+          );
+        }
         return await agentWorkflowsMain([...contextFlags, command, ...rest]);
 
       case "agent": {

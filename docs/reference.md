@@ -12,6 +12,7 @@
 - [Finish a feature](#finish-a-feature)
 - [Pull requests](#pull-requests)
 - [Codex and Claude](#codex-and-claude)
+- [Sniperflow](#sniperflow)
 - [Session-driven agent workflows](#session-driven-agent-workflows)
 - [Let agents use notes through MCP](#let-agents-use-notes-through-mcp)
 - [Notes and reports](#notes-and-reports)
@@ -829,7 +830,7 @@ When using the native writer/reviewer/DRY workflow, bind each peer's actual
 Antigravity conversation UUID before implementation. RL uses the saved binding
 to keep peers separate from the parent session and prevent recursive workflows.
 Binding removes the child from resume choices immediately. Resume also repairs
-older saved child entries using recorded workflow bindings; known children stay
+older saved child entries using recorded workflow bindings and, when the `sqlite3` CLI is available, parent or nesting metadata from Antigravity’s local conversation indexes. Native hooks also identify children by their parent or root conversation UUID. Known children stay
 excluded even after their workflow history is pruned. Both the picker and
 `--latest` keep legitimate main conversations available.
 
@@ -854,12 +855,35 @@ CLI help: Codex 0.160.1 and Claude Code 2.1.290. Live model sessions and all old
 versions are not certified. See the official [Codex hooks](https://learn.chatgpt.com/docs/hooks)
 and [Claude hooks](https://code.claude.com/docs/en/hooks) contracts.
 
+## Sniperflow
+
+From an adopted workspace with an authenticated Codex CLI, give the orchestrator a ticket objective.
+
+```sh
+rl workflow sniperflow 'Add a weekly total to the employee schedule'
+rl workflow sniperflow 'Implement the acceptance criteria in tickets/2481.md' --lines 300 --seconds 5400
+```
+
+The run starts immediately in the foreground. The specialist traces affected code and gives evidence and confidence for each claim. The product owner defines acceptance criteria. The orchestrator delegates exact files to up to three concurrent writers. Overlapping assignments wait. Writers submit patches to an isolated draft that includes the starting checkout’s local changes. Each round, three reviewers inspect the writer diffs for regressions, maintainability and unnecessary code. The product owner checks the result against the objective. The orchestrator can request another implementation or review round and present counterarguments.
+
+The default budget is **500 added production lines**, measured across the cumulative Git diff from launch. Replacements count their added lines. Deletions earn no credit. RL uses file conventions to exempt tests, styles, JSON, generated files, documentation and other data or assets. There is no round limit. Acceptance requires the current draft to satisfy the budget, pass the four reviews and receive the orchestrator’s sign-off.
+
+The default run lasts up to **three hours**. The orchestrator runs until the workflow ends. It gives writers **15 minutes** by default and other delegated agents **5 minutes**. Use `--seconds` for the overall limit, `--agent-seconds` to set a shared assignment default, and `--writer-seconds` to set a separate writer default. Writer briefs identify the affected code, the requested behavior change, and a check with an expected result. The orchestrator can set individual deadlines and grant or deny an agent’s request for more time. RL asks for a final report before an assignment expires and terminates an unresponsive agent at cutoff. In another terminal in the same workspace:
+
+```sh
+rl workflow sniperflow --status
+rl workflow sniperflow --lines 750     # set the running ticket’s total budget
+rl workflow sniperflow --extend 900
+```
+
+Acceptance applies the writer patch to the original checkout as unstaged changes. If the checkout changed independently, the run stops with its draft available for inspection. Status gives the run directory containing the draft and `events.jsonl`, including reports from incomplete runs. Ctrl-C stops the run.
+
 ## Session-driven agent workflows
 
 An adopted workspace has a built-in `writer-reviewer-dry` workflow immediately,
 without creating configuration files. Your current Codex, Claude or Antigravity session
 creates and controls its native children. RL supplies their editable roles,
-handoff rules, review policy and durable run records. RL never manages a provider CLI or model API session for a workflow.
+handoff rules, review policy and durable run records. For these session-driven workflows the host manages its own agent processes.
 Only an explicit `workflow check` request executes a planned validation command
 within the current host permissions.
 

@@ -13,6 +13,7 @@ import {
 import { message } from "./common.js";
 import { reviewGit } from "./review-git.js";
 import {
+  registeredReview,
   saveUnifiedCheckpoint,
   loadUnifiedCheckpoint,
 } from "./review-history.js";
@@ -22,11 +23,11 @@ import {
   recordFileViewed,
 } from "./review-progress.js";
 import { searchReviewFiles } from "./review-search.js";
+import { rankDefinitions } from "./review-symbols.js";
 import { rankReviewFiles } from "./review-ranking.js";
 import type { ViewedFile } from "./review-progress.js";
 import { changedFiles } from "./review-git.js";
 import { workflowReviewState } from "./agent-runner.js";
-import { Store } from "./store.js";
 import { ReviewWatcher } from "./review-live-watch.js";
 const [
   root,
@@ -90,6 +91,9 @@ interface Request {
   side?: "before" | "after";
   query?: string;
   scope?: "changes" | "files";
+  symbol?: string;
+  currentPath?: string;
+  currentLine?: number;
   branch?: string;
   pr?: number;
   viewed?: ViewedFile;
@@ -128,16 +132,19 @@ process.on("message", async (request: Request) => {
     else if (request.op === "workflow") {
       if (remotePr || branchRef) result = null;
       else {
-        const store = new Store(
+        const review = registeredReview(
+          root,
           workspaceRepo,
-          path.dirname(request.directory!),
+          request.directory!,
+          request.branch!,
         );
-        if (store.root !== request.directory)
-          throw new Error(
-            "Workflow state directory does not match the selected repository",
-          );
-        const [file] = store.instanceForWorktree(...store.worktree(root));
-        result = workflowReviewState(path.dirname(file), root, request.branch!);
+        result = review
+          ? workflowReviewState(
+              path.dirname(review.file),
+              root,
+              request.branch!,
+            )
+          : null;
       }
     } else if (request.op === "freeze") {
       repository.freeze(
@@ -166,6 +173,8 @@ process.on("message", async (request: Request) => {
         request.side,
       );
     else if (request.op === "references") result = repository.references();
+    else if (request.op === "tree")
+      result = repository.treeFiles(request.target!);
     else if (request.op === "rank")
       result = await rankReviewFiles(repository, request.files!);
     else if (request.op === "rank-evidence")
@@ -202,7 +211,44 @@ process.on("message", async (request: Request) => {
         request.scope!,
         request.context,
       );
-    else if (request.op === "progress")
+    else if (request.op === "grep-repo") {
+      const found = repository.grep(request.target!, request.query!, {
+        ignoreCase: true,
+        maxPerFile: 20,
+      });
+      const maxHits = 100;
+      const sliced = found.hits.slice(0, maxHits);
+      const uniqueFiles = new Set(found.hits.map((hit) => hit.path)).size;
+      result = {
+        hits: sliced.map((hit) => ({
+          fileKey: `repo\0${hit.path}`,
+          path: hit.path,
+          line: hit.line - 1,
+          preview: hit.text.trim().slice(0, 200),
+          fullFile: true,
+          repoHit: true,
+        })),
+        scanned: uniqueFiles,
+        total: uniqueFiles,
+        limited: found.limited || found.hits.length > maxHits,
+      };
+    } else if (request.op === "definition") {
+      const symbol = request.symbol!;
+      const target = request.target!;
+      const found = repository.grep(target, symbol, {
+        wholeWord: true,
+        ignoreCase: false,
+        maxPerFile: 40,
+      });
+      const currentFileText = request.currentPath
+        ? repository.blobText(target, request.currentPath)
+        : undefined;
+      result = rankDefinitions(found.hits, symbol, {
+        currentPath: request.currentPath,
+        currentLine: request.currentLine,
+        currentFileText,
+      });
+    } else if (request.op === "progress")
       result = loadReviewProgress(request.directory!, request.key!);
     else if (request.op === "review-file")
       result = toggleFileReviewed(

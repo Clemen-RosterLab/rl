@@ -21,6 +21,7 @@ import {
   type Snapshot,
   type ChangedFile,
 } from "./review-git.js";
+import { parseGitGrep, type RepoGrepHit } from "./review-symbols.js";
 
 export const REVIEW_HISTORY_LIMIT = 10;
 
@@ -771,6 +772,92 @@ export class LiveRepository {
         const [ref, sha] = line.split("\0");
         return { label: ref, ref, sha };
       });
+  }
+  treeFiles(target: string): string[] {
+    if (!OID.test(target)) throw new Error("Invalid tree revision identity");
+    const raw = reviewGit(this.root, [
+      "ls-tree",
+      "-r",
+      "--name-only",
+      "-z",
+      target,
+    ]);
+    return raw ? raw.split("\0").filter(Boolean) : [];
+  }
+  grep(
+    target: string,
+    query: string,
+    options: {
+      wholeWord?: boolean;
+      ignoreCase?: boolean;
+      maxPerFile?: number;
+    } = {},
+  ): { hits: RepoGrepHit[]; limited: boolean } {
+    if (!OID.test(target)) throw new Error("Invalid search revision identity");
+    if (!query) return { hits: [], limited: false };
+    const args = [
+      "--no-optional-locks",
+      "--no-pager",
+      "-c",
+      "color.ui=false",
+      "grep",
+      "-z",
+      "-n",
+      "-I",
+      "-F",
+      ...(options.wholeWord ? ["-w"] : []),
+      ...(options.ignoreCase ? ["-i"] : []),
+      ...(options.maxPerFile ? [`--max-count=${options.maxPerFile}`] : []),
+      "--",
+      query,
+      target,
+    ];
+    const result = spawnSync("git", args, {
+      cwd: this.root,
+      env: gitEnv(),
+      encoding: "utf8",
+      maxBuffer: 4 * 1024 * 1024,
+      timeout: 15000,
+      killSignal: "SIGKILL",
+    });
+    const truncated =
+      Boolean(result.error) &&
+      (result.error as NodeJS.ErrnoException).code === "ENOBUFS";
+    if (result.error && !truncated) {
+      throw new Error(`Repository search failed: ${result.error.message}`);
+    }
+    // git grep exits with status 1 when no lines match.
+    if (!truncated && result.status !== 0 && result.status !== 1) {
+      throw new Error(
+        result.stderr.trim() ||
+          `Git grep failed (${result.signal ?? result.status})`,
+      );
+    }
+    return {
+      hits: parseGitGrep(result.stdout ?? "", target),
+      limited: truncated,
+    };
+  }
+  blobText(
+    target: string,
+    filePath: string,
+    limit = 1024 * 1024,
+  ): string | undefined {
+    if (!OID.test(target) || !filePath) return undefined;
+    try {
+      const oid = reviewGit(this.root, [
+        "rev-parse",
+        "--verify",
+        `${target}:${filePath}`,
+      ]).trim();
+      if (!OID.test(oid)) return undefined;
+      const size = Number(reviewGit(this.root, ["cat-file", "-s", oid]).trim());
+      if (size > limit) return undefined;
+      const text = reviewGit(this.root, ["cat-file", "blob", oid]);
+      return text.includes("\0") ? undefined : text;
+    } catch {
+      return undefined;
+    }
   }
 }
 export function checkpointKey(

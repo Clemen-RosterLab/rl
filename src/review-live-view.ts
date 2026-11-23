@@ -8,6 +8,7 @@ import {
   type ReviewSettings,
 } from "./review-live-files.js";
 import type { ReviewRanks } from "./review-ranking.js";
+import type { FileDiffHighlights, TreeRow } from "./review-tree.js";
 
 const foreground = (hex: string) =>
   process.env.NO_COLOR ? "" : `\x1b[38;2;${rgb(hex)}m`;
@@ -209,6 +210,8 @@ export interface HitRegion extends Rect {
   action:
     | "commits"
     | "toggle-commit"
+    | "sidebar-tab"
+    | "tree"
     | "files"
     | "diff"
     | "scrollbar"
@@ -217,9 +220,11 @@ export interface HitRegion extends Rect {
     | "menu"
     | "working"
     | "expand"
+    | "jump-back"
     | "shortcut";
   index?: number;
   shortcut?: string;
+  tab?: "commits" | "tree";
 }
 export interface ReviewView {
   width: number;
@@ -229,6 +234,15 @@ export interface ReviewView {
   remoteOnly?: boolean;
   branchOnly?: boolean;
   sidebarWidth?: number;
+  sidebarTab?: "commits" | "tree";
+  treeRows?: TreeRow[];
+  treeIndex?: number;
+  treeScroll?: number;
+  treeTotalFiles?: number;
+  treeLoading?: boolean;
+  activeFile?: ReviewFile;
+  fileHighlights?: FileDiffHighlights;
+  canJumpBack?: boolean;
   textSelection?: ReviewTextSelection;
   filterMenu?: {
     filters: ReviewFileFilters;
@@ -456,7 +470,7 @@ export function reviewFrame(view: ReviewView): ReviewFrame {
     1,
     0,
     Math.max(0, layout.width - indicatorWidth - 2),
-    `PRVIEW / ${view.branch}`,
+    `REVIEW / ${view.branch}`,
     palette.text,
   );
   paint(
@@ -539,19 +553,41 @@ export function reviewFrame(view: ReviewView): ReviewFrame {
         ? `${selectedShas.size}/${view.commits.length} selected`
         : "Click or Space to select";
     const allButton = filtered ? "[a: All]" : "";
-    const buttonWidth = allButton ? Math.min(rect.width, allButton.length) : 0;
+    const tabButton = "[Tree]";
+    const tabWidth = rect.width >= tabButton.length + 12 ? tabButton.length : 0;
+    const buttonWidth = allButton
+      ? Math.min(
+          Math.max(0, rect.width - tabWidth - (tabWidth ? 1 : 0)),
+          allButton.length,
+        )
+      : 0;
+    const rightControls =
+      (buttonWidth ? buttonWidth + 1 : 0) + (tabWidth ? tabWidth + 1 : 0);
     paint(
       rect.x,
       rect.y,
-      Math.max(0, rect.width - buttonWidth - (buttonWidth ? 1 : 0)),
+      Math.max(0, rect.width - rightControls),
       `1 COMMITS · ${selection}`,
       view.focus === 0 ? palette.blue : palette.muted,
     );
-    if (buttonWidth) {
-      const buttonX = rect.x + rect.width - buttonWidth;
-      paint(buttonX, rect.y, buttonWidth, allButton, palette.amber);
+    let controlX = rect.x + rect.width;
+    if (tabWidth) {
+      controlX -= tabWidth;
+      paint(controlX, rect.y, tabWidth, tabButton, palette.muted);
       hits.push({
-        x: buttonX,
+        x: controlX,
+        y: rect.y,
+        width: tabWidth,
+        height: 1,
+        action: "sidebar-tab",
+        tab: "tree",
+      });
+    }
+    if (buttonWidth) {
+      controlX -= buttonWidth + (tabWidth ? 1 : 0);
+      paint(controlX, rect.y, buttonWidth, allButton, palette.amber);
+      hits.push({
+        x: controlX,
         y: rect.y,
         width: buttonWidth,
         height: 1,
@@ -619,8 +655,90 @@ export function reviewFrame(view: ReviewView): ReviewFrame {
       line(rect, rect.y + 1, "No commits yet", palette.muted);
     if (!layout.narrow) rule(rect, rect.y + rect.height - 1);
   }
+  function tree(): void {
+    const rect = layout.commits;
+    const tabButton = "[Commits]";
+    const tabWidth = rect.width >= tabButton.length + 10 ? tabButton.length : 0;
+    const title = `1 TREE${view.treeTotalFiles !== undefined ? ` · ${view.treeTotalFiles} files` : ""}`;
+    paint(
+      rect.x,
+      rect.y,
+      Math.max(0, rect.width - (tabWidth ? tabWidth + 1 : 0)),
+      title,
+      view.focus === 0 ? palette.blue : palette.muted,
+    );
+    if (tabWidth) {
+      const tabX = rect.x + rect.width - tabWidth;
+      paint(tabX, rect.y, tabWidth, tabButton, palette.muted);
+      hits.push({
+        x: tabX,
+        y: rect.y,
+        width: tabWidth,
+        height: 1,
+        action: "sidebar-tab",
+        tab: "commits",
+      });
+    }
+    hits.push({ ...rect, action: "tree" });
+    const rows = view.treeRows ?? [];
+    const capacity = Math.max(1, rect.height - 2);
+    const activePath = (view.activeFile ?? view.files[view.fileIndex])?.path;
+    const start = Math.max(
+      0,
+      Math.min(view.treeScroll ?? 0, Math.max(0, rows.length - capacity)),
+    );
+    if (view.treeLoading && !rows.length) {
+      line(rect, rect.y + 1, "Loading directory tree…", palette.muted);
+    } else if (!rows.length) {
+      line(rect, rect.y + 1, "No files in this revision", palette.muted);
+    } else {
+      for (let i = 0; i < capacity; i++) {
+        const index = start + i;
+        const row = rows[index];
+        if (!row) break;
+        const y = rect.y + 1 + i;
+        const isCursor = view.focus === 0 && index === (view.treeIndex ?? 0);
+        const isOpenFile = row.kind === "file" && row.path === activePath;
+        const active = isCursor || isOpenFile;
+        const indent = "  ".repeat(row.depth);
+        if (row.kind === "dir") {
+          const text = `${indent}${row.expanded ? "▾" : "▸"} ${row.name}/${row.changeCount ? ` (${row.changeCount})` : ""}`;
+          const fg = isCursor
+            ? palette.blue
+            : row.hasChanges
+              ? palette.amber
+              : palette.text;
+          line(rect, y, text, fg, isCursor);
+        } else {
+          const badge = row.status ? `${row.status[0]} ` : "  ";
+          const text = `${indent}${badge}${row.name}`;
+          const tone = row.status?.startsWith("A")
+            ? palette.blue
+            : row.status?.startsWith("D")
+              ? palette.red
+              : row.status
+                ? palette.green
+                : palette.text;
+          line(rect, y, text, active ? palette.blue : tone, active);
+        }
+        hits.push({
+          x: rect.x,
+          y,
+          width: rect.width,
+          height: 1,
+          action: "tree",
+          index,
+        });
+      }
+    }
+    if (!layout.narrow) rule(rect, rect.y + rect.height - 1);
+  }
   function files(): void {
     const rect = layout.files;
+    const browsingOther = Boolean(
+      view.activeFile &&
+      !view.files.some((file) => file.key === view.activeFile!.key),
+    );
     heading(
       rect,
       `2 FILES${view.reviewed ? ` · ${view.files.filter((file) => view.reviewed!.has(file.key)).length}/${view.files.length} reviewed` : ""}`,
@@ -634,7 +752,7 @@ export function reviewFrame(view: ReviewView): ReviewFrame {
         file = view.files[index];
       if (!file) break;
       const y = rect.y + 1 + row * 2,
-        active = index === view.fileIndex;
+        active = !browsingOther && index === view.fileIndex;
       const tone = file.status.startsWith("A")
         ? palette.blue
         : file.status.startsWith("D")
@@ -728,7 +846,7 @@ export function reviewFrame(view: ReviewView): ReviewFrame {
   function diff(): void {
     const rect = layout.diff,
       viewport = layout.viewport,
-      file = view.files[view.fileIndex],
+      file = view.activeFile ?? view.files[view.fileIndex],
       lines = view.help ?? view.lines;
     if (view.composer) {
       heading(rect, view.composer.title, true);
@@ -870,38 +988,126 @@ export function reviewFrame(view: ReviewView): ReviewFrame {
       !view.help && view.textSelection
         ? reviewSelectionBounds(view.textSelection)
         : undefined;
-    const position = `${view.files.length ? view.fileIndex + 1 : 0} / ${view.files.length}`;
+    const isBrowsed = Boolean(
+      view.activeFile &&
+      !view.files.some((entry) => entry.key === view.activeFile!.key),
+    );
+    const position = isBrowsed
+      ? "Repo"
+      : `${view.files.length ? view.fileIndex + 1 : 0} / ${view.files.length}`;
     const expand = view.expanded
       ? "[Enter/Esc: Back]"
       : view.focus === 2
         ? "[Enter: Expand]"
         : "[z: Expand]";
-    const controls = Math.min(rect.width, position.length + expand.length + 3);
+    const headingText = view.help
+      ? "KEYBOARD"
+      : view.fullFile
+        ? `3 FILE · ${view.beforeFile ? "BEFORE" : "AFTER"}`
+        : "3 DIFF PREVIEW";
+    const modeToggle = !view.help
+      ? view.fullFile
+        ? "[c: Diff]"
+        : "[c: File]"
+      : "";
+    const sideToggle =
+      !view.help && view.fullFile && file && file.layer !== "repository"
+        ? view.beforeFile
+          ? "[e: After]"
+          : "[e: Before]"
+        : "";
+    const backToggle = !view.help && view.canJumpBack ? "[← Back]" : "";
+    const baseControls = `${expand}  ${position}`;
+    const showModeToggle =
+      Boolean(modeToggle) &&
+      rect.width >=
+        headingText.length + 2 + modeToggle.length + 1 + baseControls.length;
+    const showSideToggle =
+      showModeToggle &&
+      Boolean(sideToggle) &&
+      rect.width >=
+        headingText.length +
+          2 +
+          sideToggle.length +
+          1 +
+          modeToggle.length +
+          1 +
+          baseControls.length;
+    const usedBeforeBack =
+      baseControls.length +
+      (showModeToggle ? modeToggle.length + 1 : 0) +
+      (showSideToggle ? sideToggle.length + 1 : 0);
+    const showBackToggle =
+      Boolean(backToggle) &&
+      rect.width >=
+        headingText.length + 2 + backToggle.length + 1 + usedBeforeBack;
+    const controlsWidth = Math.min(
+      rect.width,
+      usedBeforeBack + (showBackToggle ? backToggle.length + 1 : 0) + 1,
+    );
     paint(
       rect.x,
       rect.y,
-      Math.max(0, rect.width - controls),
-      view.help
-        ? "KEYBOARD"
-        : view.fullFile
-          ? `3 FILE · ${view.beforeFile ? "BEFORE" : "AFTER"}`
-          : "3 DIFF PREVIEW",
+      Math.max(0, rect.width - controlsWidth),
+      headingText,
       view.focus === 2 ? palette.blue : palette.text,
     );
+    let rightX = rect.x + rect.width - baseControls.length;
     paint(
-      rect.x + rect.width - controls,
+      rightX,
       rect.y,
-      controls,
-      `${expand}  ${position}`,
+      Math.min(rect.width, baseControls.length),
+      baseControls,
       palette.muted,
     );
     hits.push({
-      x: rect.x + rect.width - controls,
+      x: rightX,
       y: rect.y,
       width: expand.length,
       height: 1,
       action: "expand",
     });
+    if (showModeToggle) {
+      rightX -= modeToggle.length + 1;
+      paint(
+        rightX,
+        rect.y,
+        modeToggle.length,
+        modeToggle,
+        view.fullFile ? palette.blue : palette.muted,
+      );
+      hits.push({
+        x: rightX,
+        y: rect.y,
+        width: modeToggle.length,
+        height: 1,
+        action: "shortcut",
+        shortcut: "c",
+      });
+    }
+    if (showSideToggle) {
+      rightX -= sideToggle.length + 1;
+      paint(rightX, rect.y, sideToggle.length, sideToggle, palette.muted);
+      hits.push({
+        x: rightX,
+        y: rect.y,
+        width: sideToggle.length,
+        height: 1,
+        action: "shortcut",
+        shortcut: "e",
+      });
+    }
+    if (showBackToggle) {
+      rightX -= backToggle.length + 1;
+      paint(rightX, rect.y, backToggle.length, backToggle, palette.amber);
+      hits.push({
+        x: rightX,
+        y: rect.y,
+        width: backToggle.length,
+        height: 1,
+        action: "jump-back",
+      });
+    }
     paint(
       rect.x,
       rect.y + 1,
@@ -928,9 +1134,32 @@ export function reviewFrame(view: ReviewView): ReviewFrame {
         : undefined;
     for (let i = 0; i < contentHeight; i++) {
       const text = lines[offset + i] ?? "";
+      const fullLineNo = offset + i + 1;
+      const changeKind =
+        view.fullFile && !view.help
+          ? view.fileHighlights?.lines.get(fullLineNo)
+          : undefined;
+      const marker =
+        view.fullFile && !view.help
+          ? view.fileHighlights?.markers.get(fullLineNo)
+          : undefined;
       let tone = palette.text;
       let surface = palette.surface;
-      if (colors?.[offset + i] === 1) {
+      if (view.fullFile && !view.help) {
+        if (
+          changeKind === "added" ||
+          (changeKind === "modified" && !view.beforeFile)
+        ) {
+          tone = palette.green;
+          surface = palette.addition;
+        } else if (
+          changeKind === "deleted" ||
+          (changeKind === "modified" && view.beforeFile)
+        ) {
+          tone = palette.red;
+          surface = palette.deletion;
+        }
+      } else if (colors?.[offset + i] === 1) {
         tone = palette.green;
         surface = palette.addition;
       } else if (colors?.[offset + i] === 2) {
@@ -961,20 +1190,54 @@ export function reviewFrame(view: ReviewView): ReviewFrame {
           : undefined;
       paint(rect.x, viewport.y + i, 1, "", palette.text, surface);
       if (view.lineNumbers && !view.help) {
-        const [old, next] = view.fullFile
-          ? [undefined, offset + i + 1]
-          : (numbers![offset + i] ?? []);
-        paint(
-          rect.x + 1,
-          viewport.y + i,
-          12,
-          `${old === undefined ? "" : old}`.padStart(5) +
-            " " +
-            `${next === undefined ? "" : next}`.padStart(5) +
-            " ",
-          palette.muted,
-          palette.surface,
-        );
+        if (view.fullFile) {
+          let badge = "     ";
+          let badgeFg = palette.muted;
+          let badgeBg = palette.surface;
+          if (changeKind === "added") {
+            badge = "  +  ";
+            badgeFg = palette.green;
+            badgeBg = palette.addition;
+          } else if (changeKind === "deleted") {
+            badge = "  −  ";
+            badgeFg = palette.red;
+            badgeBg = palette.deletion;
+          } else if (changeKind === "modified") {
+            badge = "  ~  ";
+            badgeFg = palette.amber;
+            badgeBg = view.beforeFile ? palette.deletion : palette.addition;
+          } else if (marker) {
+            const count = marker.count > 99 ? "99+" : String(marker.count);
+            badge =
+              `${marker.kind === "deleted" ? "−" : "+"}${count}`.padStart(4) +
+              " ";
+            badgeFg = marker.kind === "deleted" ? palette.red : palette.green;
+            badgeBg =
+              marker.kind === "deleted" ? palette.deletion : palette.addition;
+          }
+          paint(rect.x + 1, viewport.y + i, 5, badge, badgeFg, badgeBg);
+          paint(
+            rect.x + 6,
+            viewport.y + i,
+            7,
+            ` ${String(fullLineNo).padStart(5)} `,
+            palette.muted,
+            palette.surface,
+          );
+        } else {
+          const [old, next] = numbers![offset + i] ?? [];
+          paint(
+            rect.x + 1,
+            viewport.y + i,
+            12,
+            `${old === undefined ? "" : old}`.padStart(5) +
+              " " +
+              `${next === undefined ? "" : next}`.padStart(5) +
+              " ",
+            palette.muted,
+            palette.surface,
+          );
+        }
       }
       paint(
         viewport.x,
@@ -1041,10 +1304,13 @@ export function reviewFrame(view: ReviewView): ReviewFrame {
       view.focus === 2
     )
       diff();
-    else if (view.focus === 0) commits();
-    else files();
+    else if (view.focus === 0) {
+      if (view.sidebarTab === "tree") tree();
+      else commits();
+    } else files();
   } else {
-    commits();
+    if (view.sidebarTab === "tree") tree();
+    else commits();
     files();
     working();
     diff();
@@ -1082,11 +1348,13 @@ export function reviewFrame(view: ReviewView): ReviewFrame {
       palette.muted,
     );
   const shortcuts = [
-    { text: "1 Commits", key: "1" },
+    { text: view.sidebarTab === "tree" ? "1 Tree" : "1 Commits", key: "1" },
     { text: "2 Files", key: "2" },
-    { text: "3 Diff", key: "3" },
+    { text: view.fullFile ? "3 File" : "3 Diff", key: "3" },
     { text: "Tab Next", key: "\t" },
     { text: view.expanded ? "z Back" : "z Expand", key: "z" },
+    { text: view.fullFile ? "c Diff" : "c File", key: "c" },
+    { text: view.sidebarTab === "tree" ? "x Commits" : "x Tree", key: "x" },
     ...(view.pr
       ? [
           { text: "i Comment", key: "i" },
@@ -1099,6 +1367,7 @@ export function reviewFrame(view: ReviewView): ReviewFrame {
     { text: "v Reviewed", key: "v" },
     { text: view.hideNoise ? "t Show all" : "t Focus", key: "t" },
     { text: "/ Search", key: "/" },
+    { text: "g Def", key: "g" },
     { text: "o Open", key: "o" },
     { text: "? Help", key: "?" },
   ];

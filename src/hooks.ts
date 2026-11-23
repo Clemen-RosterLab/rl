@@ -241,11 +241,15 @@ export async function handleHook(
             entry.childId === event.sessionId &&
             !entry.resumable,
         );
-        if (peer || knownChild) {
+        if (
+          peer ||
+          knownChild ||
+          (adapter.name === "agy" && event.childId === event.sessionId)
+        ) {
           event.childId = event.sessionId;
           event.resumable = false;
           // SessionStart can arrive before the parent has received and bound the
-          // new handle. Reclassify only when the persisted binding proves it.
+          // new handle. A later hook can also supply native parent metadata.
           store.markNativeChild(data, adapter.name, event.sessionId);
           scrubPrematurePeerRequests(file, adapter.name, event.sessionId);
         }

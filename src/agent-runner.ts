@@ -2,6 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { isDeepStrictEqual } from "node:util";
+import { indexedAntigravityChildren } from "./agent-agy.js";
 import { agentAdapter } from "./agent-registry.js";
 import {
   type AutomationConfig,
@@ -509,6 +510,9 @@ export function reconcileNativeSessions(
   agents: readonly ("agy" | "opencode")[] = ["agy", "opencode"],
 ): void {
   let changed = false;
+  const indexed = indexedAntigravityChildren(
+    agents.includes("agy") ? (data.sessions.agy ?? []).map((s) => s.id) : [],
+  );
   for (const agent of agents) {
     for (const session of data.sessions[agent] ?? []) {
       const knownChild = data.activity?.[agent]?.some(
@@ -517,7 +521,11 @@ export function reconcileNativeSessions(
           entry.childId === session.id &&
           !entry.resumable,
       );
-      if (knownChild || boundNativePeer(file, data, agent, session.id)) {
+      if (
+        knownChild ||
+        (agent === "agy" && indexed.has(session.id)) ||
+        boundNativePeer(file, data, agent, session.id)
+      ) {
         store.markNativeChild(data, agent, session.id);
         changed = true;
       }

@@ -1,3 +1,6 @@
+import { spawnSync } from "node:child_process";
+import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { object, sessionId } from "./common.js";
 import { parseJsonObject } from "./json.js";
@@ -55,6 +58,18 @@ export const agy: AgentAdapter = {
   },
   parse(payload) {
     const event = parseEvent(agy, payload);
+    if (
+      object(payload) &&
+      [payload.parentConversationId, payload.rootConversationId].some(
+        (id) =>
+          typeof id === "string" &&
+          id.length > 0 &&
+          sessionId(id) !== event.sessionId,
+      )
+    ) {
+      event.childId = event.sessionId;
+      event.resumable = false;
+    }
     // A stopped foreground loop can still have background work running.
     if (
       event.nativeEvent === "Stop" &&
@@ -78,6 +93,35 @@ export const agy: AgentAdapter = {
     };
   },
 };
+
+/** Existing RL records predate the native hook's parent metadata. Query only
+ * this workspace's saved UUIDs, without fetching conversation content. */
+export function indexedAntigravityChildren(ids: string[]): Set<string> {
+  const children = new Set<string>();
+  if (!ids.length) return children;
+  const quoted = ids.map((id) => "'" + sessionId(id) + "'").join(",");
+  const query = `SELECT conversation_id FROM conversation_summaries
+    WHERE conversation_id IN (${quoted}) AND
+    (nesting_depth > 0 OR (parent_conversation_id <> '' AND lower(parent_conversation_id) <> lower(conversation_id)));`;
+  const dirs = process.env.RL_AGY_DATA_DIR
+    ? [process.env.RL_AGY_DATA_DIR]
+    : ["antigravity-cli", "antigravity", "antigravity-ide"].map((product) =>
+        path.join(os.homedir(), ".gemini", product),
+      );
+  for (const dir of dirs) {
+    const db = path.join(dir, "conversation_summaries.db");
+    if (!fs.existsSync(db)) continue;
+    const result = spawnSync(
+      "sqlite3",
+      ["-batch", "-init", "/dev/null", "-readonly", db],
+      { input: query, encoding: "utf8", timeout: 1500 },
+    );
+    if (result.status === 0)
+      for (const id of result.stdout.trim().split(/\r?\n/))
+        if (id) children.add(id);
+  }
+  return children;
+}
 
 /** Stream one bounded prompt instead of putting large review evidence in argv. */
 export function agyTurn(prompt: string, flags: string[] = []) {

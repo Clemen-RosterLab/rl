@@ -369,7 +369,25 @@ const topics: Record<string, Topic> = {
     examples: [
       "rl workflow show",
       "rl workflow configure",
+      "rl workflow sniperflow 'Implement the ticket in tickets/2481.md'",
       "rl workflow status --follow",
+    ],
+  },
+  "workflow sniperflow": {
+    description:
+      "Launch recursive ticket implementation with supervised Codex agents",
+    usage:
+      "rl workflow sniperflow '<objective>' [--lines 500] [--seconds 10800] [--agent-seconds N] [--writer-seconds N]",
+    options: [
+      "--agent-seconds <N>  Default delegated assignment time (300 seconds)",
+      "--writer-seconds <N> Default writer time (900 seconds, or explicit --agent-seconds)",
+      "--lines <N>         Set the total logic-line budget at launch or during a run",
+      "--extend <seconds>  Extend the running workflow from a second terminal",
+      "--status            Show the deadline, outcome and saved draft directory",
+    ],
+    notes: [
+      "The orchestrator dispatches up to three file-exclusive writers. The product owner and three independent reviewers inspect their changes before acceptance.",
+      "The budget counts added production lines since launch. Tests, styles and data files are exempt. Accepted patches are applied to the worktree.",
     ],
   },
   "workflow configure": {

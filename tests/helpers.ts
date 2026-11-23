@@ -60,6 +60,7 @@ export class Workspace {
     RL_REPO_NAME: "example",
     RL_STATE_DIR: this.state,
     RL_CONFIG: this.config,
+    RL_AGY_DATA_DIR: path.join(this.root, "agy-data"),
     RL_DEFAULT_BASE: "origin/develop",
     RL_PR_OFFLINE: "1",
     PATH: path.join(ROOT, "bin") + path.delimiter + process.env.PATH,

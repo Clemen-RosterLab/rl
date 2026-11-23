@@ -344,6 +344,24 @@ test(
   },
 );
 
+test("bare review opens an uninitialized worktree without adopting it", (t) => {
+  const w = new Workspace(t, { minimal: true });
+  w.git(w.repo, "worktree", "add", "-qb", "topic", w.a);
+  write(path.join(w.a, "topic.txt"), "unadopted-content\n");
+  w.command([
+    "python3",
+    path.join(ROOT, "tests/review-live-pty.py"),
+    w.a,
+    process.execPath,
+    CLI,
+    w.repo,
+    w.state,
+    path.join(w.root, "worktrees/example"),
+    "uninitialized",
+  ]);
+  assert.ok(!fs.existsSync(path.join(w.a, ".codex/hooks.json")));
+});
+
 test("branch arguments review local and fetched remote refs without touching a checkout", (t) => {
   const w = new Workspace(t);
   write(path.join(w.a, "branch.txt"), "branch content\n");

@@ -132,6 +132,61 @@ test("Antigravity hooks use native configuration and responses, preserve user ho
   assert.equal(doctor.delivery, "observed");
 });
 
+test("native Antigravity parent metadata removes unbound subagents from resume choices", (t) => {
+  const w = new Workspace(t);
+  const parent = randomUUID(),
+    child = randomUUID(),
+    nested = randomUUID();
+  hook(w, "SessionStart", parent, { rootConversationId: parent });
+  hook(w, "SessionStart", child);
+  hook(w, "PreInvocation", child, { parentConversationId: parent });
+  hook(w, "SessionStart", nested, { rootConversationId: parent });
+  hook(w, "PreInvocation", child);
+  const state = w.status();
+  assert.deepEqual(
+    state.sessions.agy.map((entry: { id: string }) => entry.id),
+    [parent],
+  );
+  for (const id of [child, nested])
+    assert.ok(
+      state.activity.agy.some(
+        (entry: { sessionId: string; resumable: boolean }) =>
+          entry.sessionId === id && !entry.resumable,
+      ),
+    );
+  stub(w);
+  w.rl(["resume", "agy", "--latest"], { cwd: w.a });
+  assert.ok(readJson(w.env.AGY_CAPTURE!).args.includes(parent));
+});
+
+test("resume repairs preexisting agy children using provider metadata and preserves unknown sessions", (t) => {
+  const w = new Workspace(t),
+    parent = randomUUID(),
+    child = randomUUID(),
+    unknown = randomUUID();
+  for (const id of [parent, unknown, child]) hook(w, "SessionStart", id);
+  const dir = w.env.RL_AGY_DATA_DIR!;
+  fs.mkdirSync(dir);
+  w.command(["sqlite3", path.join(dir, "conversation_summaries.db")], {
+    input: `CREATE TABLE conversation_summaries(conversation_id TEXT, parent_conversation_id TEXT, nesting_depth INTEGER);
+    INSERT INTO conversation_summaries VALUES ('${parent}',NULL,0), ('${child}','${parent}',1);`,
+  });
+  stub(w);
+  w.rl(["resume", "agy", "--latest"], { cwd: w.a });
+  assert.ok(readJson(w.env.AGY_CAPTURE!).args.includes(unknown));
+  assert.deepEqual(
+    w
+      .status()
+      .sessions.agy.map((s: { id: string }) => s.id)
+      .sort(),
+    [parent, unknown].sort(),
+  );
+  hook(w, "PreInvocation", child);
+  assert.ok(
+    !w.status().sessions.agy.some((s: { id: string }) => s.id === child),
+  );
+});
+
 test("Antigravity rejects copied hooks, ambiguous mounted workspaces and sessions owned by another worktree", (t) => {
   const w = new Workspace(t),
     sid = randomUUID();

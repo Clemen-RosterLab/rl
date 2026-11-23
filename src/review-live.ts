@@ -81,12 +81,41 @@ import {
   type InlineDraft,
   type ReviewEvent,
 } from "./review-comments.js";
+import {
+  ancestorDirs,
+  buildFileTree,
+  flattenFileTree,
+  parentDirPath,
+  parseFileDiffHighlights,
+  type FileDiffHighlights,
+  type FileTreeNode,
+  type TreeRow,
+} from "./review-tree.js";
+import {
+  extractIdentifier,
+  symbolAtColumn,
+  type DefinitionCandidate,
+  type DefinitionSearchResult,
+} from "./review-symbols.js";
+
+interface JumpEntry {
+  filePath?: string;
+  fileKey?: string;
+  browsedFile?: ReviewFile;
+  fullFile: boolean;
+  preferredFullFile: boolean;
+  beforeFile: boolean;
+  sinceViewed: boolean;
+  scroll: number;
+  horizontal: number;
+}
 
 interface ActionMenu extends ReviewMenu {
   kind:
     | "base"
     | "target"
     | "search"
+    | "definitions"
     | "agent"
     | "review"
     | "drafts"
@@ -106,6 +135,7 @@ interface ActionMenu extends ReviewMenu {
   base?: string;
   identities?: Record<string, string>;
   hits?: ReviewSearchHit[];
+  definitions?: DefinitionCandidate[];
 }
 
 class GitWorker {
@@ -364,21 +394,25 @@ export function sourceLine(
 }
 const help = [
   "KEYBOARD",
-  "1 / 2 / 3        Focus Commits / Files / Diff",
+  "1 / 2 / 3        Focus Commits or Tree / Files / Diff",
+  "x                Switch Panel 1 tab between Commits and Directory Tree",
   "Tab / Shift-Tab  Switch panels (or next/prev file when expanded)",
-  "Up / Down, j / k Scroll diff (when Diff focused) or move list cursor",
+  "Up / Down, j / k Scroll diff (when Diff focused) or move list/tree cursor",
+  "Left / Right     Collapse/expand tree folders or scroll diff horizontally",
   "PgUp / PgDn      Page diff from any panel (also Ctrl-u / Ctrl-d, J / K)",
   "Home / End       Jump to start / end of diff",
-  "[ / ]            Previous / next file",
-  "Enter / z        Expand or collapse full-width diff (in Commits: select commit)",
-  "Space / Click    Toggle commit selection · a selects all commits",
+  "[ / ]            Previous / next changed file",
+  "Enter / z        Expand diff (in Commits: select; in Tree: open file / toggle folder)",
+  "Space / Click    Toggle commit selection · a selects all · in Tree: toggle/preview",
   "Click a commit   Inspect that commit; click it again to show all changes",
   "v                Mark file reviewed · u / U next / previous unreviewed",
   "t / T            Show all files / configure hidden categories",
-  "/                Search files or diff · n / N next / previous match",
-  "Ctrl-f           Search across all files · Tab changes search scope",
-  "c / C / e        Full-file context / more diff context / before vs after",
-  "{ / }            Previous / next diff hunk",
+  "/                Search files, tree, or diff · n / N next / previous match",
+  "Ctrl-f           Search across changed files or entire repo · Tab changes scope",
+  "Ctrl-Click / g   Go to definition of clicked/selected symbol (or symbol search)",
+  "Backspace/Ctrl-o Jump back after following a definition or search hit",
+  "c / C / e        Toggle File view (with diff highlights) / more context / Before vs After",
+  "{ / }            Previous / next diff hunk (in Diff or File view)",
   "o / O            Open reviewed file / current worktree file in VS Code",
   "w / p            Working tree changes / full branch or PR comparison",
   "m / s / f        Save checkpoint / compare since checkpoint / freeze snapshot",
@@ -437,9 +471,24 @@ export async function liveReview(options: LiveOptions): Promise<void> {
     sidebarWidth: number | undefined = settings.sidebarWidth,
     lines: string[] = [];
   let fullFile = false,
+    preferredFullFile = false,
     beforeFile = false,
     patchContext = 3,
     sinceViewed = false;
+  let sidebarTab: "commits" | "tree" = "commits",
+    treeTarget = "",
+    treePaths: string[] = [],
+    treeRootKey = "",
+    treeRoot: FileTreeNode | undefined,
+    treeRows: TreeRow[] = [],
+    treeIndex = 0,
+    treeScroll = 0,
+    treeLoading = false,
+    treeVersion = 0;
+  const expandedDirs = new Set<string>();
+  let browsedFile: ReviewFile | undefined;
+  let fullFileHighlights: FileDiffHighlights | undefined;
+  const isRepoBrowseFile = (file?: ReviewFile) => file?.layer === "repository";
   const lineNumbers = true;
   let menu: ActionMenu | undefined,
     menuPreviousFocus = 0;
@@ -448,7 +497,18 @@ export async function liveReview(options: LiveOptions): Promise<void> {
   let loadedFile: ReviewFile | undefined,
     selectionSource: ReviewFile | undefined;
   let pendingPosition:
-    { key: string; line?: number; source?: number } | undefined;
+    | {
+        key: string;
+        line?: number;
+        source?: number;
+        horizontal?: number;
+        center?: boolean;
+        highlight?: boolean;
+      }
+    | undefined;
+  let clickedPoint:
+    { lines: string[]; line: number; column: number } | undefined;
+  const jumpStack: JumpEntry[] = [];
   let scores: ReviewRanks = {},
     order: string[] | undefined;
   let rankBusy = false,
@@ -467,6 +527,7 @@ export async function liveReview(options: LiveOptions): Promise<void> {
     filterPreviousFocus = 0,
     prompt:
       | "search"
+      | "symbol"
       | "hidePaths"
       | "showPaths"
       | "wheel"
@@ -499,7 +560,10 @@ export async function liveReview(options: LiveOptions): Promise<void> {
   let previousRows: string[] = [],
     previousWidth = 0,
     renderTimer: ReturnType<typeof setTimeout> | undefined;
-  const patchCache = new Map<string, string[]>();
+  const patchCache = new Map<
+    string,
+    { lines: string[]; highlights?: FileDiffHighlights }
+  >();
   const patchSizes = new Map<string, number>();
   let patchChars = 0;
   const geometry = () =>
@@ -529,7 +593,7 @@ export async function liveReview(options: LiveOptions): Promise<void> {
   >();
   const inputEvents = new ReviewInput(onMouse);
   const wheelPace = new ReviewWheel();
-  const selected = () => files[fileIndex];
+  const selected = () => browsedFile ?? files[fileIndex];
   const workingFiles = () =>
     visibleReviewFiles(
       state?.workingFiles ?? [],
@@ -581,6 +645,20 @@ export async function liveReview(options: LiveOptions): Promise<void> {
       focus,
       expanded: expandedDiff,
       sidebarWidth,
+      sidebarTab,
+      treeRows,
+      treeIndex,
+      treeScroll,
+      treeTotalFiles: treeRoot ? treePaths.length : undefined,
+      treeLoading,
+      activeFile: selected(),
+      canJumpBack: jumpStack.length > 0,
+      fileHighlights:
+        fullFile &&
+        !helpOpen &&
+        (!textSelection || textSelection.lines === lines)
+          ? fullFileHighlights
+          : undefined,
       textSelection,
       filterMenu: filterMenuOpen
         ? { filters: fileFilters, index: filterMenuIndex, settings }
@@ -632,7 +710,9 @@ export async function liveReview(options: LiveOptions): Promise<void> {
       previewLabel: sinceViewed
         ? "Changes since you last viewed this file · d returns to comparison"
         : fullFile
-          ? `${beforeFile ? "Base" : "Target"} file content · c returns to diff`
+          ? isRepoBrowseFile(selected())
+            ? "Repository file (unchanged in this comparison) · c Diff · x Commits"
+            : `${beforeFile ? "Base" : "Target"} file · diffs highlighted · c Diff · e ${beforeFile ? "After" : "Before"} · {/} Hunks`
           : workflowSnapshot?.stale
             ? "Workflow evidence is stale or unavailable · W Inspect"
             : undefined,
@@ -668,7 +748,7 @@ export async function liveReview(options: LiveOptions): Promise<void> {
         ? prompt === "comment" || prompt === "review-body"
           ? composerError ||
             "Enter Save draft · Ctrl-j Newline · Esc Cancel · R submits after saving"
-          : `${prompt === "search" ? `Search files / diff [${searchScope}; Tab changes scope]` : prompt === "wheel" ? "Wheel lines (1–20)" : prompt === "hidePaths" ? "Hide paths (comma-separated globs)" : "Always show paths (comma-separated globs)"}: ${input}▏`
+          : `${prompt === "search" ? `Search files / diff [${searchScope}; Tab changes scope]` : prompt === "symbol" ? "Go to definition / symbol" : prompt === "wheel" ? "Wheel lines (1–20)" : prompt === "hidePaths" ? "Hide paths (comma-separated globs)" : "Always show paths (comma-separated globs)"}: ${input}▏`
         : undefined,
       remote,
       pr: pr
@@ -705,6 +785,7 @@ export async function liveReview(options: LiveOptions): Promise<void> {
   }
   function scrollDiff(delta: number): void {
     commentPoint = undefined;
+    clickedPoint = undefined;
     if (helpOpen)
       helpScroll = Math.max(
         0,
@@ -760,6 +841,8 @@ export async function liveReview(options: LiveOptions): Promise<void> {
     navigationVersion++;
     clearTextSelection();
     helpOpen = false;
+    browsedFile = undefined;
+    fullFile = preferredFullFile;
     rememberPosition();
     if (!committedOnly && !pr && mode.kind === "working" && commits.length) {
       preferBranchAll = true;
@@ -781,6 +864,8 @@ export async function liveReview(options: LiveOptions): Promise<void> {
       navigationVersion++;
       clearTextSelection();
       helpOpen = false;
+      browsedFile = undefined;
+      fullFile = preferredFullFile;
       rememberPosition();
       commitIndex = 0;
       mode = { kind: "working" };
@@ -795,6 +880,8 @@ export async function liveReview(options: LiveOptions): Promise<void> {
     navigationVersion++;
     clearTextSelection();
     helpOpen = false;
+    browsedFile = undefined;
+    fullFile = preferredFullFile;
     rememberPosition();
     commitIndex = index;
     const selected = currentSelectedShas();
@@ -815,6 +902,8 @@ export async function liveReview(options: LiveOptions): Promise<void> {
     const commit = commits[index - 1];
     if (!commit) return;
     helpOpen = false;
+    browsedFile = undefined;
+    fullFile = preferredFullFile;
     rememberPosition();
     commitIndex = index;
     const selection = currentSelectedShas();
@@ -871,13 +960,174 @@ export async function liveReview(options: LiveOptions): Promise<void> {
     else if (row >= commitScroll + capacity) commitScroll = row - capacity + 1;
     scrollCommits(0);
   }
+  function treeCapacity(): number {
+    return Math.max(1, geometry().commits.height - 2);
+  }
+  function scrollTree(delta: number): void {
+    const capacity = treeCapacity();
+    treeScroll = Math.max(
+      0,
+      Math.min(Math.max(0, treeRows.length - capacity), treeScroll + delta),
+    );
+    render();
+  }
+  function revealTree(): void {
+    const capacity = treeCapacity();
+    if (treeIndex < treeScroll) treeScroll = treeIndex;
+    else if (treeIndex >= treeScroll + capacity)
+      treeScroll = treeIndex - capacity + 1;
+    treeScroll = Math.max(
+      0,
+      Math.min(Math.max(0, treeRows.length - capacity), treeScroll),
+    );
+  }
+  function moveTree(delta: number): void {
+    if (!treeRows.length) return;
+    treeIndex = Math.max(0, Math.min(treeRows.length - 1, treeIndex + delta));
+    revealTree();
+    render();
+  }
+  function rebuildTreeRows(revealPath?: string): void {
+    const deletedPaths = allFiles
+      .filter((file) => file.status.startsWith("D"))
+      .map((file) => file.path)
+      .sort();
+    const rootKey = `${treeTarget}\0${deletedPaths.join("\0")}`;
+    if (treeTarget && treeRootKey !== rootKey) {
+      treeRoot = buildFileTree([...treePaths, ...deletedPaths]);
+      treeRootKey = rootKey;
+    }
+    const changedByPath = new Map<string, ReviewFile>();
+    for (const file of allFiles) {
+      if (!changedByPath.has(file.path)) changedByPath.set(file.path, file);
+    }
+    for (const file of files) {
+      changedByPath.set(file.path, file);
+    }
+    if (revealPath) {
+      for (const dir of ancestorDirs(revealPath)) expandedDirs.add(dir);
+    }
+    const previousPath = treeRows[treeIndex]?.path;
+    treeRows = treeRoot
+      ? flattenFileTree(treeRoot, expandedDirs, changedByPath)
+      : [];
+    const targetPath = revealPath ?? previousPath;
+    if (targetPath) {
+      const idx = treeRows.findIndex((row) => row.path === targetPath);
+      if (idx >= 0) treeIndex = idx;
+      else treeIndex = Math.max(0, Math.min(treeIndex, treeRows.length - 1));
+    } else {
+      treeIndex = Math.max(0, Math.min(treeIndex, treeRows.length - 1));
+    }
+    revealTree();
+  }
+  async function loadTree(revealPath?: string): Promise<void> {
+    const target =
+      comparison?.target ??
+      state?.snapshot.worktreeTree ??
+      state?.snapshot.headTree;
+    if (!target) return;
+    if (treeTarget === target && treeRoot) {
+      rebuildTreeRows(revealPath);
+      render();
+      return;
+    }
+    const version = ++treeVersion;
+    treeLoading = true;
+    render();
+    try {
+      const fetched = await git.request<string[]>("tree", { target });
+      if (stopped || version !== treeVersion) return;
+      treeTarget = target;
+      treePaths = fetched;
+      treeRootKey = "";
+      rebuildTreeRows(revealPath);
+    } catch (cause) {
+      if (version === treeVersion) error(cause);
+    } finally {
+      if (version === treeVersion) {
+        treeLoading = false;
+        render();
+      }
+    }
+  }
+  function setSidebarTab(tab: "commits" | "tree"): void {
+    sidebarTab = tab;
+    focus = 0;
+    expandedDiff = false;
+    helpOpen = false;
+    if (tab === "tree") void loadTree(selected()?.path);
+    else ensureCommitCursor();
+    render();
+  }
+  function toggleTreeDir(row: TreeRow): void {
+    if (expandedDirs.has(row.path)) expandedDirs.delete(row.path);
+    else expandedDirs.add(row.path);
+    rebuildTreeRows(row.path);
+    render();
+  }
+  function openTreeFile(row: TreeRow, focusPreview = true): void {
+    helpOpen = false;
+    rememberViewed();
+    clearTextSelection();
+    rememberPosition();
+    const visibleIdx = files.findIndex((file) => file.path === row.path);
+    if (visibleIdx >= 0) {
+      browsedFile = undefined;
+      fileIndex = visibleIdx;
+      fullFile = preferredFullFile;
+      beforeFile = fullFile && files[visibleIdx].status.startsWith("D");
+      sinceViewed = false;
+      void patch();
+    } else {
+      const changed = allFiles.find((file) => file.path === row.path);
+      if (changed) {
+        browsedFile = changed;
+        fullFile = preferredFullFile;
+        beforeFile = fullFile && changed.status.startsWith("D");
+        sinceViewed = false;
+        void patch();
+      } else {
+        const target =
+          comparison?.target ??
+          state?.snapshot.worktreeTree ??
+          state?.snapshot.headTree;
+        if (!target) return;
+        browsedFile = {
+          id: `browse:${row.path}`,
+          path: row.path,
+          status: " ",
+          additions: 0,
+          deletions: 0,
+          binary: false,
+          from: target,
+          to: target,
+          layer: "repository",
+          key: `browse\0${row.path}`,
+        };
+        fullFile = true;
+        beforeFile = false;
+        sinceViewed = false;
+        void patch();
+      }
+    }
+    if (focusPreview) focus = 2;
+    render();
+  }
   function selectFile(index: number): void {
     helpOpen = false;
     const next = Math.max(0, Math.min(Math.max(0, files.length - 1), index));
-    if (next !== fileIndex) {
+    const wasBrowsed = Boolean(browsedFile);
+    if (wasBrowsed || next !== fileIndex) {
       rememberViewed();
       clearTextSelection();
       rememberPosition();
+      browsedFile = undefined;
+      if (wasBrowsed) {
+        fullFile = preferredFullFile;
+        beforeFile = fullFile && (files[next]?.status.startsWith("D") ?? false);
+        sinceViewed = false;
+      }
       fileIndex = next;
       void patch();
     }
@@ -910,6 +1160,7 @@ export async function liveReview(options: LiveOptions): Promise<void> {
   ): void {
     if (
       !file ||
+      isRepoBrowseFile(file) ||
       !state ||
       !progressScope ||
       progressScope !== key() ||
@@ -1028,6 +1279,8 @@ export async function liveReview(options: LiveOptions): Promise<void> {
       if (!to || !current.base) return;
       navigationVersion++;
       rememberViewed();
+      browsedFile = undefined;
+      fullFile = preferredFullFile;
       mode = { kind: "range", from: current.base, to };
       closeMenu();
       focus = 2;
@@ -1035,6 +1288,14 @@ export async function liveReview(options: LiveOptions): Promise<void> {
     } else if (current.kind === "search") {
       const hit = current.hits?.[index];
       if (!hit) return;
+      if (hit.repoHit) {
+        closeMenu();
+        openAtLocation(hit.path, hit.line + 1, {
+          pushJump: true,
+          forceFullFile: true,
+        });
+        return;
+      }
       const target = files.findIndex((file) => file.key === hit.fileKey);
       if (target < 0)
         throw new Error(
@@ -1048,23 +1309,259 @@ export async function liveReview(options: LiveOptions): Promise<void> {
           "Search result changed; search the current comparison again",
         );
       closeMenu();
+      pushJumpLocation();
+      browsedFile = undefined;
       fullFile = hit.fullFile;
+      preferredFullFile = fullFile;
       beforeFile = hit.fullFile && files[target].status.startsWith("D");
       sinceViewed = false;
-      pendingPosition = { key: hit.fileKey, line: hit.line };
+      pendingPosition = {
+        key: hit.fileKey,
+        line: hit.line,
+        center: true,
+        highlight: true,
+      };
       focus = 2;
       selectFile(target);
       void patch();
+    } else if (current.kind === "definitions") {
+      const candidate = current.definitions?.[index];
+      if (!candidate) return;
+      closeMenu();
+      openAtLocation(candidate.path, candidate.line, {
+        pushJump: true,
+        forceFullFile: true,
+      });
+      setStatus(
+        `${candidate.path}:${candidate.line} · Backspace or [← Back] returns`,
+      );
     } else {
       const provider = current.values?.[index];
       closeMenu();
       if (provider) await rankFiles(provider);
     }
   }
+  function pushJumpLocation(): void {
+    const current = selected();
+    if (!current) return;
+    jumpStack.push({
+      filePath: current.path,
+      fileKey: current.key,
+      browsedFile,
+      fullFile,
+      preferredFullFile,
+      beforeFile,
+      sinceViewed,
+      scroll,
+      horizontal,
+    });
+    if (jumpStack.length > 50) jumpStack.shift();
+  }
+  function openAtLocation(
+    filePath: string,
+    lineNumber: number,
+    options: { pushJump?: boolean; forceFullFile?: boolean } = {},
+  ): void {
+    const targetRev =
+      comparison?.target ??
+      state?.snapshot.worktreeTree ??
+      state?.snapshot.headTree;
+    if (!targetRev) return;
+    if (options.pushJump) pushJumpLocation();
+    helpOpen = false;
+    rememberViewed();
+    clearTextSelection();
+    rememberPosition();
+    const zeroBasedLine = Math.max(0, lineNumber - 1);
+    const visibleIdx = files.findIndex((file) => file.path === filePath);
+    let targetFile: ReviewFile;
+    if (visibleIdx >= 0) {
+      browsedFile = undefined;
+      fileIndex = visibleIdx;
+      targetFile = files[visibleIdx];
+      fullFile = options.forceFullFile ? true : preferredFullFile;
+      beforeFile = fullFile && targetFile.status.startsWith("D");
+    } else {
+      const changed = allFiles.find((file) => file.path === filePath);
+      if (changed) {
+        browsedFile = changed;
+        targetFile = changed;
+        fullFile = options.forceFullFile ? true : preferredFullFile;
+        beforeFile = fullFile && changed.status.startsWith("D");
+      } else {
+        targetFile = {
+          id: `browse:${filePath}`,
+          path: filePath,
+          status: " ",
+          additions: 0,
+          deletions: 0,
+          binary: false,
+          from: targetRev,
+          to: targetRev,
+          layer: "repository",
+          key: `browse\0${filePath}`,
+        };
+        browsedFile = targetFile;
+        fullFile = true;
+        beforeFile = false;
+      }
+    }
+    sinceViewed = false;
+    pendingPosition = {
+      key: targetFile.key,
+      line: zeroBasedLine,
+      center: true,
+      highlight: true,
+    };
+    focus = 2;
+    if (sidebarTab === "tree") rebuildTreeRows(filePath);
+    void patch();
+    render();
+  }
+  function jumpBack(): void {
+    const entry = jumpStack.pop();
+    if (!entry) {
+      setStatus("No previous jump location");
+      return;
+    }
+    helpOpen = false;
+    clearTextSelection();
+    clickedPoint = undefined;
+    rememberPosition();
+    fullFile = entry.fullFile;
+    preferredFullFile = entry.preferredFullFile;
+    beforeFile = entry.beforeFile;
+    sinceViewed = entry.sinceViewed;
+    let targetKey = entry.fileKey ?? "";
+    if (entry.browsedFile) {
+      browsedFile = entry.browsedFile;
+      targetKey = entry.browsedFile.key;
+    } else {
+      browsedFile = undefined;
+      const idx = files.findIndex(
+        (file) =>
+          file.key === entry.fileKey ||
+          (entry.filePath && file.path === entry.filePath),
+      );
+      if (idx >= 0) {
+        fileIndex = idx;
+        targetKey = files[idx].key;
+      }
+    }
+    if (targetKey) {
+      pendingPosition = {
+        key: targetKey,
+        line: entry.scroll,
+        horizontal: entry.horizontal,
+      };
+    }
+    focus = 2;
+    if (sidebarTab === "tree" && entry.filePath) {
+      rebuildTreeRows(entry.filePath);
+    }
+    void patch();
+    setStatus(
+      `Returned to ${entry.filePath ?? selected()?.path ?? "previous location"}`,
+    );
+  }
+  async function goToDefinition(
+    symbol: string,
+    origin?: { path?: string; line?: number },
+  ): Promise<void> {
+    const targetRev =
+      comparison?.target ??
+      state?.snapshot.worktreeTree ??
+      state?.snapshot.headTree;
+    if (!targetRev) {
+      setStatus("Wait for the repository revision to finish loading");
+      return;
+    }
+    const clean = symbol.trim();
+    if (!clean) return;
+    const version = ++searchVersion;
+    setStatus(`Finding definition of ${clean}…`);
+    const result = await git.request<DefinitionSearchResult>("definition", {
+      target: targetRev,
+      symbol: clean,
+      currentPath: origin?.path,
+      currentLine: origin?.line,
+    });
+    if (stopped || version !== searchVersion) return;
+    if (result.autoJump && result.definitions.length) {
+      const top = result.definitions[0];
+      openAtLocation(top.path, top.line, {
+        pushJump: true,
+        forceFullFile: true,
+      });
+      setStatus(
+        `Definition: ${top.path}:${top.line} · Backspace returns${result.definitions.length > 1 ? ` · ${result.definitions.length - 1} other match${result.definitions.length === 2 ? "" : "es"}` : ""}`,
+      );
+      return;
+    }
+    if (result.definitions.length) {
+      openMenu({
+        kind: "definitions",
+        title: `DEFINITIONS · ${clean} (${result.definitions.length})`,
+        subtitle: "Enter or click to jump · Backspace returns after jumping",
+        index: 0,
+        items: result.definitions.map((item) => ({
+          label: `${item.path}:${item.line} · ${item.kind}`,
+          detail: item.preview,
+        })),
+        definitions: result.definitions,
+      });
+      return;
+    }
+    if (result.references.length) {
+      openMenu({
+        kind: "definitions",
+        title: `REFERENCES · ${clean} (${result.references.length})`,
+        subtitle: "No declaration found · showing symbol occurrences",
+        index: 0,
+        items: result.references.map((item) => ({
+          label: `${item.path}:${item.line}`,
+          detail: item.preview,
+        })),
+        definitions: result.references,
+      });
+      return;
+    }
+    setStatus(`No definition or usage found for "${clean}"`);
+  }
   async function searchAcrossFiles(query: string): Promise<void> {
     const version = ++searchVersion;
-    const captured = files.map((file) => ({ ...file })),
-      scope = searchScope;
+    const scope = searchScope;
+    if (scope === "repo") {
+      const targetRev =
+        comparison?.target ??
+        state?.snapshot.worktreeTree ??
+        state?.snapshot.headTree;
+      if (!targetRev) {
+        setStatus("Wait for the repository revision to finish loading");
+        return;
+      }
+      setStatus(`Searching repository for "${query}"…`);
+      const result = await git.request<ReviewSearchResult>("grep-repo", {
+        target: targetRev,
+        query,
+      });
+      if (stopped || version !== searchVersion) return;
+      openMenu({
+        kind: "search",
+        title: `SEARCH RESULTS · ${result.hits.length}${result.limited ? "+" : ""}`,
+        subtitle: `repo: ${query} · ${result.scanned} matching ${result.scanned === 1 ? "file" : "files"}${result.limited ? " · limit reached" : ""}`,
+        index: 0,
+        items: result.hits.length
+          ? result.hits.map((hit) => ({
+              label: `${hit.path}:${hit.line + 1}`,
+              detail: hit.preview,
+            }))
+          : [{ label: "No matches in repository" }],
+        hits: result.hits,
+      });
+      return;
+    }
+    const captured = files.map((file) => ({ ...file }));
     setStatus(`Searching ${files.length} visible file layers…`);
     const result = await git.request<ReviewSearchResult>("search", {
       files: captured,
@@ -1182,17 +1679,27 @@ export async function liveReview(options: LiveOptions): Promise<void> {
   }
   function applyPendingPosition(file: ReviewFile): void {
     if (pendingPosition?.key !== file.key) return;
-    if (pendingPosition.line !== undefined) scroll = pendingPosition.line;
-    else if (pendingPosition.source !== undefined) {
-      if (fullFile) scroll = pendingPosition.source - 1;
+    const pending = pendingPosition;
+    let targetLine: number | undefined;
+    if (pending.line !== undefined) {
+      targetLine = Math.max(0, Math.min(lines.length - 1, pending.line));
+      scroll = pending.center
+        ? Math.max(0, targetLine - Math.floor(height() / 4))
+        : targetLine;
+    } else if (pending.source !== undefined) {
+      if (fullFile) scroll = pending.source - 1;
       else {
         const target = reviewLineNumbers(lines).findIndex(
           ([old, next]) =>
             (beforeFile ? old : next) !== undefined &&
-            (beforeFile ? old! : next!) >= pendingPosition!.source!,
+            (beforeFile ? old! : next!) >= pending.source!,
         );
         if (target >= 0) scroll = target;
       }
+    }
+    if (pending.horizontal !== undefined) horizontal = pending.horizontal;
+    if (pending.highlight && targetLine !== undefined) {
+      commentPoint = { lines, line: targetLine };
     }
     pendingPosition = undefined;
     scroll = Math.max(
@@ -1323,6 +1830,9 @@ export async function liveReview(options: LiveOptions): Promise<void> {
       } else if (hit.action === "files") {
         focus = 1;
         selectFile(fileIndex + delta);
+      } else if (hit.action === "tree") {
+        focus = 0;
+        scrollTree(delta);
       } else if (hit.action === "commits" || hit.action === "toggle-commit") {
         focus = 0;
         scrollCommits(delta);
@@ -1330,6 +1840,14 @@ export async function liveReview(options: LiveOptions): Promise<void> {
       return;
     }
     if ((event.button & 3) !== 0) return;
+    if (hit.action === "sidebar-tab" && hit.tab) {
+      setSidebarTab(hit.tab);
+      return;
+    }
+    if (hit.action === "jump-back") {
+      jumpBack();
+      return;
+    }
     if (hit.action === "shortcut") {
       onKey(hit.shortcut!, {
         name: hit.shortcut === "\t" ? "tab" : hit.shortcut,
@@ -1379,13 +1897,55 @@ export async function liveReview(options: LiveOptions): Promise<void> {
         event.x >= frame!.layout.diff.x + 1 &&
         event.x < viewport.x + viewport.width
       ) {
+        const jumpClick = Boolean(event.button & 16 || event.button & 8);
         clearTextSelection();
         if (!patchBusy && lines.length) {
           const point = textPoint(event);
           commentPoint = { lines, line: point.line };
+          clickedPoint = { lines, line: point.line, column: point.column };
+          if (jumpClick) {
+            const symbol = symbolAtColumn(
+              lines[point.line] ?? "",
+              point.column,
+              !fullFile,
+            );
+            if (symbol) {
+              const originLine = fullFile
+                ? point.line + 1
+                : sourceLine(
+                    lines,
+                    point.line,
+                    beforeFile ? "before" : "after",
+                  );
+              void goToDefinition(symbol, {
+                path: selected()?.path,
+                line: originLine,
+              }).catch(error);
+            } else {
+              setStatus(
+                "Ctrl-click an identifier to jump to its definition (or press g)",
+              );
+            }
+            render();
+            return;
+          }
           textSelection = { anchor: point, end: point, lines };
           selectionSource = loadedFile;
           selectingText = true;
+        }
+      }
+      render();
+      return;
+    }
+    if (hit.action === "tree") {
+      focus = 0;
+      if (hit.index !== undefined) {
+        const row = treeRows[hit.index];
+        if (row) {
+          treeIndex = hit.index;
+          revealTree();
+          if (row.kind === "dir") toggleTreeDir(row);
+          else openTreeFile(row, true);
         }
       }
       render();
@@ -1588,6 +2148,13 @@ export async function liveReview(options: LiveOptions): Promise<void> {
           if (branchChanged) {
             workflowSnapshot = undefined;
             preferBranchAll = false;
+            browsedFile = undefined;
+            fullFile = preferredFullFile;
+            treeTarget = "";
+            treePaths = [];
+            treeRoot = undefined;
+            treeRootKey = "";
+            treeRows = [];
             mode = { kind: "working" };
             commitIndex = 0;
             status =
@@ -1597,7 +2164,7 @@ export async function liveReview(options: LiveOptions): Promise<void> {
               0,
               timeline().findIndex((c) => c.sha === sha) + 1,
             );
-          if (focus === 0) ensureCommitCursor();
+          if (focus === 0 && sidebarTab === "commits") ensureCommitCursor();
           await compare();
         }
       }
@@ -1649,6 +2216,39 @@ export async function liveReview(options: LiveOptions): Promise<void> {
         progressScope = scope;
       }
       filterFiles(oldKey, oldFile);
+      if (browsedFile) {
+        const visibleMatch = files.find(
+          (file) => file.path === browsedFile!.path,
+        );
+        if (visibleMatch) {
+          const wasUnchanged = isRepoBrowseFile(browsedFile);
+          browsedFile = undefined;
+          fileIndex = files.indexOf(visibleMatch);
+          if (wasUnchanged) {
+            fullFile = preferredFullFile;
+            beforeFile = fullFile && visibleMatch.status.startsWith("D");
+          }
+        } else {
+          const changedMatch = allFiles.find(
+            (file) => file.path === browsedFile!.path,
+          );
+          if (changedMatch) {
+            const wasUnchanged = isRepoBrowseFile(browsedFile);
+            browsedFile = changedMatch;
+            if (wasUnchanged) {
+              fullFile = preferredFullFile;
+              beforeFile = fullFile && changedMatch.status.startsWith("D");
+            }
+          } else if (comparison?.target) {
+            browsedFile = {
+              ...browsedFile,
+              from: comparison.target,
+              to: comparison.target,
+            };
+          }
+        }
+      }
+      if (sidebarTab === "tree") void loadTree();
       if (frozen)
         void git
           .request("freeze", {
@@ -1688,6 +2288,7 @@ export async function liveReview(options: LiveOptions): Promise<void> {
     const file = selected();
     if (!file) {
       loadedFile = undefined;
+      fullFileHighlights = undefined;
       clearTextSelection();
       rememberPosition();
       activeViewport = "";
@@ -1709,38 +2310,93 @@ export async function liveReview(options: LiveOptions): Promise<void> {
       scroll = previous?.scroll ?? 0;
       horizontal = previous?.horizontal ?? 0;
     }
+    if (!fullFile && isRepoBrowseFile(file)) {
+      loadedFile = file;
+      fullFileHighlights = undefined;
+      lines = [
+        "No changes to this file in the current comparison.",
+        "Press c or click [c: File] to view the full file.",
+      ];
+      scroll = 0;
+      render();
+      return;
+    }
     const version = patchVersion,
-      cacheKey = `${file.key}:${reviewFileFingerprint(file)}:${fullFile ? (beforeFile ? "before" : "after") : sinceViewed ? `viewed:${progress.viewed[file.key]?.tree}` : `diff:${patchContext}`}`;
-    if (patchCache.has(cacheKey)) {
-      lines = patchCache.get(cacheKey)!;
+      fingerprint = reviewFileFingerprint(file),
+      cacheKey = `${file.key}:${fingerprint}:${fullFile ? (beforeFile ? "before" : "after") : sinceViewed ? `viewed:${progress.viewed[file.key]?.tree}` : `diff:${patchContext}`}`;
+    const cached = patchCache.get(cacheKey);
+    if (cached) {
+      lines = cached.lines;
+      fullFileHighlights = fullFile ? cached.highlights : undefined;
       loadedFile = file;
       applyPendingPosition(file);
-      if (!progress.viewed[file.key]) rememberViewed(file);
+      if (!isRepoBrowseFile(file) && !progress.viewed[file.key])
+        rememberViewed(file);
       scroll = Math.min(scroll, scrollLimit(displayedLines().length, height()));
       render();
       return;
     }
     patchBusy = true;
     loadedFile = undefined;
+    fullFileHighlights = undefined;
     // Never leave another file's patch underneath a new selection.
     lines = [`Loading ${file.path}…`];
     render();
     try {
-      const result = await preview.read(file, {
-        gitDir: state!.gitDir,
-        context: patchContext,
-        fullFile,
-        side: beforeFile ? "before" : "after",
-        viewed: sinceViewed ? progress.viewed[file.key] : undefined,
-      });
-      if (stopped || version !== patchVersion) return;
-      lines = result.split("\n");
+      let text: string;
+      let highlights: FileDiffHighlights | undefined;
+      if (fullFile) {
+        const diffPrefix = `${file.key}:${fingerprint}:diff:`;
+        let cachedDiffLines: string[] | undefined;
+        if (!isRepoBrowseFile(file)) {
+          for (const [entryKey, entryValue] of patchCache) {
+            if (entryKey.startsWith(diffPrefix)) {
+              cachedDiffLines = entryValue.lines;
+              break;
+            }
+          }
+        }
+        const side = beforeFile ? "before" : "after";
+        const result = await preview.readFullFile(file, {
+          gitDir: state!.gitDir,
+          context: 0,
+          fullFile: true,
+          side,
+          includePatch: !isRepoBrowseFile(file) && !cachedDiffLines,
+        });
+        if (stopped || version !== patchVersion) return;
+        text = result.text;
+        const nextLines = text.split("\n");
+        const diffText = cachedDiffLines
+          ? cachedDiffLines.join("\n")
+          : result.patch;
+        if (!isRepoBrowseFile(file) && diffText) {
+          highlights = parseFileDiffHighlights(
+            diffText,
+            side,
+            nextLines.length,
+          );
+        }
+        lines = nextLines;
+      } else {
+        text = await preview.read(file, {
+          gitDir: state!.gitDir,
+          context: patchContext,
+          fullFile: false,
+          side: beforeFile ? "before" : "after",
+          viewed: sinceViewed ? progress.viewed[file.key] : undefined,
+        });
+        if (stopped || version !== patchVersion) return;
+        lines = text.split("\n");
+      }
       loadedFile = file;
-      patchCache.set(cacheKey, lines);
-      patchSizes.set(cacheKey, result.length);
-      patchChars += result.length;
+      fullFileHighlights = fullFile ? highlights : undefined;
+      patchCache.set(cacheKey, { lines, highlights });
+      patchSizes.set(cacheKey, text.length);
+      patchChars += text.length;
       applyPendingPosition(file);
-      if (!progress.viewed[file.key]) rememberViewed(file);
+      if (!isRepoBrowseFile(file) && !progress.viewed[file.key])
+        rememberViewed(file);
       while (patchCache.size > 20 || patchChars > 16 * 1024 * 1024) {
         const oldest = patchCache.keys().next().value!;
         patchChars -= patchSizes.get(oldest) ?? 0;
@@ -1842,6 +2498,36 @@ export async function liveReview(options: LiveOptions): Promise<void> {
   function nextMatch(direction = 1): void {
     if (!search) return;
     helpOpen = false;
+    if (focus === 0 && sidebarTab === "tree") {
+      const needle = search.toLowerCase();
+      const allPaths = [
+        ...new Set([
+          ...treePaths,
+          ...allFiles
+            .filter((file) => file.status.startsWith("D"))
+            .map((file) => file.path),
+        ]),
+      ].sort();
+      const currentPath = treeRows[treeIndex]?.path;
+      const startIndex = currentPath ? allPaths.indexOf(currentPath) : -1;
+      let matchPath: string | undefined;
+      for (let n = 1; n <= allPaths.length; n++) {
+        const i =
+          (((startIndex + direction * n) % allPaths.length) + allPaths.length) %
+          allPaths.length;
+        if (allPaths[i].toLowerCase().includes(needle)) {
+          matchPath = allPaths[i];
+          break;
+        }
+      }
+      if (matchPath) {
+        rebuildTreeRows(matchPath);
+        render();
+      } else {
+        setStatus(`No match for "${search}"`);
+      }
+      return;
+    }
     if (focus !== 1) focus = 2;
     let found = false;
     if (focus === 1) {
@@ -2085,7 +2771,9 @@ export async function liveReview(options: LiveOptions): Promise<void> {
         "Finding's file is outside this comparison · select w or p, then reopen W",
       );
     closeMenu();
+    browsedFile = undefined;
     fullFile = false;
+    preferredFullFile = false;
     sinceViewed = false;
     beforeFile = false;
     if (!files.some((f) => f.key === file.key)) files.push(file);
@@ -2716,10 +3404,12 @@ export async function liveReview(options: LiveOptions): Promise<void> {
           "paths",
           "changes",
           "files",
+          "repo",
         ];
         searchScope =
           scopes[
-            (scopes.indexOf(searchScope) + (keypress.shift ? 3 : 1)) %
+            (scopes.indexOf(searchScope) +
+              (keypress.shift ? scopes.length - 1 : 1)) %
               scopes.length
           ];
         render();
@@ -2738,11 +3428,27 @@ export async function liveReview(options: LiveOptions): Promise<void> {
         input = "";
         if (kind === "search") {
           search = value;
-          if (searchScope === "changes" || searchScope === "files")
+          if (
+            searchScope === "changes" ||
+            searchScope === "files" ||
+            searchScope === "repo"
+          )
             void searchAcrossFiles(value).catch(error);
           else {
-            focus = searchScope === "paths" ? 1 : 2;
+            if (!(
+              searchScope === "paths" &&
+              focus === 0 &&
+              sidebarTab === "tree"
+            ))
+              focus = searchScope === "paths" ? 1 : 2;
             nextMatch();
+          }
+        } else if (kind === "symbol") {
+          const symbol = extractIdentifier(value) ?? value.trim();
+          if (symbol) {
+            void goToDefinition(symbol, { path: selected()?.path }).catch(
+              error,
+            );
           }
         } else if (kind === "wheel") {
           const wheelStep = Number(value);
@@ -2876,7 +3582,10 @@ export async function liveReview(options: LiveOptions): Promise<void> {
         search = "";
       } else {
         focus = Math.max(0, focus - 1);
-        if (focus === 0) ensureCommitCursor();
+        if (focus === 0) {
+          if (sidebarTab === "commits") ensureCommitCursor();
+          else revealTree();
+        }
       }
       render();
       return;
@@ -2892,14 +3601,20 @@ export async function liveReview(options: LiveOptions): Promise<void> {
     if (text === "/") {
       prompt = "search";
       input = search;
-      searchScope = focus === 1 ? "paths" : "diff";
+      searchScope =
+        focus === 1 || (focus === 0 && sidebarTab === "tree")
+          ? "paths"
+          : "diff";
       render();
       return;
     }
     if (keypress.ctrl && name === "f") {
       prompt = "search";
       input = search;
-      searchScope = "changes";
+      searchScope =
+        sidebarTab === "tree" || isRepoBrowseFile(selected())
+          ? "repo"
+          : "changes";
       render();
       return;
     }
@@ -2909,6 +3624,45 @@ export async function liveReview(options: LiveOptions): Promise<void> {
       rankBusy = false;
       searchVersion++;
       setStatus("Background analysis cancelled");
+      return;
+    }
+    if (text === "g" && !keypress.ctrl && !keypress.meta) {
+      const selectedWord =
+        focus === 2 && textSelection
+          ? extractIdentifier(reviewSelectedText(textSelection))
+          : undefined;
+      const clickedWord =
+        focus === 2 && clickedPoint?.lines === displayedLines()
+          ? symbolAtColumn(
+              displayedLines()[clickedPoint.line] ?? "",
+              clickedPoint.column,
+              !fullFile,
+            )
+          : undefined;
+      const symbol = selectedWord ?? clickedWord;
+      if (symbol) {
+        const lineIdx =
+          textSelection?.anchor.line ?? clickedPoint?.line ?? scroll;
+        const originLine = fullFile
+          ? lineIdx + 1
+          : sourceLine(
+              displayedLines(),
+              lineIdx,
+              beforeFile ? "before" : "after",
+            );
+        void goToDefinition(symbol, {
+          path: selected()?.path,
+          line: originLine,
+        }).catch(error);
+      } else {
+        prompt = "symbol";
+        input = "";
+        render();
+      }
+      return;
+    }
+    if (name === "backspace" || (keypress.ctrl && name === "o")) {
+      if (jumpStack.length) jumpBack();
       return;
     }
     if (text === "b") {
@@ -2938,6 +3692,12 @@ export async function liveReview(options: LiveOptions): Promise<void> {
     }
     if (text === "v") {
       const file = textSelection ? selectionSource : loadedFile;
+      if (isRepoBrowseFile(file)) {
+        setStatus(
+          "Only changed files in the current comparison can be marked reviewed",
+        );
+        return;
+      }
       if (!file || patchBusy || compareBusy || !progressScope) {
         setStatus(
           "Wait for the displayed file to finish loading before marking it reviewed",
@@ -2975,13 +3735,16 @@ export async function liveReview(options: LiveOptions): Promise<void> {
       return;
     }
     if (text === "{" || text === "}") {
-      const hunks = displayedLines().flatMap((line, index) =>
-        line.startsWith("@@ ") ? [index] : [],
-      );
+      const hunks =
+        fullFile && fullFileHighlights
+          ? fullFileHighlights.hunks
+          : displayedLines().flatMap((line, index) =>
+              line.startsWith("@@ ") ? [index] : [],
+            );
       const target =
         text === "}"
           ? hunks.find((index) => index > scroll)
-          : hunks.reverse().find((index) => index < scroll);
+          : [...hunks].reverse().find((index) => index < scroll);
       if (target !== undefined) scrollDiff(target - scroll);
       else setStatus("No further hunk in this direction");
       return;
@@ -2989,24 +3752,38 @@ export async function liveReview(options: LiveOptions): Promise<void> {
     if (text === "c" || text === "e" || text === "C") {
       const file = selected();
       if (!file) return;
+      if (text === "e" && isRepoBrowseFile(file)) {
+        setStatus(
+          "Unchanged repository file has identical base and target content",
+        );
+        return;
+      }
       const source = fullFile
         ? scroll + 1
         : sourceLine(displayedLines(), scroll);
       clearTextSelection();
       if (text === "C") {
         patchContext = patchContext === 3 ? 12 : patchContext === 12 ? 40 : 3;
-        fullFile = sinceViewed = false;
+        fullFile = false;
+        preferredFullFile = false;
+        sinceViewed = false;
       } else if (text === "e") {
         fullFile = true;
+        preferredFullFile = true;
         beforeFile = !beforeFile;
         sinceViewed = false;
       } else {
         fullFile = !fullFile;
+        preferredFullFile = fullFile;
         sinceViewed = false;
         if (fullFile) beforeFile = file.status.startsWith("D");
       }
       pendingPosition = { key: file.key, source };
       void patch();
+      return;
+    }
+    if (text === "x" && !keypress.ctrl && !keypress.meta) {
+      setSidebarTab(sidebarTab === "tree" ? "commits" : "tree");
       return;
     }
     if (text === "d") {
@@ -3093,6 +3870,8 @@ export async function liveReview(options: LiveOptions): Promise<void> {
       navigationVersion++;
       rememberViewed();
       clearTextSelection();
+      browsedFile = undefined;
+      fullFile = preferredFullFile;
       mode = { kind: "working" };
       commitIndex = 0;
       rememberPosition();
@@ -3104,12 +3883,14 @@ export async function liveReview(options: LiveOptions): Promise<void> {
       navigationVersion++;
       rememberViewed();
       clearTextSelection();
+      browsedFile = undefined;
+      fullFile = preferredFullFile;
       mode = {
         kind: "branch",
         base: pr?.baseRefOid ?? options.branch?.base ?? options.defaultBase,
         ...(options.pr && pr ? { head: pr.headRefOid } : {}),
       };
-      if (focus === 0) ensureCommitCursor();
+      if (focus === 0 && sidebarTab === "commits") ensureCommitCursor();
       rememberPosition();
       void compare();
       return;
@@ -3118,6 +3899,8 @@ export async function liveReview(options: LiveOptions): Promise<void> {
       navigationVersion++;
       rememberViewed();
       clearTextSelection();
+      browsedFile = undefined;
+      fullFile = preferredFullFile;
       try {
         if (state) {
           const navigation = navigationVersion;
@@ -3203,7 +3986,10 @@ export async function liveReview(options: LiveOptions): Promise<void> {
     }
     if (["1", "2", "3"].includes(text)) {
       focus = Number(text) - 1;
-      if (focus === 0) ensureCommitCursor();
+      if (focus === 0) {
+        if (sidebarTab === "commits") ensureCommitCursor();
+        else revealTree();
+      }
       if (focus !== 2) expandedDiff = false;
       render();
       return;
@@ -3215,7 +4001,10 @@ export async function liveReview(options: LiveOptions): Promise<void> {
         return;
       }
       focus = (focus + (keypress.shift ? 2 : 1)) % 3;
-      if (focus === 0) ensureCommitCursor();
+      if (focus === 0) {
+        if (sidebarTab === "commits") ensureCommitCursor();
+        else revealTree();
+      }
       if (focus !== 2) expandedDiff = false;
       render();
       return;
@@ -3247,12 +4036,24 @@ export async function liveReview(options: LiveOptions): Promise<void> {
       return;
     }
     if (text === " " && focus === 0) {
-      toggleCommit(commitIndex || 1);
+      if (sidebarTab === "tree") {
+        const row = treeRows[treeIndex];
+        if (row?.kind === "dir") toggleTreeDir(row);
+        else if (row?.kind === "file") openTreeFile(row, false);
+      } else {
+        toggleCommit(commitIndex || 1);
+      }
       return;
     }
     if (name === "return") {
       if (focus === 0) {
-        selectCommit(commitIndex || 1);
+        if (sidebarTab === "tree") {
+          const row = treeRows[treeIndex];
+          if (row?.kind === "dir") toggleTreeDir(row);
+          else if (row?.kind === "file") openTreeFile(row, true);
+        } else {
+          selectCommit(commitIndex || 1);
+        }
         return;
       }
       if (focus === 1) focus = 2;
@@ -3261,11 +4062,47 @@ export async function liveReview(options: LiveOptions): Promise<void> {
       return;
     }
     if (name === "left" || name === "right") {
-      if (focus === 2)
+      if (focus === 2) {
         horizontal = Math.max(0, horizontal + (name === "left" ? -2 : 2));
-      else {
+      } else if (focus === 0 && sidebarTab === "tree") {
+        const row = treeRows[treeIndex];
+        if (name === "right") {
+          if (row?.kind === "dir") {
+            if (!row.expanded) {
+              expandedDirs.add(row.path);
+              rebuildTreeRows(row.path);
+            } else if (treeRows[treeIndex + 1]?.depth === row.depth + 1) {
+              treeIndex++;
+              revealTree();
+            }
+          } else if (row?.kind === "file") {
+            openTreeFile(row, true);
+            return;
+          } else {
+            focus = 1;
+          }
+        } else {
+          if (row?.kind === "dir" && row.expanded) {
+            expandedDirs.delete(row.path);
+            rebuildTreeRows(row.path);
+          } else if (row) {
+            const parent = parentDirPath(row.path);
+            if (parent) {
+              const parentIdx = treeRows.findIndex(
+                (entry) => entry.kind === "dir" && entry.path === parent,
+              );
+              if (parentIdx >= 0) {
+                treeIndex = parentIdx;
+                revealTree();
+              }
+            }
+          }
+        }
+        render();
+        return;
+      } else {
         focus = Math.max(0, Math.min(2, focus + (name === "left" ? -1 : 1)));
-        if (focus === 0) ensureCommitCursor();
+        if (focus === 0 && sidebarTab === "commits") ensureCommitCursor();
       }
       rememberPosition();
       render();
@@ -3295,8 +4132,10 @@ export async function liveReview(options: LiveOptions): Promise<void> {
           ? -1
           : 0;
     if (direction) {
-      if (focus === 0 && state) moveCommit(direction);
-      else if (focus === 1) selectFile(fileIndex + direction);
+      if (focus === 0) {
+        if (sidebarTab === "tree") moveTree(direction);
+        else if (state) moveCommit(direction);
+      } else if (focus === 1) selectFile(fileIndex + direction);
       else scrollDiff(direction);
       render();
     }
